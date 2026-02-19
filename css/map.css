@@ -1,0 +1,78 @@
+/* css/map.css */
+
+/* Map container inside main area */
+#map-stage{
+  position: absolute;
+  inset: 0;           /* fill main area */
+  overflow: hidden;   /* prevent zoom scroll jump */
+  background: #ffffff;
+}
+/* Force the WebGL canvas to fill the map area */
+#map-stage canvas{
+  width: 100% !important;
+  height: 100% !important;
+  display: block;          /* removes inline-canvas gaps */
+}
+
+/* Info card overlay */
+#info-card {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  width: 340px;
+  background: #ffffff;
+  padding: 16px 16px 14px;
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.22);
+  z-index: 50;
+  user-select: none;
+}
+
+.hidden { display: none; }
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  gap: 10px;
+}
+
+#card-title { margin: 0; font-size: 18px; color: #222; font-weight: 700; }
+#card-info  { margin: 0; color: #555; line-height: 1.5; font-size: 14px; }
+
+#close-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 0;
+  background: #f4f4f4;
+  font-size: 20px;
+  cursor: pointer;
+  color: #666;
+}
+#close-btn:hover { background: #ececec; color: #222; }
+
+.card-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+#directions-btn, #clear-route-btn {
+  flex: 1;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+#directions-btn { background: #1f7aff; color: #fff; }
+#directions-btn:disabled { background: #a8c7ff; cursor: not-allowed; }
+
+#clear-route-btn { background: #f1f1f1; color: #333; }
+#clear-route-btn:disabled { opacity: 0.6; cursor: not-allowed; }
