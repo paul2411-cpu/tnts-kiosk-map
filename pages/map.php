@@ -13,6 +13,11 @@ ob_start();
       </div>
 
       <div class="card-body">
+        <div id="card-rooms-wrap" class="card-rooms hidden">
+          <div class="card-rooms-title">Rooms</div>
+          <div id="card-rooms-status" class="card-rooms-status">Loading rooms...</div>
+          <div id="card-rooms-list" class="card-rooms-list"></div>
+        </div>
         <p id="card-info">Select “Get Directions” to show the route.</p>
 
         <div class="card-actions">
@@ -29,8 +34,8 @@ $extraHead = <<<HTML
 <script type="importmap">
 {
   "imports": {
-    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    "three": "../three.js-master/build/three.module.js",
+    "three/addons/": "../three.js-master/examples/jsm/"
   }
 }
 </script>

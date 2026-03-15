@@ -30,7 +30,7 @@ if (!isset($extraScripts)) $extraScripts = "";
 
       <div class="topbar-right">
         <div class="searchbox">
-          <input type="text" placeholder="Type to Search here...." />
+          <input id="search-input" type="text" placeholder="Type to Search here...." />
           <button type="button" class="searchbtn" aria-label="Search">
             🔍
           </button>

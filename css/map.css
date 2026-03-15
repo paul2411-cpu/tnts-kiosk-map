@@ -42,6 +42,76 @@
 
 #card-title { margin: 0; font-size: 18px; color: #222; font-weight: 700; }
 #card-info  { margin: 0; color: #555; line-height: 1.5; font-size: 14px; }
+#card-info { order: 1; }
+
+.card-body {
+  display: grid;
+  gap: 12px;
+}
+
+.card-rooms {
+  order: 2;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f8fafc;
+  padding: 10px 12px;
+}
+
+.card-rooms-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: #111827;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.card-rooms-status {
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.card-rooms-list {
+  display: grid;
+  gap: 8px;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.card-room-item {
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+}
+
+.card-room-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.card-room-name {
+  color: #101828;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.card-room-number {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.card-room-meta {
+  margin-top: 4px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.4;
+}
 
 #close-btn {
   width: 34px;
@@ -56,6 +126,7 @@
 #close-btn:hover { background: #ececec; color: #222; }
 
 .card-actions {
+  order: 3;
   display: flex;
   gap: 10px;
   margin-top: 14px;

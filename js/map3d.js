@@ -9,6 +9,9 @@ if (!mapStage) throw new Error("Missing #map-stage");
 const infoCard = document.getElementById("info-card");
 const cardTitle = document.getElementById("card-title");
 const cardInfo = document.getElementById("card-info");
+const cardRoomsWrap = document.getElementById("card-rooms-wrap");
+const cardRoomsStatus = document.getElementById("card-rooms-status");
+const cardRoomsList = document.getElementById("card-rooms-list");
 const closeBtn = document.getElementById("close-btn");
 const directionsBtn = document.getElementById("directions-btn");
 const clearRouteBtn = document.getElementById("clear-route-btn");
@@ -298,7 +301,7 @@ function kbHandlePress(e) {
 
       case "done":
         // ✅ Run search then close
-        handleSearchSelect(kbTargetInput.value);
+        handleSearchSelect(kbTargetInput.value, { autoRoute: true });
         hideKeyboard();
         return;
 
@@ -319,7 +322,7 @@ function kbHandlePress(e) {
 
       case "enter":
         // ✅ Run search then close
-        handleSearchSelect(kbTargetInput.value);
+        handleSearchSelect(kbTargetInput.value, { autoRoute: true });
         hideKeyboard();
         return;
 
@@ -370,10 +373,17 @@ function setupOnScreenKeyboard() {
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
-      handleSearchSelect(input.value);
+      handleSearchSelect(input.value, { autoRoute: true });
       hideKeyboard();
     }
   });
+
+  const searchBtn = document.querySelector(".searchbtn");
+  if (searchBtn) {
+    searchBtn.addEventListener("click", () => {
+      handleSearchSelect(input.value, { autoRoute: true });
+    });
+  }
 
   // Bind keyboard presses (pointerdown avoids blur issues)
   const overlay = document.getElementById("kiosk-kb-overlay");
@@ -426,13 +436,181 @@ camera.position.set(0, 5, 10);
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 mapStage.appendChild(renderer.domElement);
-renderer.domElement.style.width = "100%";
-renderer.domElement.style.height = "100%";
-renderer.domElement.style.display = "block";
-renderer.domElement.style.touchAction = "none";
+const canvas = renderer.domElement;
+canvas.style.width = "100%";
+canvas.style.height = "100%";
+canvas.style.display = "block";
+canvas.style.touchAction = "none";
+
+function ensureBuildingLabelStyles() {
+  if (document.getElementById("map-building-label-styles")) return;
+
+  const style = document.createElement("style");
+  style.id = "map-building-label-styles";
+  style.textContent = `
+    #map-building-label-layer {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+      z-index: 40;
+    }
+    .map-building-label {
+      position: absolute;
+      left: 0;
+      top: 0;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(128, 0, 0, 0.9);
+      color: #fff;
+      font: 800 13px/1.1 "Trebuchet MS", "Segoe UI", sans-serif;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+      opacity: 0.96;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      transform: translate(-50%, -100%);
+    }
+    .map-building-label.is-hovered {
+      background: rgba(180, 0, 0, 0.96);
+    }
+    .map-building-label.is-selected {
+      background: rgba(17, 24, 39, 0.96);
+    }
+    @media (max-width: 640px) {
+      .map-building-label {
+        padding: 5px 8px;
+        font-size: 10px;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function ensureBuildingLabelLayer() {
+  ensureBuildingLabelStyles();
+
+  if (getComputedStyle(mapStage).position === "static") {
+    mapStage.style.position = "relative";
+  }
+  if (!buildingLabelLayer) {
+    buildingLabelLayer = document.createElement("div");
+    buildingLabelLayer.id = "map-building-label-layer";
+  }
+  if (!buildingLabelLayer.parentElement) {
+    mapStage.appendChild(buildingLabelLayer);
+  }
+  return buildingLabelLayer;
+}
+
+function ensureNavigationOverlayStyles() {
+  if (document.getElementById("map-navigation-overlay-styles")) return;
+
+  const style = document.createElement("style");
+  style.id = "map-navigation-overlay-styles";
+  style.textContent = `
+    #map-navigation-overlay {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      pointer-events: none;
+      z-index: 45;
+    }
+    .map-kiosk-pin {
+      position: absolute;
+      left: 0;
+      top: 0;
+      display: none;
+      transform: translate(-50%, -100%);
+      text-align: center;
+      white-space: nowrap;
+    }
+    .map-kiosk-pin__icon {
+      position: relative;
+      width: 28px;
+      height: 28px;
+      margin: 0 auto;
+      border: 4px solid #ff1f1f;
+      border-radius: 50% 50% 50% 0;
+      background: #fff;
+      box-shadow: 0 10px 24px rgba(239, 68, 68, 0.24);
+      transform: rotate(-45deg);
+    }
+    .map-kiosk-pin__icon::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ff1f1f;
+      transform: translate(-50%, -50%);
+    }
+    .map-kiosk-pin__label {
+      margin-top: 10px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.96);
+      color: #7f1d1d;
+      font: 800 12px/1.1 "Trebuchet MS", "Segoe UI", sans-serif;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.14);
+    }
+    @media (max-width: 640px) {
+      .map-kiosk-pin__icon {
+        width: 24px;
+        height: 24px;
+        border-width: 3px;
+      }
+      .map-kiosk-pin__label {
+        font-size: 10px;
+        padding: 4px 8px;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+let navigationOverlayLayer = null;
+let kioskMarkerEl = null;
+
+function ensureNavigationOverlayLayer() {
+  ensureNavigationOverlayStyles();
+
+  if (getComputedStyle(mapStage).position === "static") {
+    mapStage.style.position = "relative";
+  }
+  if (!navigationOverlayLayer) {
+    navigationOverlayLayer = document.createElement("div");
+    navigationOverlayLayer.id = "map-navigation-overlay";
+  }
+  if (!navigationOverlayLayer.parentElement) {
+    mapStage.appendChild(navigationOverlayLayer);
+  }
+  return navigationOverlayLayer;
+}
+
+function ensureKioskMarker() {
+  const layer = ensureNavigationOverlayLayer();
+  if (!kioskMarkerEl) {
+    kioskMarkerEl = document.createElement("div");
+    kioskMarkerEl.className = "map-kiosk-pin";
+    kioskMarkerEl.innerHTML = `
+      <div class="map-kiosk-pin__icon"></div>
+      <div class="map-kiosk-pin__label">You are here</div>
+    `;
+  }
+  if (!kioskMarkerEl.parentElement) {
+    layer.appendChild(kioskMarkerEl);
+  }
+  return kioskMarkerEl;
+}
 
 // --- Controls
-const controls = new OrbitControls(camera, renderer.domElement);
+const controls = new OrbitControls(camera, canvas);
 
 controls.enableDamping = true;
 controls.dampingFactor = 0.1;
@@ -481,6 +659,11 @@ window.addEventListener("resize", () => resizeToContainer());
 // --- Mouse coords relative to canvas rect
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
+const activeTouchPointers = new Map();
+let touchSceneTap = null;
+let suppressSceneClickUntil = 0;
+let pinchDistance = 0;
+let isSceneHoverActive = false;
 
 function setMouseFromEvent(event) {
   const rect = renderer.domElement.getBoundingClientRect();
@@ -488,8 +671,16 @@ function setMouseFromEvent(event) {
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 }
 
-window.addEventListener("mousemove", (event) => {
+canvas.addEventListener("pointermove", (event) => {
+  if (event.pointerType && event.pointerType !== "mouse") return;
+  isSceneHoverActive = true;
   setMouseFromEvent(event);
+});
+canvas.addEventListener("pointerleave", () => {
+  isSceneHoverActive = false;
+  hoveredBuildingName = null;
+  clearHoverTint();
+  clearHoverOutline();
 });
 
 // ==========================
@@ -498,6 +689,10 @@ window.addEventListener("mousemove", (event) => {
 const FOV_MIN = 18;   // smaller = more zoom in
 const FOV_MAX = 75;   // larger = more zoom out
 const FOV_STEP = 0.03; // wheel sensitivity (trackpad friendly)
+const TOUCH_TAP_SLOP_PX = 12;
+const TOUCH_CLICK_SUPPRESS_MS = 450;
+const TOUCH_PINCH_SLOP_PX = 2;
+const TOUCH_FOV_STEP = 0.08;
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -520,131 +715,253 @@ function onWheelFovZoom(e) {
 // passive:false is REQUIRED so preventDefault() works
 renderer.domElement.addEventListener("wheel", onWheelFovZoom, { passive: false });
 
-// ==========================
-// ✅ PINCH (TOUCH) FOV ZOOM
-// ==========================
-const PINCH_FOV_STEP = 0.05; // sensitivity (pixels -> fov delta)
-const PINCH_START_THRESHOLD = 2; // px to decide pinch vs two-finger pan
-
-const activeTouches = new Map(); // pointerId -> {x,y}
-let pinchLastDist = 0;
-let isPinching = false;
-
-function getTouchDist() {
-  const pts = Array.from(activeTouches.values());
-  if (pts.length < 2) return 0;
-  const a = pts[0];
-  const b = pts[1];
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.hypot(dx, dy);
+function isTouchLikePointer(event) {
+  return event.pointerType === "touch" || event.pointerType === "pen";
 }
 
-function startPinchTracking() {
-  if (activeTouches.size === 2) {
-    pinchLastDist = getTouchDist();
-    isPinching = false;
+function trackTouchPointer(event) {
+  if (!isTouchLikePointer(event)) return;
+  activeTouchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+}
+
+function releaseTouchPointer(pointerId) {
+  activeTouchPointers.delete(pointerId);
+  if (activeTouchPointers.size < 2) pinchDistance = 0;
+}
+
+function getTouchDistance() {
+  const points = Array.from(activeTouchPointers.values());
+  if (points.length < 2) return 0;
+  const [a, b] = points;
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function updateTouchFovZoom() {
+  if (activeTouchPointers.size < 2) {
+    pinchDistance = 0;
+    return;
+  }
+  const distance = getTouchDistance();
+  if (!(distance > 0)) return;
+  if (!(pinchDistance > 0)) {
+    pinchDistance = distance;
+    return;
+  }
+  const delta = distance - pinchDistance;
+  if (Math.abs(delta) < TOUCH_PINCH_SLOP_PX) return;
+  const nextFov = clamp(camera.fov - delta * TOUCH_FOV_STEP, FOV_MIN, FOV_MAX);
+  if (Math.abs(nextFov - camera.fov) > 0.001) {
+    camera.fov = nextFov;
+    camera.updateProjectionMatrix();
+  }
+  pinchDistance = distance;
+}
+
+function isEventOnCanvas(event) {
+  const rect = canvas.getBoundingClientRect();
+  return (
+    event.clientX >= rect.left &&
+    event.clientX <= rect.right &&
+    event.clientY >= rect.top &&
+    event.clientY <= rect.bottom
+  );
+}
+
+const LIVE_MAP_ENDPOINT = "../api/map_live.php";
+const BUILDING_DETAILS_ENDPOINT = "../api/map_building_details.php";
+const SEARCH_INDEX_ENDPOINT = "../api/map_search.php";
+const FALLBACK_MODEL_URL = "../models/tnts_navigation.glb";
+const LIVE_POLL_INTERVAL_MS = 30000;
+
+let activeRoutesByKey = new Map(); // normalized name -> { name, mode, names|points, distance? }
+let routeNamesForSearch = [];      // display names
+let dbBuildingNamesForSearch = []; // DB building names
+let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
+let dbBuildingsByKey = new Map();  // normalized building name -> metadata
+let liveVersion = null;
+let livePollTimer = null;
+let livePollBusy = false;
+let currentLiveModelFile = "";
+let cardDetailsRequestSeq = 0;
+let cardRoomsCache = new Map();
+let publishedKioskPoint = null;
+let publishedKioskPointAligned = null;
+
+const kioskMarkerScreen = new THREE.Vector3();
+
+function rebuildRouteCatalog(entries) {
+  activeRoutesByKey = new Map();
+  routeNamesForSearch = [];
+  for (const entry of (entries || [])) {
+    const name = String(entry?.name || "").trim();
+    const key = normalizeQuery(name);
+    if (!key || !name) continue;
+    activeRoutesByKey.set(key, entry);
+    routeNamesForSearch.push(name);
   }
 }
 
-function applyPinchZoom(delta) {
-  const nextFov = camera.fov - delta * PINCH_FOV_STEP;
-  camera.fov = clamp(nextFov, FOV_MIN, FOV_MAX);
-  camera.updateProjectionMatrix();
+function inferPublishedKioskPoint(entries) {
+  const buckets = new Map();
+  for (const entry of (entries || [])) {
+    const point = Array.isArray(entry?.points) ? entry.points[0] : null;
+    if (!Array.isArray(point) || point.length < 3) continue;
+    const key = point.map((value) => Number(value).toFixed(3)).join("|");
+    const bucket = buckets.get(key) || { count: 0, point };
+    bucket.count += 1;
+    buckets.set(key, bucket);
+  }
+
+  let best = null;
+  for (const bucket of buckets.values()) {
+    if (!best || bucket.count > best.count) best = bucket;
+  }
+  if (!best?.point) return null;
+
+  return new THREE.Vector3(
+    Number(best.point[0]),
+    Number(best.point[1]),
+    Number(best.point[2])
+  );
 }
 
-function onTouchPointerDown(e) {
-  if (e.pointerType !== "touch") return;
-  activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
-  if (activeTouches.size === 2) startPinchTracking();
+function setPublishedKioskPoint(point) {
+  publishedKioskPoint = point?.clone?.() || null;
+  publishedKioskPointAligned = publishedKioskPoint?.clone?.() || null;
+  if (publishedKioskPoint && loadedModel) {
+    publishedKioskPointAligned = alignPointToModelSurface(publishedKioskPoint);
+  }
+  updateKioskMarker();
 }
 
-function onTouchPointerMove(e) {
-  if (e.pointerType !== "touch") return;
-  if (!activeTouches.has(e.pointerId)) return;
-  activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+function setPublishedRoutes(routesObj) {
+  if (!routesObj || typeof routesObj !== "object") {
+    setPublishedKioskPoint(null);
+    return false;
+  }
+  const entries = [];
+  for (const [rawKey, rawEntry] of Object.entries(routesObj)) {
+    if (!rawEntry || !Array.isArray(rawEntry.points) || rawEntry.points.length < 2) continue;
+    const name = String(rawEntry.name || rawKey || "").trim();
+    if (!name) continue;
+    const points = rawEntry.points
+      .filter(p => Array.isArray(p) && p.length >= 3)
+      .map(p => [Number(p[0]), Number(p[1]), Number(p[2])])
+      .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]) && Number.isFinite(p[2]));
+    if (points.length < 2) continue;
+    entries.push({
+      name,
+      mode: "points",
+      points,
+      distance: Number(rawEntry.distance)
+    });
+  }
+  if (!entries.length) {
+    setPublishedKioskPoint(null);
+    return false;
+  }
+  rebuildRouteCatalog(entries);
+  setPublishedKioskPoint(inferPublishedKioskPoint(entries));
+  return true;
+}
 
-  if (activeTouches.size === 2) {
-    const dist = getTouchDist();
-    const delta = dist - pinchLastDist;
+function getRouteEntry(name) {
+  const key = normalizeQuery(name);
+  if (!key) return null;
+  return activeRoutesByKey.get(key) || null;
+}
 
-    if (!isPinching && Math.abs(delta) >= PINCH_START_THRESHOLD) {
-      isPinching = true;
-      controls.enabled = false;
+rebuildRouteCatalog([]);
+
+function registerDbBuildingMeta(entry) {
+  for (const key of getBuildingLookupKeys(entry?.name)) {
+    if (!dbBuildingsByKey.has(key)) {
+      dbBuildingsByKey.set(key, entry);
+    }
+  }
+}
+
+function getDbBuildingMeta(name) {
+  for (const key of getBuildingLookupKeys(name)) {
+    const entry = dbBuildingsByKey.get(key);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+function getDisplayBuildingName(name) {
+  return String(getDbBuildingMeta(name)?.name || name || "").trim();
+}
+
+function getRouteEntryForBuilding(name) {
+  const displayName = getDisplayBuildingName(name);
+  return getRouteEntry(displayName) || getRouteEntry(name);
+}
+
+function refreshBuildingLabelText() {
+  for (const entry of buildingLabels) {
+    const nextLabel = formatBuildingLabel(getDisplayBuildingName(entry.name));
+    if (entry.element.textContent !== nextLabel) {
+      entry.element.textContent = nextLabel;
+    }
+  }
+  updateBuildingLabels();
+}
+
+async function loadSearchCatalog(modelFile = currentLiveModelFile) {
+  try {
+    const url = new URL(SEARCH_INDEX_ENDPOINT, window.location.href);
+    url.searchParams.set("v", String(Date.now()));
+    if (modelFile) url.searchParams.set("model", modelFile);
+
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data || data.ok === false) throw new Error(data?.error || "Invalid search payload");
+
+    const buildings = Array.isArray(data.buildings) ? data.buildings : [];
+    const rooms = Array.isArray(data.rooms) ? data.rooms : [];
+
+    cardRoomsCache.clear();
+    dbBuildingsByKey = new Map();
+    dbBuildingNamesForSearch = [];
+    for (const raw of buildings) {
+      const name = String(raw?.name || "").trim();
+      if (!name) continue;
+      registerDbBuildingMeta({
+        id: raw?.id ?? null,
+        name,
+        description: String(raw?.description || "").trim(),
+        imagePath: String(raw?.imagePath || "").trim(),
+        modelFile: String(raw?.modelFile || "").trim()
+      });
+      dbBuildingNamesForSearch.push(name);
     }
 
-    if (isPinching) {
-      applyPinchZoom(delta);
-      e.preventDefault();
-      e.stopPropagation();
+    dbRoomEntriesForSearch = rooms
+      .map((r) => ({
+        roomName: String(r?.roomName || "").trim(),
+        buildingName: String(r?.buildingName || "").trim(),
+        modelFile: String(r?.modelFile || "").trim()
+      }))
+      .filter((r) => r.roomName && r.buildingName);
+
+    refreshBuildingLabelText();
+    if (selectedBuildingName) {
+      showCard(selectedBuildingName);
     }
 
-    pinchLastDist = dist;
+    // If user already typed, re-run search now that DB rooms/buildings are ready.
+    if (loadedModel && String(pendingSearchQuery || "").trim()) {
+      handleSearchSelect(pendingSearchQuery);
+    }
+  } catch (err) {
+    console.warn("Search catalog unavailable (route/building-only search remains active):", err);
+    dbBuildingNamesForSearch = [];
+    dbRoomEntriesForSearch = [];
+    dbBuildingsByKey = new Map();
   }
 }
-
-function onTouchPointerUp(e) {
-  if (e.pointerType !== "touch") return;
-  activeTouches.delete(e.pointerId);
-  if (activeTouches.size < 2) {
-    if (isPinching) controls.enabled = true;
-    isPinching = false;
-    pinchLastDist = 0;
-  }
-}
-
-renderer.domElement.addEventListener("pointerdown", onTouchPointerDown, { passive: false });
-renderer.domElement.addEventListener("pointermove", onTouchPointerMove, { passive: false });
-renderer.domElement.addEventListener("pointerup", onTouchPointerUp, { passive: false });
-renderer.domElement.addEventListener("pointercancel", onTouchPointerUp, { passive: false });
-
-// -------------------- ROUTES (unchanged)
-// --------------------
-const ROUTES = {
-  "ANTERIO_SORIANO": ["KIOSK_START","KIOSK_START055","KIOSK_START057","ANTERIO_SORIANO"],
-  "DELFIN_MONTANO": ["KIOSK_START","KIOSK_START055","KIOSK_START057","KIOSK_START058","DELFIN_MONTANO"],
-  "EPIMASCO_VELASCO": ["KIOSK_START","KIOSK_START055","KIOSK_START056","EPIMASCO_VELASCO"],
-  "J_REMULLA": ["KIOSK_START","KIOSK_START055","KIOSK_START001","J_REMULLA"],
-  "TNTS_FASHION_HUB": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","TNTS_FASHION_HUB"],
-  "FERNANDO_CAMPOS": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","KIOSK_START005","FERNANDO_CAMPOS"],
-  "SOTA": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","SOTA"],
-  "ERINEO_MALIKSI": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","ERINEO_MALIKSI"],
-  "ICT": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","ICT"],
-  "TESDA_ASSESSMENT": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","TESDA_ASSESSMENT"],
-  "ADMIN": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","ADMIN"],
-  "CANTEEN001": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START008","CANTEEN001"],
-  "AMPHI_STAGE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START008","KIOSK_START009","KIOSK_START010","AMPHI_STAGE"],
-  "TRADEAN_HALL": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","KIOSK_START005","KIOSK_START011","KIOSK_START012","KIOSK_START013","TRADEAN_HALL"],
-  "FOODTECH_RFS": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","KIOSK_START005","KIOSK_START011","KIOSK_START012","KIOSK_START013","KIOSK_START014","FOODTECH_RFS"],
-  "CANTEEN": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","CANTEEN"],
-  "DEPED_3": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","DEPED_3"],
-  "AUTOMOTIVE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START024","KIOSK_START025","AUTOMOTIVE"],
-  "DRESSMAKING_TAILORING": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","KIOSK_START005","KIOSK_START011","KIOSK_START012","KIOSK_START013","KIOSK_START014","KIOSK_START015","DRESSMAKING_TAILORING"],
-  "ELECTRICITY_WOOD_TRADE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START004","KIOSK_START005","KIOSK_START011","KIOSK_START012","KIOSK_START013","KIOSK_START014","KIOSK_START015","ELECTRICITY_WOOD_TRADE"],
-  "ALUMNI": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","ALUMNI"],
-  "COURT_STAGE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","COURT_STAGE"],
-
-  "EMILO_RIEGO": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","KIOSK_START026","KIOSK_START049","KIOSK_START050","EMILO_RIEGO"],
-  "LINO_BOCALAN": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","KIOSK_START026","KIOSK_START049","KIOSK_START050","KIOSK_START051","LINO_BOCALAN"],
-  "DEPED_1": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START029","DEPED_1"],
-  "DEPED_2": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START030","KIOSK_START031","DEPEDE_2"],
-  "ELECTRONICS": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","ELECTRONICS"],
-  "LUIS_O_FERRER": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","KIOSK_START044","KIOSK_START045","KIOSK_START046","LUIS_O_FERRER"],
-  "LUIS_Y_FERRER": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","KIOSK_START044","KIOSK_START045","KIOSK_START046","LUIS_Y_FERRER"],
-  "DOMINADOR_CAMERINO": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","KIOSK_START026","KIOSK_START049","KIOSK_START050","KIOSK_START051","KIOSK_START052","DOMINADOR_CAMERINO"],
-  "AUS_AID": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","KIOSK_START026","KIOSK_START049","KIOSK_START050","KIOSK_START051","KIOSK_START052","KIOSK_START053","AUS_AID"],
-  "FABIAN_PUGEDA": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START026","KIOSK_START026","KIOSK_START049","KIOSK_START050","KIOSK_START051","KIOSK_START052","KIOSK_START053","KIOSK_START054","FABIAN_PUGEDA"],
-  "DON_POBLETE_BLDG": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","KIOSK_START044","KIOSK_START045","KIOSK_START046","KIOSK_START047","KIOSK_START048","DON_POBLETE_BLDG"],
-  "RODRIGUEZ_BLDG": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START021","KIOSK_START043","KIOSK_START044","KIOSK_START045","KIOSK_START046","KIOSK_START047","KIOSK_START042","RODRIGUEZ_BLDG"],
-  "SOFT_TRADE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START029","KIOSK_START033","SOFT_TRADE"],
-  "SOFT_TRADE_2": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START030","KIOSK_START031","KIOSK_START035","KIOSK_START032","SOFT_TRADE_2"],
-  "WELDING": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START030","KIOSK_START031","KIOSK_START035","KIOSK_START034","KIOSK_START036","WELDING"],
-  "PPP_1": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START029","KIOSK_START033","KIOSK_START039","PPP_1"],
-  "PPP_2": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START030","KIOSK_START031","KIOSK_START035","KIOSK_START034","KIOSK_START036","KIOSK_START037","PPP_2"],
-  "SAMONTE": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START030","KIOSK_START031","KIOSK_START035","KIOSK_START034","KIOSK_START036","KIOSK_START038","SAMONTE"],
-  "ARCA": ["KIOSK_START","KIOSK_START055","KIOSK_START001","KIOSK_START006","KIOSK_START002","KIOSK_START003","KIOSK_START007","KIOSK_START017","KIOSK_START018","KIOSK_START023","KIOSK_START019","KIOSK_START020","KIOSK_START022","KIOSK_START027","KIOSK_START028","KIOSK_START029","KIOSK_START033","KIOSK_START039","KIOSK_START040","ARCA"],
-};
-const CLICKABLE_BUILDINGS = new Set(Object.keys(ROUTES));
 
 
 
@@ -661,52 +978,143 @@ function normalizeQuery(q) {
     .replace(/\s+/g, "_");
 }
 
-function findBestBuildingMatch(queryNorm) {
-  if (!queryNorm) return null;
+function normalizeLoose(q) {
+  return normalizeQuery(q).replace(/[_\-.]/g, "");
+}
 
-  // 1) Exact match (ALUMNI)
-  if (CLICKABLE_BUILDINGS.has(queryNorm)) return queryNorm;
+function removeOneNumericSuffix(name) {
+  return String(name || "").replace(/([._-]\d+)$/g, "");
+}
 
-  // 2) Exact match ignoring underscores/spaces
-  const flat = queryNorm.replace(/_/g, "");
-  for (const name of CLICKABLE_BUILDINGS) {
-    if (name.replace(/_/g, "") === flat) return name;
+function isGenericNodeName(name) {
+  const n = String(name || "").trim().toUpperCase();
+  const flat = n.replace(/[\s_.-]+/g, "");
+  return (
+    flat === "SCENE" ||
+    flat === "AUXSCENE" ||
+    flat === "ROOT" ||
+    flat === "ROOTNODE" ||
+    flat === "GLTF" ||
+    flat === "MODEL" ||
+    flat === "GROUP" ||
+    flat === "COLLECTION" ||
+    flat === "SCENECOLLECTION" ||
+    flat === "MASTERCOLLECTION"
+  );
+}
+
+function scoreSearchMatch(queryNorm, targetNorm) {
+  if (!queryNorm || !targetNorm) return 0;
+  if (targetNorm === queryNorm) return 120;
+
+  const qFlat = normalizeLoose(queryNorm);
+  const tFlat = normalizeLoose(targetNorm);
+  if (tFlat === qFlat) return 110;
+
+  if (targetNorm.startsWith(queryNorm)) return 90;
+  if (tFlat.startsWith(qFlat)) return 85;
+  if (targetNorm.includes(queryNorm)) return 70;
+  if (tFlat.includes(qFlat)) return 65;
+  return 0;
+}
+
+function collectSearchCandidates(queryNorm) {
+  if (!queryNorm) return [];
+
+  const out = [];
+  const seen = new Set();
+
+  const pushCandidate = (type, label, buildingName, roomName = "") => {
+    const key = `${type}::${String(label)}::${String(buildingName)}::${String(roomName)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    let score = 0;
+    if (type === "room") {
+      // Match by room only, and by room+building when user includes both.
+      const roomNorm = normalizeQuery(roomName);
+      const roomWithBuildingNorm = normalizeQuery(`${roomName} ${buildingName}`);
+      const roomLabelNorm = normalizeQuery(label);
+      score = Math.max(
+        scoreSearchMatch(queryNorm, roomNorm),
+        scoreSearchMatch(queryNorm, roomWithBuildingNorm) + 5,
+        scoreSearchMatch(queryNorm, roomLabelNorm) + 3
+      );
+    } else {
+      score = scoreSearchMatch(queryNorm, normalizeQuery(label));
+    }
+    if (score <= 0) return;
+
+    const hasRoute = !!getRouteEntry(buildingName);
+    out.push({
+      type,
+      label,
+      buildingName,
+      roomName,
+      hasRoute,
+      score: score + (hasRoute ? 20 : 0)
+    });
+  };
+
+  // Route-published buildings (highest confidence for routing).
+  for (const name of routeNamesForSearch) {
+    pushCandidate("building", name, name, "");
   }
 
-  // 3) Partial match (e.g. "ALUMI" → "ALUMNI")
-  for (const name of CLICKABLE_BUILDINGS) {
-    if (name.includes(queryNorm)) return name;
+  // DB buildings (may include buildings without published route yet).
+  for (const bName of dbBuildingNamesForSearch) {
+    pushCandidate("building", bName, bName, "");
   }
 
-  // 4) Partial match ignoring underscores
-  for (const name of CLICKABLE_BUILDINGS) {
-    if (name.replace(/_/g, "").includes(flat)) return name;
+  // DB rooms -> route by parent building.
+  for (const row of dbRoomEntriesForSearch) {
+    pushCandidate("room", `${row.roomName} (${row.buildingName})`, row.buildingName, row.roomName);
   }
 
-  return null;
+  out.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.type !== b.type) return a.type === "building" ? -1 : 1;
+    return a.label.localeCompare(b.label);
+  });
+  return out;
 }
 
 function selectBuildingByName(buildingName) {
   if (!loadedModel || !buildingName) return false;
 
-  const anchor =
-    getObjectByNameFlexible(loadedModel, buildingName) ||
-    loadedModel.getObjectByName(buildingName);
+  let candidateName = String(buildingName);
+  const normTarget = normalizeQuery(candidateName);
+  for (const routed of routeNamesForSearch) {
+    if (normalizeQuery(routed) === normTarget) {
+      candidateName = routed;
+      break;
+    }
+  }
+
+  let entry = getBuildingEntryByName(candidateName) || getBuildingEntryByName(buildingName);
+  let anchor = entry?.object || null;
+
+  if (!anchor) {
+    // Fallback for case/spacing differences and loader-added numeric suffixes.
+    loadedModel.traverse((obj) => {
+      if (anchor || !obj?.name) return;
+      if (isGenericNodeName(obj.name)) return;
+
+      const objNorm = normalizeQuery(obj.name);
+      const objNormNoSuffix = normalizeQuery(removeOneNumericSuffix(obj.name));
+      if (objNorm === normTarget || objNormNoSuffix === normTarget) {
+        anchor = obj;
+      }
+    });
+  }
 
   if (!anchor) return false;
 
-  // Find a mesh under that anchor for outline (if anchor is an Empty)
-  let meshForOutline = null;
-  anchor.traverse((o) => {
-    if (!meshForOutline && o.isMesh && o.geometry) meshForOutline = o;
-  });
-
-  // Fallback: if the anchor itself is mesh
-  if (!meshForOutline && anchor.isMesh) meshForOutline = anchor;
-
+  entry = entry || getBuildingEntryByName(anchor.name);
+  const meshForOutline = entry?.meshForOutline || findOutlineMeshForObject(anchor);
   if (!meshForOutline) return false;
 
-  selectedBuildingName = buildingName;
+  selectedBuildingName = entry?.name || anchor.name || candidateName;
 
   // Clear previous selection visuals
   clearHoverTint();
@@ -714,12 +1122,13 @@ function selectBuildingByName(buildingName) {
   clearClickOutline();
 
   setClickOutline(meshForOutline);
-  showCard(buildingName);
+  showCard(selectedBuildingName);
 
   return true;
 }
 
-function handleSearchSelect(rawValue) {
+function handleSearchSelect(rawValue, opts = {}) {
+  const { autoRoute = false } = opts;
   pendingSearchQuery = rawValue; // remember latest search even if GLB not loaded yet
 
   if (!loadedModel) return; // model not ready yet
@@ -731,10 +1140,41 @@ function handleSearchSelect(rawValue) {
     return;
   }
 
-  const match = findBestBuildingMatch(q);
-  if (!match) return; // no match; keep current selection
+  const candidates = collectSearchCandidates(q);
+  if (!candidates.length) return;
 
-  selectBuildingByName(match);
+  // Prefer rooms/buildings whose parent building has a published route.
+  const prioritized = [
+    ...candidates.filter((c) => c.hasRoute),
+    ...candidates.filter((c) => !c.hasRoute)
+  ];
+
+  let selected = null;
+  for (const candidate of prioritized) {
+    if (selectBuildingByName(candidate.buildingName)) {
+      selected = candidate;
+      break;
+    }
+  }
+  if (!selected) return;
+
+  if (selected.type === "room" && selected.roomName) {
+    const routeReady = !!getRouteEntryForBuilding(selected.buildingName);
+    cardInfo.textContent = routeReady
+      ? `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. Select "Get Directions" to show the route.`
+      : `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. No published route for this building.`;
+    if (autoRoute) {
+      activateDirectionsForSelectedBuilding();
+    }
+    return;
+    cardInfo.textContent = routeReady
+      ? `Matched ${selected.roomName} in ${selected.buildingName}. Select “Get Directions” to show the route.`
+      : `Matched ${selected.roomName} in ${selected.buildingName}. No published route for this building.`;
+  }
+
+  if (autoRoute) {
+    activateDirectionsForSelectedBuilding();
+  }
 }
 
 
@@ -744,17 +1184,284 @@ let loadedModel = null;
 
 let hoveredMesh = null;
 let hoveredOriginalMat = null;
+let hoveredTintMat = null;
 
 let clickOutline = null;
 let hoverOutline = null;
 let selectedBuildingName = null;
+let hoveredBuildingName = null;
 
 let routeMesh = null;
+let routeArrowMesh = null;
+let routeAnimationState = null;
+let buildingLabelLayer = null;
+let buildingLabels = [];
+let buildingEntriesByKey = new Map();
+let buildingEntriesByObject = new Map();
+
+const labelBox = new THREE.Box3();
+const labelSize = new THREE.Vector3();
+const labelCenter = new THREE.Vector3();
+const labelScreen = new THREE.Vector3();
+const surfaceAlignOrigin = new THREE.Vector3();
+const surfaceAlignDown = new THREE.Vector3(0, -1, 0);
+
+const ROUTE_RIBBON_LIFT = 0.35;
+const ROUTE_RIBBON_THICKNESS = 1.2;
+const ROUTE_ARROW_LIFT = ROUTE_RIBBON_LIFT + 0.04;
+const ROUTE_ARROW_LENGTH = 4.2;
+const ROUTE_ARROW_WIDTH = 2.3;
+const ROUTE_ANIMATION_MAX_DELTA = 0.05;
+
+const routeRibbonMaterial = new THREE.MeshBasicMaterial({
+  color: 0xff0000,
+  transparent: true,
+  opacity: 1.0,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  depthTest: false,
+});
+
+const routeArrowMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffffff,
+  transparent: true,
+  opacity: 0.96,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  depthTest: false,
+});
+
+const frameClock = new THREE.Clock();
+
+function getMaterialArray(material) {
+  if (!material) return [];
+  return Array.isArray(material) ? material : [material];
+}
+
+function disposeReplacedMaterials(currentMaterial, originalMaterial) {
+  const originals = new Set(getMaterialArray(originalMaterial));
+  for (const mat of getMaterialArray(currentMaterial)) {
+    if (!mat || originals.has(mat) || !mat.dispose) continue;
+    mat.dispose();
+  }
+}
+
+function isWaypointName(name) {
+  return /^KIOSK_START(?:[._-]?\d+)?$/i.test(String(name || "").trim());
+}
+
+function isRoadLikeName(name) {
+  const raw = String(name || "").trim();
+  const loose = normalizeLoose(raw);
+  if (!loose) return false;
+  return loose === "ROAD" || /^ROAD\d+$/.test(loose);
+}
+
+function isGroundOrHelperName(name) {
+  const loose = normalizeLoose(name);
+  if (!loose) return true;
+  return (
+    isRoadLikeName(name) ||
+    loose === "GROUND" ||
+    loose === "FLOOR" ||
+    loose === "TERRAIN" ||
+    loose.startsWith("CIRCLE") ||
+    loose.includes("STAIR")
+  );
+}
+
+function hasMeshDescendant(obj) {
+  let found = false;
+  obj?.traverse?.((child) => {
+    if (found) return;
+    if (child?.isMesh && child.geometry) found = true;
+  });
+  return found;
+}
+
+function formatBuildingLabel(name) {
+  return String(name || "")
+    .replace(/[_.|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getBuildingLookupKeys(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return [];
+
+  const keys = new Set();
+  const push = (value) => {
+    const key = normalizeQuery(value);
+    if (key) keys.add(key);
+  };
+
+  push(raw);
+  push(removeOneNumericSuffix(raw));
+
+  const dotless = raw.replace(/\./g, "");
+  push(dotless);
+  push(removeOneNumericSuffix(dotless));
+
+  return [...keys];
+}
+
+function registerBuildingEntry(entry) {
+  if (entry?.object?.uuid) {
+    buildingEntriesByObject.set(entry.object.uuid, entry);
+  }
+  for (const key of getBuildingLookupKeys(entry?.name)) {
+    if (!buildingEntriesByKey.has(key)) {
+      buildingEntriesByKey.set(key, entry);
+    }
+  }
+}
+
+function getBuildingEntryByName(name) {
+  for (const key of getBuildingLookupKeys(name)) {
+    const entry = buildingEntriesByKey.get(key);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+function clearBuildingLabels() {
+  for (const entry of buildingLabels) {
+    entry.element?.remove?.();
+  }
+  buildingLabelLayer?.replaceChildren?.();
+  buildingLabels = [];
+  buildingEntriesByKey = new Map();
+  buildingEntriesByObject = new Map();
+}
+
+function isBuildingRootName(name) {
+  return !!String(name || "").trim() &&
+    !isGenericNodeName(name) &&
+    !isWaypointName(name) &&
+    !isGroundOrHelperName(name);
+}
+
+function findOutlineMeshForObject(obj) {
+  if (obj?.isMesh && obj.geometry) return obj;
+
+  let mesh = null;
+  obj?.traverse?.((child) => {
+    if (mesh) return;
+    if (child?.isMesh && child.geometry) mesh = child;
+  });
+  return mesh;
+}
+
+function findTopBuildingRoot(obj, modelRoot) {
+  let current = obj;
+  while (current && current !== modelRoot) {
+    if (current.parent === modelRoot) {
+      return isBuildingRootName(current.name) ? current : null;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+function hasRenderableBounds(obj) {
+  if (!obj || !hasMeshDescendant(obj)) return false;
+  labelBox.setFromObject(obj);
+  if (labelBox.isEmpty()) return false;
+  labelBox.getSize(labelSize);
+  return labelSize.length() > 0.01;
+}
+
+function getLabelAnchorPosition(obj, modelSize) {
+  labelBox.setFromObject(obj);
+  if (labelBox.isEmpty()) return null;
+
+  labelBox.getSize(labelSize);
+  labelBox.getCenter(labelCenter);
+
+  const lift = Math.max(labelSize.y * 0.18, modelSize * 0.012, 0.35);
+  return new THREE.Vector3(labelCenter.x, labelBox.max.y + lift, labelCenter.z);
+}
+
+function rebuildBuildingLabels(model, modelSize) {
+  clearBuildingLabels();
+  buildingLabelLayer = ensureBuildingLabelLayer();
+  if (!model) return;
+
+  for (const root of (model.children || [])) {
+    if (!root?.name || !isBuildingRootName(root.name) || !hasRenderableBounds(root)) continue;
+    const meshForOutline = findOutlineMeshForObject(root);
+    const worldPosition = getLabelAnchorPosition(root, modelSize);
+    if (!meshForOutline || !worldPosition) continue;
+
+    const element = document.createElement("div");
+    element.className = "map-building-label";
+    element.textContent = formatBuildingLabel(getDisplayBuildingName(root.name));
+    buildingLabelLayer.appendChild(element);
+
+    const entry = {
+      name: root.name,
+      object: root,
+      meshForOutline,
+      worldPosition,
+      element
+    };
+
+    registerBuildingEntry(entry);
+    buildingLabels.push(entry);
+  }
+
+  updateBuildingLabels();
+}
+
+function findBuildingEntryFromHit(hitObject) {
+  if (!loadedModel) return null;
+  const root = findTopBuildingRoot(hitObject, loadedModel);
+  return root ? (buildingEntriesByObject.get(root.uuid) || null) : null;
+}
+
+function updateBuildingLabels() {
+  if (!buildingLabels.length || !buildingLabelLayer) return;
+
+  const rect = mapStage.getBoundingClientRect();
+  const width = rect.width || 1;
+  const height = rect.height || 1;
+
+  const hoveredNorm = normalizeQuery(hoveredBuildingName);
+  const selectedNorm = normalizeQuery(selectedBuildingName);
+
+  for (const entry of buildingLabels) {
+    labelScreen.copy(entry.worldPosition).project(camera);
+
+    const x = (labelScreen.x * 0.5 + 0.5) * width;
+    const y = (-labelScreen.y * 0.5 + 0.5) * height;
+    const isVisible =
+      labelScreen.z > -1 &&
+      labelScreen.z < 1 &&
+      x >= -180 &&
+      x <= width + 180 &&
+      y >= -80 &&
+      y <= height + 80;
+
+    entry.element.style.display = isVisible ? "block" : "none";
+    if (isVisible) {
+      entry.element.style.left = `${x}px`;
+      entry.element.style.top = `${y}px`;
+    }
+    entry.element.classList.toggle("is-hovered", !!hoveredNorm && normalizeQuery(entry.name) === hoveredNorm);
+    entry.element.classList.toggle("is-selected", !!selectedNorm && normalizeQuery(entry.name) === selectedNorm);
+  }
+}
 
 function clearHoverTint() {
-  if (hoveredMesh && hoveredOriginalMat) hoveredMesh.material = hoveredOriginalMat;
+  if (hoveredMesh && hoveredOriginalMat) {
+    const current = hoveredMesh.material;
+    hoveredMesh.material = hoveredOriginalMat;
+    disposeReplacedMaterials(current, hoveredOriginalMat);
+  }
   hoveredMesh = null;
   hoveredOriginalMat = null;
+  hoveredTintMat = null;
 }
 
 function applyHoverTint(mesh) {
@@ -762,9 +1469,15 @@ function applyHoverTint(mesh) {
   hoveredMesh = mesh;
   hoveredOriginalMat = mesh.material;
 
-  const mat = mesh.material.clone();
-  if (mat.color) mat.color.set(0xaaaaaa);
-  mesh.material = mat;
+  const sourceMats = getMaterialArray(mesh.material);
+  const tintedMats = sourceMats.map((m) => {
+    if (!m || !m.clone) return m;
+    const clone = m.clone();
+    if (clone.color) clone.color.set(0xaaaaaa);
+    return clone;
+  });
+  hoveredTintMat = Array.isArray(mesh.material) ? tintedMats : tintedMats[0];
+  mesh.material = hoveredTintMat;
 }
 
 function clearHoverOutline() {
@@ -794,63 +1507,214 @@ function clearClickOutline() {
   clickOutline = null;
 }
 
-function setClickOutline(mesh) {
+function setClickOutline(target) {
   clearClickOutline();
-  if (!mesh || !mesh.geometry) return;
+  if (!target) return;
 
-  const edges = new THREE.EdgesGeometry(mesh.geometry);
-  const mat = new THREE.LineBasicMaterial({ color: 0x000000 });
-  clickOutline = new THREE.LineSegments(edges, mat);
-  mesh.add(clickOutline);
+  clickOutline = new THREE.BoxHelper(target, 0x000000);
+  scene.add(clickOutline);
   clickOutline.raycast = () => null;
 }
 
 function clearRouteOnly() {
   if (routeMesh) {
     scene.remove(routeMesh);
-    routeMesh.geometry.dispose();
-    routeMesh.material.dispose();
+    routeMesh.geometry?.dispose?.();
     routeMesh = null;
+  }
+  if (routeArrowMesh) {
+    scene.remove(routeArrowMesh);
+    routeArrowMesh.geometry?.dispose?.();
+    routeArrowMesh = null;
+  }
+  routeAnimationState = null;
+}
+
+function resetCardRoomsPanel() {
+  if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  cardRoomsWrap.classList.add("hidden");
+  cardRoomsStatus.classList.remove("hidden");
+  cardRoomsStatus.textContent = "Loading rooms...";
+  cardRoomsList.replaceChildren();
+}
+
+function setCardRoomsLoading(message = "Loading rooms...") {
+  if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  cardRoomsWrap.classList.remove("hidden");
+  cardRoomsStatus.classList.remove("hidden");
+  cardRoomsStatus.textContent = message;
+  cardRoomsList.replaceChildren();
+}
+
+function setCardRoomsMessage(message) {
+  if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  cardRoomsWrap.classList.remove("hidden");
+  cardRoomsStatus.classList.remove("hidden");
+  cardRoomsStatus.textContent = message;
+  cardRoomsList.replaceChildren();
+}
+
+function renderCardRoomsList(rooms) {
+  if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  cardRoomsWrap.classList.remove("hidden");
+  cardRoomsList.replaceChildren();
+
+  if (!Array.isArray(rooms) || !rooms.length) {
+    cardRoomsStatus.classList.remove("hidden");
+    cardRoomsStatus.textContent = "No rooms found for this building in the published model.";
+    return;
+  }
+
+  cardRoomsStatus.classList.add("hidden");
+  for (const room of rooms) {
+    const item = document.createElement("div");
+    item.className = "card-room-item";
+
+    const head = document.createElement("div");
+    head.className = "card-room-head";
+
+    const name = document.createElement("div");
+    name.className = "card-room-name";
+    name.textContent = String(room?.name || "Unnamed Room");
+
+    const number = document.createElement("div");
+    number.className = "card-room-number";
+    number.textContent = String(room?.roomNumber || "").trim() || "-";
+
+    head.appendChild(name);
+    head.appendChild(number);
+    item.appendChild(head);
+
+    const metaParts = [];
+    if (String(room?.floorNumber || "").trim()) metaParts.push(`Floor ${String(room.floorNumber).trim()}`);
+    if (String(room?.roomType || "").trim()) metaParts.push(String(room.roomType).trim());
+    if (String(room?.description || "").trim()) metaParts.push(String(room.description).trim());
+
+    if (metaParts.length) {
+      const meta = document.createElement("div");
+      meta.className = "card-room-meta";
+      meta.textContent = metaParts.join(" • ");
+      item.appendChild(meta);
+    }
+
+    cardRoomsList.appendChild(item);
+  }
+}
+
+async function loadCardBuildingDetails(buildingName) {
+  const displayName = getDisplayBuildingName(buildingName) || String(buildingName || "").trim();
+  const meta = getDbBuildingMeta(buildingName);
+  if (!displayName) {
+    resetCardRoomsPanel();
+    return;
+  }
+
+  const requestSeq = ++cardDetailsRequestSeq;
+  const cacheKey = `${currentLiveModelFile}::${meta?.id ?? ""}::${normalizeQuery(displayName)}`;
+  if (cardRoomsCache.has(cacheKey)) {
+    if (requestSeq !== cardDetailsRequestSeq) return;
+    renderCardRoomsList(cardRoomsCache.get(cacheKey));
+    return;
+  }
+
+  setCardRoomsLoading("Loading rooms...");
+
+  try {
+    const url = new URL(BUILDING_DETAILS_ENDPOINT, window.location.href);
+    if (currentLiveModelFile) url.searchParams.set("model", currentLiveModelFile);
+    if (meta?.id != null) url.searchParams.set("buildingId", String(meta.id));
+    url.searchParams.set("name", displayName);
+
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+    if (requestSeq !== cardDetailsRequestSeq) return;
+
+    const rooms = Array.isArray(data.rooms) ? data.rooms : [];
+    cardRoomsCache.set(cacheKey, rooms);
+    renderCardRoomsList(rooms);
+  } catch (err) {
+    if (requestSeq !== cardDetailsRequestSeq) return;
+    setCardRoomsMessage(`Room list unavailable: ${err?.message || err}`);
   }
 }
 
 function showCard(buildingName) {
+  const displayName = getDisplayBuildingName(buildingName) || buildingName;
+  const meta = getDbBuildingMeta(buildingName);
+  const description = String(meta?.description || "").trim();
+  const routeAvailable = !!getRouteEntryForBuilding(buildingName);
+
+  infoCard.classList.remove("hidden");
+  cardTitle.textContent = displayName;
+  cardInfo.textContent = description
+    ? `${description} ${routeAvailable ? 'Select "Get Directions" to show the route.' : "No published route for this building."}`
+    : (routeAvailable ? 'Select "Get Directions" to show the route.' : "No published route for this building.");
+  directionsBtn.disabled = !routeAvailable;
+  loadCardBuildingDetails(buildingName).catch(() => {});
+  return;
+
   infoCard.classList.remove("hidden");
   cardTitle.textContent = buildingName;
-  cardInfo.textContent = "Select “Get Directions” to show the route.";
-  directionsBtn.disabled = false;
+  const hasRoute = !!getRouteEntry(buildingName);
+  cardInfo.textContent = hasRoute
+    ? "Select “Get Directions” to show the route."
+    : "No published route for this building.";
+  directionsBtn.disabled = !hasRoute;
 }
 
 function hideCardAndClear() {
   infoCard.classList.add("hidden");
   selectedBuildingName = null;
+  hoveredBuildingName = null;
   directionsBtn.disabled = true;
   clearRouteBtn.disabled = true;
+  cardDetailsRequestSeq++;
 
   clearRouteOnly();
   clearClickOutline();
+  resetCardRoomsPanel();
 }
 
 closeBtn.addEventListener("click", () => hideCardAndClear());
 
-directionsBtn.addEventListener("click", () => {
+function activateDirectionsForSelectedBuilding() {
   if (!loadedModel || !selectedBuildingName) return;
 
-  const routeNames = ROUTES[selectedBuildingName];
-  if (!routeNames) {
+  const routeEntry = getRouteEntryForBuilding(selectedBuildingName);
+  if (!routeEntry) {
     console.warn("No route configured for:", selectedBuildingName);
+    showCard(selectedBuildingName);
     return;
   }
 
-  const points = resolveRoutePoints(routeNames);
+  let points = [];
+  if (routeEntry.mode === "points") {
+    points = routeEntry.points
+      .map(p => Array.isArray(p) ? new THREE.Vector3(p[0], p[1], p[2]) : null)
+      .filter(Boolean);
+  } else {
+    points = resolveRoutePoints(routeEntry.names);
+  }
 
   if (points.length < 2) {
     console.warn("Route points < 2. Check console ROUTE DEBUG MISSING list.");
+    cardInfo.textContent = "Route data is incomplete for this building.";
     return;
   }
 
-  drawRibbonPath(points);
+  const alignedPoints = alignRoutePointsToModelSurface(points);
+  const routeDistance = Number.isFinite(routeEntry.distance) ? routeEntry.distance : measureRouteLength(alignedPoints);
+  const started = startAnimatedRoute(alignedPoints, routeDistance);
+  if (!started) {
+    cardInfo.textContent = "Route data is incomplete for this building.";
+    return;
+  }
   clearRouteBtn.disabled = false;
+}
+
+directionsBtn.addEventListener("click", () => {
+  activateDirectionsForSelectedBuilding();
 });
 
 clearRouteBtn.addEventListener("click", () => {
@@ -865,15 +1729,6 @@ function findBestOutlineMesh(hitObject) {
     o = o.parent;
   }
   return hitObject.isMesh ? hitObject : null;
-}
-
-function findBuildingNameFromHit(hitObject) {
-  let o = hitObject;
-  while (o) {
-    if (o.name && CLICKABLE_BUILDINGS.has(o.name)) return o.name;
-    o = o.parent;
-  }
-  return null;
 }
 
 function getObjectByNameFlexible(root, name) {
@@ -950,20 +1805,48 @@ function resolveRoutePoints(nameList) {
   return points;
 }
 
-function drawRibbonPath(points) {
-  clearRouteOnly();
-  if (!points || points.length < 2) return;
+function alignPointToModelSurface(point) {
+  const src = point?.clone?.();
+  if (!src || !loadedModel || !Number.isFinite(src.x) || !Number.isFinite(src.z)) return src || null;
 
-  const lift = 0.12;
-  const thickness = 1.2;
+  const refY = Number.isFinite(src.y) ? src.y : 0;
+  surfaceAlignOrigin.set(src.x, refY + 5000, src.z);
+  raycaster.set(surfaceAlignOrigin, surfaceAlignDown);
+
+  const hits = raycaster.intersectObjects(loadedModel.children || [], true);
+  let y = refY;
+  for (const hit of hits) {
+    if (hit?.object && hit.object.visible !== false) {
+      y = hit.point.y;
+      break;
+    }
+  }
+  src.y = y;
+  return src;
+}
+
+function alignRoutePointsToModelSurface(points) {
+  if (!Array.isArray(points) || points.length < 2) return Array.isArray(points) ? points : [];
+  const aligned = [];
+  for (const point of points) {
+    const alignedPoint = alignPointToModelSurface(point);
+    if (alignedPoint) aligned.push(alignedPoint);
+  }
+  return aligned.length >= 2 ? aligned : points;
+}
+
+function createRibbonGeometry(points, { lift = ROUTE_RIBBON_LIFT, thickness = ROUTE_RIBBON_THICKNESS } = {}) {
+  if (!Array.isArray(points) || points.length < 2) return null;
 
   const positions = [];
   const indices = [];
   let vi = 0;
 
   for (let i = 0; i < points.length - 1; i++) {
-    const a = points[i].clone(); a.y += lift;
-    const b = points[i + 1].clone(); b.y += lift;
+    const a = points[i].clone();
+    const b = points[i + 1].clone();
+    a.y += lift;
+    b.y += lift;
 
     const dir = new THREE.Vector3().subVectors(b, a);
     const len = dir.length();
@@ -971,7 +1854,6 @@ function drawRibbonPath(points) {
     dir.normalize();
 
     const perp = new THREE.Vector3(-dir.z, 0, dir.x).normalize().multiplyScalar(thickness / 2);
-
     const p1 = a.clone().add(perp);
     const p2 = a.clone().sub(perp);
     const p3 = b.clone().sub(perp);
@@ -992,141 +1874,615 @@ function drawRibbonPath(points) {
     vi += 4;
   }
 
+  if (!positions.length || !indices.length) return null;
+
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
-
-  const material = new THREE.MeshBasicMaterial({
-    color: 0xff0000,
-    transparent: true,
-    opacity: 1.0,
-    side: THREE.DoubleSide,
-    depthWrite: false,
-    depthTest: true,
-  });
-
-  routeMesh = new THREE.Mesh(geometry, material);
-  routeMesh.renderOrder = 999;
-  scene.add(routeMesh);
+  return geometry;
 }
 
-// --- Load model
-const MODEL_URL = "/tnts/models/tnts_map.glb";
+function setRouteRibbonGeometry(geometry) {
+  if (!geometry) {
+    if (routeMesh) {
+      scene.remove(routeMesh);
+      routeMesh.geometry?.dispose?.();
+      routeMesh = null;
+    }
+    return;
+  }
 
-const loader = new GLTFLoader();
-console.log("MODEL_URL RESOLVED:", new URL(MODEL_URL, import.meta.url).href);
+  if (!routeMesh) {
+    routeMesh = new THREE.Mesh(geometry, routeRibbonMaterial);
+    routeMesh.renderOrder = 999;
+    routeMesh.frustumCulled = false;
+    scene.add(routeMesh);
+    return;
+  }
 
-loader.load(
-  MODEL_URL,
-  (gltf) => {
-    loadedModel = gltf.scene;
-    scene.add(loadedModel);
+  routeMesh.geometry?.dispose?.();
+  routeMesh.geometry = geometry;
+  if (!routeMesh.parent) scene.add(routeMesh);
+}
 
-    // 1. Calculate Bounding Box
-    const box = new THREE.Box3().setFromObject(loadedModel);
-    const size = box.getSize(new THREE.Vector3()).length();
-    const center = box.getCenter(new THREE.Vector3());
+function setRouteArrowGeometry(geometry) {
+  if (!geometry) {
+    if (routeArrowMesh) {
+      scene.remove(routeArrowMesh);
+      routeArrowMesh.geometry?.dispose?.();
+      routeArrowMesh = null;
+    }
+    return;
+  }
 
-    // 2. Center Controls
-    controls.target.copy(center);
+  if (!routeArrowMesh) {
+    routeArrowMesh = new THREE.Mesh(geometry, routeArrowMaterial);
+    routeArrowMesh.renderOrder = 1000;
+    routeArrowMesh.frustumCulled = false;
+    scene.add(routeArrowMesh);
+    return;
+  }
 
-    // 3. Fix Camera Position
-    const STARTUP_CAMERA_CLOSENESS = 0.5;
-    const direction = new THREE.Vector3(1, 0.8, 1).normalize();
-    camera.position.copy(center).add(direction.multiplyScalar(size * STARTUP_CAMERA_CLOSENESS));
+  routeArrowMesh.geometry?.dispose?.();
+  routeArrowMesh.geometry = geometry;
+  if (!routeArrowMesh.parent) scene.add(routeArrowMesh);
+}
 
-    // 4. Update Planes
-    camera.near = Math.max(0.01, size / 1000);
-    camera.far  = size * 100;
-    camera.updateProjectionMatrix();
+function measureRouteLength(points) {
+  if (!Array.isArray(points) || points.length < 2) return 0;
+  let total = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    if (!a || !b) continue;
+    total += Math.hypot(b.x - a.x, b.z - a.z);
+  }
+  return total;
+}
 
-    // 5. OrbitControls limits
-    controls.minDistance = 0.0;
-    controls.maxDistance = size * 5.0;
+function getAnimatedRouteSpeed(routeDistance) {
+  const safeDistance = Math.max(1, Number(routeDistance) || 0);
+  const duration = THREE.MathUtils.clamp(1.8 + (Math.sqrt(safeDistance) * 0.22), 2.6, 7.5);
+  return safeDistance / duration;
+}
 
-    // 6. Update controls
-    controls.update();
+function createRouteAnimationState(points, routeDistance) {
+  const cleanPoints = (points || [])
+    .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.z))
+    .map((point) => point.clone());
+  if (cleanPoints.length < 2) return null;
 
-    directionsBtn.disabled = false;
-    clearRouteBtn.disabled = true;
+  const segmentLengths = [];
+  const cumulativeLengths = [0];
+  let totalLength = 0;
 
-    // ==========================
-    // ✅ APPLY SEARCH AFTER MODEL LOAD
-    // ==========================
-    if (typeof pendingSearchQuery !== "undefined" && pendingSearchQuery.trim()) {
-      handleSearchSelect(pendingSearchQuery);
+  for (let i = 0; i < cleanPoints.length - 1; i++) {
+    const a = cleanPoints[i];
+    const b = cleanPoints[i + 1];
+    const length = Math.hypot(b.x - a.x, b.z - a.z);
+    segmentLengths.push(length);
+    totalLength += length;
+    cumulativeLengths.push(totalLength);
+  }
+  if (!(totalLength > 0.001)) return null;
+
+  return {
+    points: cleanPoints,
+    segmentLengths,
+    cumulativeLengths,
+    totalLength,
+    revealLength: 0,
+    speed: getAnimatedRouteSpeed(Number.isFinite(routeDistance) ? routeDistance : totalLength),
+  };
+}
+
+function getVisibleRoutePoints(state, revealLength) {
+  if (!state?.points?.length || state.points.length < 2) return [];
+
+  const visible = [state.points[0].clone()];
+  let remaining = Math.max(0, Math.min(revealLength, state.totalLength));
+
+  for (let i = 0; i < state.points.length - 1; i++) {
+    const a = state.points[i];
+    const b = state.points[i + 1];
+    const segmentLength = state.segmentLengths[i];
+    if (!(segmentLength > 0.0001)) continue;
+
+    if (remaining >= segmentLength) {
+      visible.push(b.clone());
+      remaining -= segmentLength;
+      continue;
     }
 
-    console.log("GLB loaded. Size:", size, "Center:", center);
-  },
-  undefined,
-  (error) => {
-    console.error("GLB LOAD ERROR:", error);
-    alert("GLB failed to load. Check MODEL_URL path: " + MODEL_URL);
+    if (remaining > 0) {
+      const t = remaining / segmentLength;
+      visible.push(a.clone().lerp(b, t));
+    }
+    break;
   }
-);
 
+  return visible;
+}
+
+function sampleRouteAtDistance(state, distance) {
+  if (!state?.points?.length) return null;
+  const safeDistance = Math.max(0, Math.min(distance, state.totalLength));
+
+  for (let i = 0; i < state.segmentLengths.length; i++) {
+    const start = state.cumulativeLengths[i];
+    const end = state.cumulativeLengths[i + 1];
+    const segmentLength = state.segmentLengths[i];
+    if (!(segmentLength > 0.0001)) continue;
+    if (safeDistance > end && i < state.segmentLengths.length - 1) continue;
+
+    const a = state.points[i];
+    const b = state.points[i + 1];
+    const t = THREE.MathUtils.clamp((safeDistance - start) / segmentLength, 0, 1);
+    const point = a.clone().lerp(b, t);
+    const tangent = new THREE.Vector3(b.x - a.x, 0, b.z - a.z);
+    if (tangent.lengthSq() < 1e-6) tangent.set(1, 0, 0);
+    else tangent.normalize();
+    return { point, tangent };
+  }
+
+  const lastPoint = state.points[state.points.length - 1].clone();
+  const prevPoint = state.points[state.points.length - 2] || lastPoint;
+  const tangent = new THREE.Vector3(lastPoint.x - prevPoint.x, 0, lastPoint.z - prevPoint.z);
+  if (tangent.lengthSq() < 1e-6) tangent.set(1, 0, 0);
+  else tangent.normalize();
+  return { point: lastPoint, tangent };
+}
+
+function createRouteArrowGeometry(state) {
+  if (!state) return null;
+
+  const revealLength = Math.max(0, Math.min(state.revealLength, state.totalLength));
+  const placements = [];
+  const spacing = THREE.MathUtils.clamp(state.totalLength / 6, 10, 18);
+  const startOffset = Math.min(8, state.totalLength * 0.24);
+  const minTail = ROUTE_ARROW_LENGTH * 0.35;
+
+  for (let distance = startOffset; distance <= revealLength - minTail; distance += spacing) {
+    placements.push(distance);
+  }
+
+  const headDistance = revealLength - (ROUTE_ARROW_LENGTH * 0.55);
+  if (headDistance > ROUTE_ARROW_LENGTH * 0.45) {
+    const lastPlacement = placements.length ? placements[placements.length - 1] : -Infinity;
+    if (headDistance - lastPlacement > spacing * 0.45) {
+      placements.push(headDistance);
+    }
+  }
+  if (!placements.length) return null;
+
+  const positions = [];
+  const indices = [];
+  let vi = 0;
+
+  for (const distance of placements) {
+    const sample = sampleRouteAtDistance(state, distance);
+    if (!sample) continue;
+
+    const forward = sample.tangent.clone();
+    const side = new THREE.Vector3(-forward.z, 0, forward.x).normalize();
+    const center = sample.point.clone();
+    center.y += ROUTE_ARROW_LIFT;
+
+    const tip = center.clone().add(forward.clone().multiplyScalar(ROUTE_ARROW_LENGTH * 0.5));
+    const baseCenter = center.clone().add(forward.clone().multiplyScalar(-ROUTE_ARROW_LENGTH * 0.5));
+    const left = baseCenter.clone().add(side.clone().multiplyScalar(ROUTE_ARROW_WIDTH * 0.5));
+    const right = baseCenter.clone().add(side.clone().multiplyScalar(-ROUTE_ARROW_WIDTH * 0.5));
+
+    positions.push(
+      tip.x, tip.y, tip.z,
+      left.x, left.y, left.z,
+      right.x, right.y, right.z
+    );
+    indices.push(vi, vi + 1, vi + 2);
+    vi += 3;
+  }
+
+  if (!positions.length) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function renderAnimatedRoute(state) {
+  const visiblePoints = getVisibleRoutePoints(state, state?.revealLength || 0);
+  setRouteRibbonGeometry(createRibbonGeometry(visiblePoints));
+  setRouteArrowGeometry(createRouteArrowGeometry(state));
+}
+
+function startAnimatedRoute(points, routeDistance) {
+  clearRouteOnly();
+  const state = createRouteAnimationState(points, routeDistance);
+  if (!state) return false;
+  routeAnimationState = state;
+  renderAnimatedRoute(routeAnimationState);
+  return true;
+}
+
+function updateRouteAnimation(deltaSeconds) {
+  if (!routeAnimationState) return;
+  if (routeAnimationState.revealLength >= routeAnimationState.totalLength) return;
+
+  const clampedDelta = Math.max(0, Math.min(Number(deltaSeconds) || 0, ROUTE_ANIMATION_MAX_DELTA));
+  if (!(clampedDelta > 0)) return;
+
+  routeAnimationState.revealLength = Math.min(
+    routeAnimationState.totalLength,
+    routeAnimationState.revealLength + (routeAnimationState.speed * clampedDelta)
+  );
+  renderAnimatedRoute(routeAnimationState);
+}
+
+function drawRibbonPath(points) {
+  clearRouteOnly();
+  const state = createRouteAnimationState(points, measureRouteLength(points));
+  if (!state) return false;
+  state.revealLength = state.totalLength;
+  renderAnimatedRoute(state);
+  return true;
+}
+
+function updateKioskMarker() {
+  if (!kioskMarkerEl && !publishedKioskPointAligned && !publishedKioskPoint) return;
+
+  const marker = ensureKioskMarker();
+  const point = publishedKioskPointAligned || publishedKioskPoint;
+  if (!loadedModel || !point || !activeRoutesByKey.size) {
+    marker.style.display = "none";
+    return;
+  }
+
+  const rect = mapStage.getBoundingClientRect();
+  const width = rect.width || 1;
+  const height = rect.height || 1;
+  kioskMarkerScreen.copy(point).project(camera);
+
+  const x = (kioskMarkerScreen.x * 0.5 + 0.5) * width;
+  const y = (-kioskMarkerScreen.y * 0.5 + 0.5) * height;
+  const isVisible =
+    kioskMarkerScreen.z > -1 &&
+    kioskMarkerScreen.z < 1 &&
+    x >= -120 &&
+    x <= width + 120 &&
+    y >= -120 &&
+    y <= height + 120;
+
+  marker.style.display = isVisible ? "block" : "none";
+  if (isVisible) {
+    marker.style.left = `${x}px`;
+    marker.style.top = `${y}px`;
+  }
+}
+
+// --- Live map boot / reload
+const loader = new GLTFLoader();
+
+function addCacheBuster(url, v) {
+  if (!url) return url;
+  const token = encodeURIComponent(String(v || Date.now()));
+  const sep = String(url).includes("?") ? "&" : "?";
+  return `${url}${sep}v=${token}`;
+}
+
+function disposeHierarchy(root) {
+  if (!root) return;
+  const disposedGeometries = new Set();
+  const disposedMaterials = new Set();
+  const disposedTextures = new Set();
+
+  root.traverse((node) => {
+    if (!(node.isMesh || node.isLine || node.isPoints)) return;
+
+    if (node.geometry && node.geometry.dispose && !disposedGeometries.has(node.geometry)) {
+      disposedGeometries.add(node.geometry);
+      node.geometry.dispose();
+    }
+
+    for (const mat of getMaterialArray(node.material)) {
+      if (!mat || disposedMaterials.has(mat)) continue;
+      disposedMaterials.add(mat);
+
+      for (const key of Object.keys(mat)) {
+        const tex = mat[key];
+        if (tex && tex.isTexture && tex.dispose && !disposedTextures.has(tex)) {
+          disposedTextures.add(tex);
+          tex.dispose();
+        }
+      }
+
+      if (mat.dispose) mat.dispose();
+    }
+  });
+}
+
+function applyLoadedModel(newModel) {
+  const previousModel = loadedModel;
+
+  clearRouteOnly();
+  clearClickOutline();
+  clearHoverOutline();
+  clearHoverTint();
+  clearBuildingLabels();
+  selectedBuildingName = null;
+  hoveredBuildingName = null;
+  infoCard?.classList?.add("hidden");
+  clearRouteBtn.disabled = true;
+
+  if (previousModel) {
+    scene.remove(previousModel);
+    disposeHierarchy(previousModel);
+  }
+
+  loadedModel = newModel;
+  scene.add(loadedModel);
+  loadedModel.updateMatrixWorld(true);
+  publishedKioskPointAligned = publishedKioskPoint ? alignPointToModelSurface(publishedKioskPoint) : null;
+
+  // 1. Calculate Bounding Box
+  const box = new THREE.Box3().setFromObject(loadedModel);
+  const size = box.getSize(new THREE.Vector3()).length();
+  const center = box.getCenter(new THREE.Vector3());
+
+  // 2. Center Controls
+  controls.target.copy(center);
+
+  // 3. Fix Camera Position
+  const STARTUP_CAMERA_CLOSENESS = 0.5;
+  const direction = new THREE.Vector3(1, 0.8, 1).normalize();
+  camera.position.copy(center).add(direction.multiplyScalar(size * STARTUP_CAMERA_CLOSENESS));
+
+  // 4. Update Planes
+  camera.near = Math.max(0.01, size / 1000);
+  camera.far = size * 100;
+  camera.updateProjectionMatrix();
+
+  // 5. OrbitControls limits
+  controls.minDistance = 0.0;
+  controls.maxDistance = size * 5.0;
+
+  // 6. Update controls
+  controls.update();
+  directionsBtn.disabled = true;
+  clearRouteBtn.disabled = true;
+  rebuildBuildingLabels(loadedModel, size);
+
+  if (typeof pendingSearchQuery !== "undefined" && pendingSearchQuery.trim()) {
+    handleSearchSelect(pendingSearchQuery);
+  }
+
+  console.log("GLB loaded. Size:", size, "Center:", center);
+}
+
+function loadModel(modelUrl) {
+  return new Promise((resolve, reject) => {
+    loader.load(
+      modelUrl,
+      (gltf) => {
+        applyLoadedModel(gltf.scene);
+        resolve();
+      },
+      undefined,
+      (error) => reject(error)
+    );
+  });
+}
+
+async function fetchLiveMapPayload() {
+  const url = addCacheBuster(LIVE_MAP_ENDPOINT, Date.now());
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Live map fetch failed (${res.status})`);
+  const payload = await res.json();
+  if (!payload || payload.ok === false) throw new Error("Live map payload invalid");
+  return payload;
+}
+
+function applyPublishedRoutes(payload) {
+  const ok = setPublishedRoutes(payload?.routes || null);
+  if (!ok) {
+    rebuildRouteCatalog([]);
+    setPublishedKioskPoint(null);
+  }
+}
+
+async function loadLiveMap(payload, { forceReloadModel = false } = {}) {
+  const modelUrl = String(payload?.modelUrl || FALLBACK_MODEL_URL);
+  const version = String(payload?.version || "");
+  const shouldReload = forceReloadModel || !loadedModel || version !== liveVersion;
+  currentLiveModelFile = String(payload?.modelFile || currentLiveModelFile || "");
+
+  applyPublishedRoutes(payload);
+
+  if (shouldReload) {
+    await loadModel(addCacheBuster(modelUrl, version || Date.now()));
+  }
+
+  liveVersion = version || liveVersion;
+  if (payload?.publishedAt) {
+    console.log("Live map version:", liveVersion, "publishedAt:", payload.publishedAt);
+  }
+
+  // Refresh searchable rooms/buildings from DB when map payload is loaded.
+  loadSearchCatalog(currentLiveModelFile).catch(() => {});
+}
+
+async function bootLiveMap() {
+  try {
+    const payload = await fetchLiveMapPayload();
+    await loadLiveMap(payload, { forceReloadModel: true });
+  } catch (err) {
+    console.warn("Live map unavailable, using fallback:", err);
+    rebuildRouteCatalog([]);
+    setPublishedKioskPoint(null);
+    currentLiveModelFile = "";
+    await loadModel(addCacheBuster(FALLBACK_MODEL_URL, Date.now()));
+    loadSearchCatalog("").catch(() => {});
+  }
+}
+
+async function checkLiveMapUpdates() {
+  if (livePollBusy) return;
+  livePollBusy = true;
+  try {
+    const payload = await fetchLiveMapPayload();
+    const nextVersion = String(payload?.version || "");
+    if (!nextVersion || nextVersion !== liveVersion) {
+      await loadLiveMap(payload, { forceReloadModel: true });
+    } else {
+      currentLiveModelFile = String(payload?.modelFile || currentLiveModelFile || "");
+      applyPublishedRoutes(payload);
+      loadSearchCatalog(currentLiveModelFile).catch(() => {});
+    }
+  } catch (_) {
+    // Keep current map/routes when offline or temporarily unavailable.
+  } finally {
+    livePollBusy = false;
+  }
+}
+
+bootLiveMap().catch((error) => {
+  console.error("LIVE MAP BOOT ERROR:", error);
+  alert("Map failed to load.");
+});
+
+if (!livePollTimer) {
+  livePollTimer = setInterval(checkLiveMapUpdates, LIVE_POLL_INTERVAL_MS);
+}
+
+
+function pickSceneSelection(event) {
+  if (!loadedModel) return null;
+  setMouseFromEvent(event);
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(loadedModel.children, true);
+  if (intersects.length === 0) return null;
+  const hit = intersects[0].object;
+  const buildingEntry = findBuildingEntryFromHit(hit);
+  if (!buildingEntry) return null;
+  return { hit, buildingEntry };
+}
+
+function handleSceneSelection(event) {
+  if (event.target?.closest?.("#info-card")) return;
+  if (!loadedModel) return;
+
+  const selection = pickSceneSelection(event);
+  if (!selection) {
+    hideCardAndClear();
+    return;
+  }
+
+  const { hit, buildingEntry } = selection;
+  selectedBuildingName = buildingEntry.name;
+
+  const outlineTarget = buildingEntry.object || hit;
+  if (outlineTarget) setClickOutline(outlineTarget);
+
+  showCard(buildingEntry.name);
+}
+
+canvas.addEventListener("pointerdown", (event) => {
+  if (!isTouchLikePointer(event)) return;
+  isSceneHoverActive = false;
+  hoveredBuildingName = null;
+  clearHoverTint();
+  clearHoverOutline();
+  trackTouchPointer(event);
+  if (touchSceneTap) touchSceneTap.hadMultiTouch = touchSceneTap.hadMultiTouch || activeTouchPointers.size > 1;
+  touchSceneTap = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
+    hadMultiTouch: activeTouchPointers.size > 1
+  };
+}, true);
+
+canvas.addEventListener("pointermove", (event) => {
+  if (!isTouchLikePointer(event)) return;
+  trackTouchPointer(event);
+  if (touchSceneTap && touchSceneTap.pointerId === event.pointerId) {
+    const dx = Math.abs(event.clientX - touchSceneTap.startX);
+    const dy = Math.abs(event.clientY - touchSceneTap.startY);
+    if (dx > TOUCH_TAP_SLOP_PX || dy > TOUCH_TAP_SLOP_PX) touchSceneTap.moved = true;
+  }
+  if (touchSceneTap && activeTouchPointers.size > 1) touchSceneTap.hadMultiTouch = true;
+  updateTouchFovZoom();
+}, true);
+
+window.addEventListener("pointerup", (event) => {
+  if (!isTouchLikePointer(event)) return;
+  const tap = touchSceneTap && touchSceneTap.pointerId === event.pointerId ? touchSceneTap : null;
+  releaseTouchPointer(event.pointerId);
+  if (!tap) return;
+  touchSceneTap = null;
+  if (tap.hadMultiTouch || tap.moved || !isEventOnCanvas(event)) return;
+  suppressSceneClickUntil = performance.now() + TOUCH_CLICK_SUPPRESS_MS;
+  handleSceneSelection(event);
+}, true);
+
+window.addEventListener("pointercancel", (event) => {
+  if (!isTouchLikePointer(event)) return;
+  releaseTouchPointer(event.pointerId);
+  if (touchSceneTap && touchSceneTap.pointerId === event.pointerId) touchSceneTap = null;
+}, true);
 
 // --- Click selection
 window.addEventListener("click", (event) => {
-  if (event.target.closest("#info-card")) return;
-  if (!loadedModel) return;
-
-  setMouseFromEvent(event);
-
-  raycaster.setFromCamera(mouse, camera);
-  const intersects = raycaster.intersectObjects(loadedModel.children, true);
-
-  if (intersects.length === 0) {
-    hideCardAndClear();
-    return;
-  }
-
-  const hit = intersects[0].object;
-  const buildingName = findBuildingNameFromHit(hit);
-  if (!buildingName) {
-    hideCardAndClear();
-    return;
-  }
-
-  selectedBuildingName = buildingName;
-
-  const outlineTargetMesh = findBestOutlineMesh(hit);
-  if (outlineTargetMesh) setClickOutline(outlineTargetMesh);
-
-  showCard(buildingName);
+  if (performance.now() < suppressSceneClickUntil) return;
+  handleSceneSelection(event);
 });
 
 // --- Hover
 function animate() {
   requestAnimationFrame(animate);
+  const deltaSeconds = frameClock.getDelta();
 
-  if (loadedModel) {
+  if (loadedModel && isSceneHoverActive) {
     raycaster.setFromCamera(mouse, camera);
     const intersects = raycaster.intersectObjects(loadedModel.children, true);
 
     if (intersects.length > 0) {
       const hit = intersects[0].object;
-      const buildingName = findBuildingNameFromHit(hit);
+      const buildingEntry = findBuildingEntryFromHit(hit);
+      const buildingName = buildingEntry?.name || null;
 
       if (buildingName) {
+        hoveredBuildingName = buildingName;
+        // Hover follows the exact child mesh under the cursor.
+        // Building-root resolution is still used only to know which building is being hovered.
         const mesh = findBestOutlineMesh(hit);
         if (mesh && hoveredMesh !== mesh) {
           applyHoverTint(mesh);
           setHoverOutline(mesh);
         }
       } else {
+        hoveredBuildingName = null;
         clearHoverTint();
         clearHoverOutline();
       }
     } else {
+      hoveredBuildingName = null;
       clearHoverTint();
       clearHoverOutline();
     }
+  } else if (hoveredBuildingName) {
+    hoveredBuildingName = null;
+    clearHoverTint();
+    clearHoverOutline();
   }
 
+  updateRouteAnimation(deltaSeconds);
   controls.update();
+  updateBuildingLabels();
+  updateKioskMarker();
   renderer.render(scene, camera);
 }
 

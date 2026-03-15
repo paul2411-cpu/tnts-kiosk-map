@@ -26,13 +26,18 @@ body{
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   color:var(--text);
   background: #f6f7fb;
+  overflow: hidden;
 }
 
 /* Layout */
 .admin-shell{
   display:grid;
   grid-template-columns: 280px 1fr;
+  grid-template-rows: 1fr;
   min-height:100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .sidebar{
@@ -42,6 +47,15 @@ body{
   display:flex;
   flex-direction:column;
   gap: 14px;
+  overflow: hidden;
+  min-height: 0;
+  height: 100%;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 280px;
+  z-index: 20;
 }
 
 .brand{
@@ -61,7 +75,16 @@ body{
   opacity: .85;
 }
 
-.nav{ display:flex; flex-direction:column; gap:6px; margin-top:6px; }
+.nav{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  margin-top:6px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
 
 .nav-item{
   display:flex;
@@ -102,6 +125,7 @@ body{
   border-radius: 14px;
   background: rgba(255,255,255,.10);
   border: 1px solid rgba(255,255,255,.14);
+  flex-shrink: 0;
 }
 .me-name{ font-weight: 800; font-size: 13px; }
 .me-role{ font-size: 12px; opacity:.85; margin-top:2px; }
@@ -109,6 +133,12 @@ body{
 /* Main */
 .main{
   padding: 18px 18px 28px;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  display:flex;
+  flex-direction:column;
+  grid-column: 2 / 3;
 }
 
 .topbar{
@@ -143,6 +173,9 @@ body{
   border-radius: var(--r);
   padding: 18px;
   box-shadow: var(--shadow);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* Cards + grid */
@@ -153,9 +186,29 @@ body{
 .grid.cols-4{ grid-template-columns: repeat(4, minmax(0,1fr)); }
 @media (max-width: 1100px){ .grid.cols-4{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
 @media (max-width: 700px){
+  body{ overflow: auto; }
   .admin-shell{ grid-template-columns: 1fr; }
-  .sidebar{ position:sticky; top:0; z-index:10; }
+  .sidebar{
+    position:sticky;
+    top:0;
+    z-index:10;
+    height:auto;
+    bottom:auto;
+    width:auto;
+    overflow: visible;
+  }
+  .nav{ overflow: visible; padding-right: 0; }
+  .sidebar-footer{ position: static; }
   .grid.cols-4{ grid-template-columns: 1fr; }
+  .main{
+    overflow: visible;
+    display:block;
+    height:auto;
+    grid-column: 1 / -1;
+  }
+  .content{
+    overflow: visible;
+  }
 }
 
 .card{

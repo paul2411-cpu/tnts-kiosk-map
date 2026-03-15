@@ -25,6 +25,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $stmt->close();
 
     if ($user && password_verify($password, $user["password_hash"])) {
+      session_regenerate_id(true);
       $_SESSION["admin_logged_in"] = true;
       $_SESSION["admin_id"] = $user["admin_id"];
       $_SESSION["admin_username"] = $user["username"];

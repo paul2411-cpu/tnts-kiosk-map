@@ -1,17 +1,448 @@
-<?php
+﻿<?php
 require_once __DIR__ . "/inc/auth.php";
 require_admin();
+require_once __DIR__ . "/inc/db.php";
 
 $ASSET_DIR = __DIR__ . "/assets_map";
 $OVERLAY_PATH = __DIR__ . "/overlays/map_overlay.json";
 $MODEL_DIR = __DIR__ . "/../models";
 $DEFAULT_MODEL_PATH = __DIR__ . "/overlays/default_model.json";
-$ORIGINAL_MODEL_NAME = "tnts_map.glb";
+$LIVE_MAP_PATH = __DIR__ . "/overlays/map_live.json";
+$RELEASES_PATH = __DIR__ . "/overlays/map_releases.json";
+$ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
+
+if (empty($_SESSION["map_editor_csrf"])) {
+  try {
+    $_SESSION["map_editor_csrf"] = bin2hex(random_bytes(32));
+  } catch (Throwable $_) {
+    $fallback = function_exists("openssl_random_pseudo_bytes") ? openssl_random_pseudo_bytes(32) : false;
+    if (!is_string($fallback) || strlen($fallback) < 32) {
+      $fallback = hash("sha256", uniqid((string)mt_rand(), true), true);
+    }
+    $_SESSION["map_editor_csrf"] = bin2hex($fallback);
+  }
+}
+$MAP_EDITOR_CSRF = (string)$_SESSION["map_editor_csrf"];
+
+if (empty($_SESSION["map_import_csrf"])) {
+  try {
+    $_SESSION["map_import_csrf"] = bin2hex(random_bytes(32));
+  } catch (Throwable $_) {
+    $fallback = function_exists("openssl_random_pseudo_bytes") ? openssl_random_pseudo_bytes(32) : false;
+    if (!is_string($fallback) || strlen($fallback) < 32) {
+      $fallback = hash("sha256", uniqid((string)mt_rand(), true), true);
+    }
+    $_SESSION["map_import_csrf"] = bin2hex($fallback);
+  }
+}
+$MAP_IMPORT_CSRF = (string)$_SESSION["map_import_csrf"];
+
+function json_error_and_exit(int $status, string $message): void {
+  http_response_code($status);
+  echo json_encode(["ok" => false, "error" => $message], JSON_PRETTY_PRINT);
+  exit;
+}
+
+function is_same_origin_request(): bool {
+  $origin = $_SERVER["HTTP_ORIGIN"] ?? "";
+  $referer = $_SERVER["HTTP_REFERER"] ?? "";
+  $reqHostRaw = trim((string)($_SERVER["HTTP_HOST"] ?? ""));
+  if ($reqHostRaw === "") return false;
+  $reqHost = strtolower($reqHostRaw);
+  $reqPort = isset($_SERVER["SERVER_PORT"]) ? (int)$_SERVER["SERVER_PORT"] : null;
+  if (strpos($reqHostRaw, ":") !== false && preg_match('/^(.+):(\d+)$/', $reqHostRaw, $m)) {
+    $reqHost = strtolower($m[1]);
+    $reqPort = (int)$m[2];
+  }
+
+  if (is_string($origin) && $origin !== "") {
+    $parts = parse_url($origin);
+    if (!is_array($parts) || empty($parts["host"])) return false;
+    $originHost = strtolower((string)$parts["host"]);
+    $originPort = isset($parts["port"]) ? (int)$parts["port"] : null;
+    if ($originHost !== $reqHost) return false;
+    if ($originPort !== null && $reqPort !== null && $originPort !== $reqPort) return false;
+    return true;
+  }
+
+  if (is_string($referer) && $referer !== "") {
+    $parts = parse_url($referer);
+    if (!is_array($parts) || empty($parts["host"])) return false;
+    $refHost = strtolower((string)$parts["host"]);
+    if ($refHost !== $reqHost) return false;
+    $refPort = isset($parts["port"]) ? (int)$parts["port"] : null;
+    if ($refPort !== null && $reqPort !== null && $refPort !== $reqPort) return false;
+    return true;
+  }
+
+  // Some clients may omit both headers on same-origin requests.
+  return true;
+}
+
+function verify_csrf_or_origin(): void {
+  if ($_SERVER["REQUEST_METHOD"] !== "POST") {
+    json_error_and_exit(405, "POST required");
+  }
+
+  if (!is_same_origin_request()) {
+    json_error_and_exit(403, "Cross-origin request denied");
+  }
+
+  $token = $_SERVER["HTTP_X_CSRF_TOKEN"] ?? "";
+  $sessionToken = isset($_SESSION["map_editor_csrf"]) ? (string)$_SESSION["map_editor_csrf"] : "";
+  if (!is_string($token) || $token === "" || $sessionToken === "" || !hash_equals($sessionToken, $token)) {
+    json_error_and_exit(403, "CSRF validation failed");
+  }
+}
+
+function safe_atomic_write_bytes(string $path, string $content): bool {
+  $dir = dirname($path);
+  if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
+    return false;
+  }
+
+  try {
+    $suffix = bin2hex(random_bytes(8));
+  } catch (Throwable $_) {
+    $suffix = (string)mt_rand(100000, 999999);
+  }
+
+  $tmp = $path . ".tmp." . $suffix;
+  $written = file_put_contents($tmp, $content, LOCK_EX);
+  if ($written === false) {
+    @unlink($tmp);
+    return false;
+  }
+
+  if (@rename($tmp, $path)) return true;
+
+  // Windows fallback (rename cannot overwrite existing files).
+  @unlink($path);
+  if (@rename($tmp, $path)) return true;
+
+  @unlink($tmp);
+  return false;
+}
+
+function safe_atomic_write_json(string $path, $data): bool {
+  $json = json_encode($data, JSON_PRETTY_PRINT);
+  if ($json === false) return false;
+  return safe_atomic_write_bytes($path, $json);
+}
+
+function restore_file_from_backup(string $path, ?string $backup): void {
+  if ($backup === null) {
+    if (file_exists($path)) @unlink($path);
+    return;
+  }
+  safe_atomic_write_bytes($path, $backup);
+}
+
+function is_numeric_vec3($value): bool {
+  return is_array($value)
+    && count($value) >= 3
+    && is_numeric($value[0])
+    && is_numeric($value[1])
+    && is_numeric($value[2]);
+}
+
+function validate_overlay_item($item, ?string &$error = null): bool {
+  if (!is_array($item)) {
+    $error = "Item must be an object";
+    return false;
+  }
+
+  $type = isset($item["type"]) ? (string)$item["type"] : (isset($item["points"]) ? "road" : "asset");
+  if ($type === "road") {
+    if (!isset($item["points"]) || !is_array($item["points"])) {
+      $error = "Road item points must be an array";
+      return false;
+    }
+    foreach ($item["points"] as $idx => $pt) {
+      if (!is_numeric_vec3($pt)) {
+        $error = "Road item point {$idx} must be numeric [x,y,z]";
+        return false;
+      }
+    }
+    if (isset($item["position"]) && !is_numeric_vec3($item["position"])) {
+      $error = "Road item position must be numeric [x,y,z]";
+      return false;
+    }
+    if (isset($item["rotation"]) && !is_numeric_vec3($item["rotation"])) {
+      $error = "Road item rotation must be numeric [x,y,z]";
+      return false;
+    }
+    if (isset($item["scale"]) && !is_numeric_vec3($item["scale"])) {
+      $error = "Road item scale must be numeric [x,y,z]";
+      return false;
+    }
+    return true;
+  }
+
+  if (empty($item["asset"]) || !is_string($item["asset"])) {
+    $error = "Asset item requires a valid asset path";
+    return false;
+  }
+  if (!isset($item["position"]) || !is_numeric_vec3($item["position"])) {
+    $error = "Asset item position must be numeric [x,y,z]";
+    return false;
+  }
+  if (!isset($item["rotation"]) || !is_numeric_vec3($item["rotation"])) {
+    $error = "Asset item rotation must be numeric [x,y,z]";
+    return false;
+  }
+  if (!isset($item["scale"]) || !is_numeric_vec3($item["scale"])) {
+    $error = "Asset item scale must be numeric [x,y,z]";
+    return false;
+  }
+  return true;
+}
+
+function validate_roadnet_payload($data, ?string &$error = null): bool {
+  if (!is_array($data) || !isset($data["roads"]) || !is_array($data["roads"])) {
+    $error = "Roadnet payload must include roads[]";
+    return false;
+  }
+  foreach ($data["roads"] as $idx => $roadItem) {
+    $itemError = null;
+    if (!validate_overlay_item(array_merge(["type" => "road"], is_array($roadItem) ? $roadItem : []), $itemError)) {
+      $error = "roads[{$idx}] invalid: " . ($itemError ?: "Malformed road item");
+      return false;
+    }
+  }
+  return true;
+}
+
+function is_valid_glb_binary(string $raw): bool {
+  if (strlen($raw) < 12) return false;
+  $hdr = unpack("a4magic/Vversion/Vlength", substr($raw, 0, 12));
+  if (!is_array($hdr)) return false;
+  if (($hdr["magic"] ?? "") !== "glTF") return false;
+  if ((int)($hdr["version"] ?? 0) !== 2) return false;
+  if ((int)($hdr["length"] ?? 0) !== strlen($raw)) return false;
+  return true;
+}
+
+function editor_db_col(mysqli $conn, string $table, string $column): bool {
+  $safeTable = str_replace("`", "``", $table);
+  $safeColumn = $conn->real_escape_string($column);
+  $res = $conn->query("SHOW COLUMNS FROM `{$safeTable}` LIKE '{$safeColumn}'");
+  return $res instanceof mysqli_result && $res->num_rows > 0;
+}
+
+function editor_db_sql(mysqli $conn, string $sql): void {
+  if (!$conn->query($sql)) throw new RuntimeException($conn->error);
+}
+
+function editor_ensure_snapshot_schema(mysqli $conn): void {
+  editor_db_sql($conn, "
+    CREATE TABLE IF NOT EXISTS map_versions (
+      version_id INT AUTO_INCREMENT PRIMARY KEY,
+      model_file VARCHAR(255) NOT NULL,
+      model_hash CHAR(64) NOT NULL,
+      imported_by_admin_id INT NULL,
+      total_buildings INT NOT NULL DEFAULT 0,
+      total_rooms INT NOT NULL DEFAULT 0,
+      date_created TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uniq_model_hash (model_file, model_hash)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  ");
+  if (!editor_db_col($conn, "buildings", "source_model_file")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN source_model_file VARCHAR(255) NULL AFTER image_path");
+  if (!editor_db_col($conn, "buildings", "first_seen_version_id")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
+  if (!editor_db_col($conn, "buildings", "last_seen_version_id")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
+  if (!editor_db_col($conn, "buildings", "is_present_in_latest")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
+  if (!editor_db_col($conn, "buildings", "last_edited_at")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
+  if (!editor_db_col($conn, "buildings", "last_edited_by_admin_id")) editor_db_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
+  if (!editor_db_col($conn, "rooms", "building_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN building_id INT NULL AFTER room_id");
+  if (!editor_db_col($conn, "rooms", "room_number")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN room_number VARCHAR(50) NULL AFTER room_name");
+  if (!editor_db_col($conn, "rooms", "room_type")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN room_type VARCHAR(100) NULL AFTER room_number");
+  if (!editor_db_col($conn, "rooms", "floor_number")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN floor_number VARCHAR(50) NULL AFTER room_type");
+  if (!editor_db_col($conn, "rooms", "building_name")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN building_name VARCHAR(255) NULL AFTER floor_number");
+  if (!editor_db_col($conn, "rooms", "description")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN description TEXT NULL AFTER building_name");
+  if (!editor_db_col($conn, "rooms", "image_path")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN image_path VARCHAR(255) NULL AFTER description");
+  if (!editor_db_col($conn, "rooms", "source_model_file")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN source_model_file VARCHAR(255) NULL AFTER image_path");
+  if (!editor_db_col($conn, "rooms", "first_seen_version_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
+  if (!editor_db_col($conn, "rooms", "last_seen_version_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
+  if (!editor_db_col($conn, "rooms", "is_present_in_latest")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
+  if (!editor_db_col($conn, "rooms", "last_edited_at")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
+  if (!editor_db_col($conn, "rooms", "last_edited_by_admin_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
+}
+
+function editor_get_or_create_version_id(mysqli $conn, string $modelFile, string $modelHash): int {
+  $stmt = $conn->prepare("SELECT version_id FROM map_versions WHERE model_file = ? AND model_hash = ? LIMIT 1");
+  if (!$stmt) throw new RuntimeException("Failed to prepare map version lookup");
+  $stmt->bind_param("ss", $modelFile, $modelHash);
+  if (!$stmt->execute()) throw new RuntimeException("Failed to query map_versions");
+  $res = $stmt->get_result();
+  $row = $res ? $res->fetch_assoc() : null;
+  $stmt->close();
+  if ($row && isset($row["version_id"])) return (int)$row["version_id"];
+
+  $stmt = $conn->prepare("INSERT INTO map_versions (model_file, model_hash, imported_by_admin_id, total_buildings, total_rooms) VALUES (?, ?, NULL, 0, 0)");
+  if (!$stmt) throw new RuntimeException("Failed to prepare map version insert");
+  $stmt->bind_param("ss", $modelFile, $modelHash);
+  if (!$stmt->execute()) throw new RuntimeException("Failed to insert map version");
+  $id = (int)$stmt->insert_id;
+  $stmt->close();
+  return $id;
+}
+
+function editor_refresh_version_totals(mysqli $conn, int $versionId, string $modelFile): void {
+  $safeModel = $conn->real_escape_string($modelFile);
+  $buildingCountRes = $conn->query("SELECT COUNT(*) AS cnt FROM buildings WHERE source_model_file = '{$safeModel}' AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)");
+  $roomCountRes = $conn->query("SELECT COUNT(*) AS cnt FROM rooms WHERE source_model_file = '{$safeModel}' AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)");
+  $buildingCount = ($buildingCountRes instanceof mysqli_result) ? (int)(($buildingCountRes->fetch_assoc()["cnt"] ?? 0)) : 0;
+  $roomCount = ($roomCountRes instanceof mysqli_result) ? (int)(($roomCountRes->fetch_assoc()["cnt"] ?? 0)) : 0;
+
+  $stmt = $conn->prepare("UPDATE map_versions SET total_buildings = ?, total_rooms = ? WHERE version_id = ?");
+  if (!$stmt) throw new RuntimeException("Failed to prepare version total update");
+  $stmt->bind_param("iii", $buildingCount, $roomCount, $versionId);
+  if (!$stmt->execute()) throw new RuntimeException("Failed to update version totals");
+  $stmt->close();
+}
+
+function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $targetModel, int $targetVersionId): void {
+  if ($sourceModel === "" || $targetModel === "" || $sourceModel === $targetModel) return;
+
+  $buildingSql = "
+    SELECT building_id, building_name, description, image_path, last_edited_at, last_edited_by_admin_id
+    FROM buildings
+    WHERE source_model_file = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
+    ORDER BY building_id ASC
+  ";
+  $buildingStmt = $conn->prepare($buildingSql);
+  if (!$buildingStmt) throw new RuntimeException("Failed to prepare source building query");
+  $buildingStmt->bind_param("s", $sourceModel);
+  if (!$buildingStmt->execute()) throw new RuntimeException("Failed to load source building snapshot");
+  $buildingRes = $buildingStmt->get_result();
+  $sourceBuildings = [];
+  if ($buildingRes instanceof mysqli_result) {
+    while ($row = $buildingRes->fetch_assoc()) $sourceBuildings[] = $row;
+  }
+  $buildingStmt->close();
+  if (!$sourceBuildings) return;
+
+  $insertBuildingStmt = $conn->prepare("
+    INSERT INTO buildings (
+      building_name,
+      description,
+      image_path,
+      source_model_file,
+      first_seen_version_id,
+      last_seen_version_id,
+      is_present_in_latest,
+      last_edited_at,
+      last_edited_by_admin_id
+    )
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+  ");
+  if (!$insertBuildingStmt) throw new RuntimeException("Failed to prepare cloned building insert");
+
+  $insertRoomStmt = $conn->prepare("
+    INSERT INTO rooms (
+      building_id,
+      room_name,
+      room_number,
+      room_type,
+      floor_number,
+      building_name,
+      description,
+      image_path,
+      source_model_file,
+      first_seen_version_id,
+      last_seen_version_id,
+      is_present_in_latest,
+      last_edited_at,
+      last_edited_by_admin_id
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+  ");
+  if (!$insertRoomStmt) throw new RuntimeException("Failed to prepare cloned room insert");
+
+  $roomQueryStmt = $conn->prepare("
+    SELECT room_name, room_number, room_type, floor_number, building_name, description, image_path, last_edited_at, last_edited_by_admin_id
+    FROM rooms
+    WHERE source_model_file = ? AND building_id = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
+    ORDER BY room_id ASC
+  ");
+  if (!$roomQueryStmt) throw new RuntimeException("Failed to prepare source room query");
+
+  foreach ($sourceBuildings as $building) {
+    $sourceBuildingId = (int)($building["building_id"] ?? 0);
+    if ($sourceBuildingId <= 0) continue;
+
+    $buildingName = trim((string)($building["building_name"] ?? ""));
+    if ($buildingName === "") continue;
+    $buildingDescription = trim((string)($building["description"] ?? ""));
+    $buildingImagePath = trim((string)($building["image_path"] ?? ""));
+    $buildingEditedAt = isset($building["last_edited_at"]) ? (string)$building["last_edited_at"] : null;
+    $buildingEditedBy = isset($building["last_edited_by_admin_id"]) ? (int)$building["last_edited_by_admin_id"] : null;
+
+    $insertBuildingStmt->bind_param(
+      "ssssiisi",
+      $buildingName,
+      $buildingDescription,
+      $buildingImagePath,
+      $targetModel,
+      $targetVersionId,
+      $targetVersionId,
+      $buildingEditedAt,
+      $buildingEditedBy
+    );
+    if (!$insertBuildingStmt->execute()) throw new RuntimeException("Failed to clone building snapshot: " . $buildingName);
+    $newBuildingId = (int)$insertBuildingStmt->insert_id;
+
+    $roomQueryStmt->bind_param("si", $sourceModel, $sourceBuildingId);
+    if (!$roomQueryStmt->execute()) throw new RuntimeException("Failed to load source room snapshot: " . $buildingName);
+    $roomRes = $roomQueryStmt->get_result();
+    if (!($roomRes instanceof mysqli_result)) continue;
+
+    while ($room = $roomRes->fetch_assoc()) {
+      $roomName = trim((string)($room["room_name"] ?? ""));
+      if ($roomName === "") continue;
+      $roomNumber = trim((string)($room["room_number"] ?? ""));
+      $roomType = trim((string)($room["room_type"] ?? ""));
+      $floorNumber = trim((string)($room["floor_number"] ?? ""));
+      $roomBuildingName = trim((string)($room["building_name"] ?? $buildingName));
+      $roomDescription = trim((string)($room["description"] ?? ""));
+      $roomImagePath = trim((string)($room["image_path"] ?? ""));
+      $roomEditedAt = isset($room["last_edited_at"]) ? (string)$room["last_edited_at"] : null;
+      $roomEditedBy = isset($room["last_edited_by_admin_id"]) ? (int)$room["last_edited_by_admin_id"] : null;
+
+      $insertRoomStmt->bind_param(
+        "issssssssiisi",
+        $newBuildingId,
+        $roomName,
+        $roomNumber,
+        $roomType,
+        $floorNumber,
+        $roomBuildingName,
+        $roomDescription,
+        $roomImagePath,
+        $targetModel,
+        $targetVersionId,
+        $targetVersionId,
+        $roomEditedAt,
+        $roomEditedBy
+      );
+      if (!$insertRoomStmt->execute()) throw new RuntimeException("Failed to clone room snapshot: " . $roomName);
+    }
+  }
+
+  $roomQueryStmt->close();
+  $insertRoomStmt->close();
+  $insertBuildingStmt->close();
+}
 
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
+  $action = (string)$_GET["action"];
 
-  if ($_GET["action"] === "list_assets") {
+  if (in_array($action, ["save_routes", "save_roadnet", "set_default_model", "publish_map", "save_overlay", "export_glb"], true)) {
+    verify_csrf_or_origin();
+  }
+
+  if ($action === "list_assets") {
     $items = [];
     if (is_dir($ASSET_DIR)) {
       foreach (scandir($ASSET_DIR) as $f) {
@@ -27,7 +458,143 @@ if (isset($_GET["action"])) {
     exit;
   }
 
-  if ($_GET["action"] === "list_models") {
+  if ($action === "load_routes") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      echo json_encode(["ok" => true, "routes" => new stdClass()], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+    $path = __DIR__ . "/overlays/routes_" . $safe . ".json";
+    if (file_exists($path)) {
+      echo file_get_contents($path);
+    } else {
+      echo json_encode(["ok" => true, "routes" => new stdClass()], JSON_PRETTY_PRINT);
+    }
+    exit;
+  }
+
+  if ($action === "save_routes") {
+
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid name"]);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    if (!is_array($data) || !isset($data["routes"]) || !is_array($data["routes"])) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid JSON"]);
+      exit;
+    }
+
+    $overlayDir = __DIR__ . "/overlays";
+    if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
+
+    $path = $overlayDir . "/routes_" . $safe . ".json";
+    $payload = [
+      "ok" => true,
+      "model" => $safe,
+      "updated" => time(),
+      "routes" => $data["routes"]
+    ];
+    if (!safe_atomic_write_json($path, $payload)) {
+      json_error_and_exit(500, "Failed to save routes file");
+    }
+    echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "load_roadnet") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      echo json_encode([
+        "ok" => true,
+        "exists" => false,
+        "roads" => []
+      ], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $path = __DIR__ . "/overlays/roadnet_" . $safe . ".json";
+    if (!file_exists($path)) {
+      echo json_encode([
+        "ok" => true,
+        "model" => $safe,
+        "exists" => false,
+        "roads" => []
+      ], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $raw = file_get_contents($path);
+    $json = json_decode($raw, true);
+    $roads = (is_array($json) && isset($json["roads"]) && is_array($json["roads"])) ? $json["roads"] : [];
+    $updated = (is_array($json) && isset($json["updated"])) ? $json["updated"] : null;
+
+    echo json_encode([
+      "ok" => true,
+      "model" => $safe,
+      "exists" => true,
+      "updated" => $updated,
+      "roads" => $roads
+    ], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "save_roadnet") {
+
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid name"]);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    if (!validate_roadnet_payload($data, $payloadError)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => $payloadError ?: "Invalid JSON"], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $overlayDir = __DIR__ . "/overlays";
+    if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
+
+    $path = $overlayDir . "/roadnet_" . $safe . ".json";
+    $payload = [
+      "ok" => true,
+      "model" => $safe,
+      "updated" => time(),
+      "roads" => $data["roads"]
+    ];
+    if (!safe_atomic_write_json($path, $payload)) {
+      json_error_and_exit(500, "Failed to save roadnet file");
+    }
+    echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "list_models") {
     $defaultModel = $ORIGINAL_MODEL_NAME;
     if (file_exists($DEFAULT_MODEL_PATH)) {
       $raw = file_get_contents($DEFAULT_MODEL_PATH);
@@ -58,7 +625,7 @@ if (isset($_GET["action"])) {
     exit;
   }
 
-  if ($_GET["action"] === "get_default_model") {
+  if ($action === "get_default_model") {
     $defaultModel = $ORIGINAL_MODEL_NAME;
     if (file_exists($DEFAULT_MODEL_PATH)) {
       $raw = file_get_contents($DEFAULT_MODEL_PATH);
@@ -74,12 +641,7 @@ if (isset($_GET["action"])) {
     exit;
   }
 
-  if ($_GET["action"] === "set_default_model") {
-    if ($_SERVER["REQUEST_METHOD"] !== "POST") {
-      http_response_code(405);
-      echo json_encode(["ok" => false, "error" => "POST required"]);
-      exit;
-    }
+  if ($action === "set_default_model") {
 
     $raw = file_get_contents("php://input");
     $data = json_decode($raw, true);
@@ -102,12 +664,98 @@ if (isset($_GET["action"])) {
     if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
 
     $payload = ["file" => $file, "updated" => time()];
-    file_put_contents($DEFAULT_MODEL_PATH, json_encode($payload, JSON_PRETTY_PRINT), LOCK_EX);
+    if (!safe_atomic_write_json($DEFAULT_MODEL_PATH, $payload)) {
+      json_error_and_exit(500, "Failed to update default model");
+    }
     echo json_encode(["ok" => true, "file" => $file], JSON_PRETTY_PRINT);
     exit;
   }
 
-  if ($_GET["action"] === "load_overlay") {
+  if ($action === "publish_map") {
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    $file = is_array($data) && !empty($data["file"]) ? basename($data["file"]) : "";
+    if ($file === "" || !preg_match('/\.glb$/i', $file)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid file"]);
+      exit;
+    }
+
+    $modelPath = $MODEL_DIR . "/" . $file;
+    if (!file_exists($modelPath)) {
+      http_response_code(404);
+      echo json_encode(["ok" => false, "error" => "Model file not found"]);
+      exit;
+    }
+
+    $overlayDir = dirname($LIVE_MAP_PATH);
+    if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
+
+    $routesFile = "routes_" . $file . ".json";
+    $routesPath = $overlayDir . "/" . $routesFile;
+    $liveBackup = file_exists($LIVE_MAP_PATH) ? file_get_contents($LIVE_MAP_PATH) : null;
+    $defaultBackup = file_exists($DEFAULT_MODEL_PATH) ? file_get_contents($DEFAULT_MODEL_PATH) : null;
+    $releasesBackup = file_exists($RELEASES_PATH) ? file_get_contents($RELEASES_PATH) : null;
+
+    $publishedAt = time();
+    $version = date("YmdHis") . "_" . substr(md5($file . "|" . microtime(true)), 0, 8);
+    $manifest = [
+      "ok" => true,
+      "modelFile" => $file,
+      "routesFile" => $routesFile,
+      "version" => $version,
+      "publishedAt" => $publishedAt
+    ];
+    try {
+      if (!file_exists($routesPath)) {
+        $emptyRoutes = [
+          "ok" => true,
+          "model" => $file,
+          "updated" => time(),
+          "routes" => new stdClass()
+        ];
+        if (!safe_atomic_write_json($routesPath, $emptyRoutes)) {
+          throw new RuntimeException("Failed to initialize routes file");
+        }
+      }
+
+      if (!safe_atomic_write_json($LIVE_MAP_PATH, $manifest)) {
+        throw new RuntimeException("Failed to write live map manifest");
+      }
+
+      // Keep default model aligned with published model for admin UX consistency.
+      if (!safe_atomic_write_json($DEFAULT_MODEL_PATH, ["file" => $file, "updated" => $publishedAt])) {
+        throw new RuntimeException("Failed to update default model");
+      }
+
+      $history = [];
+      if (file_exists($RELEASES_PATH)) {
+        $old = json_decode(file_get_contents($RELEASES_PATH), true);
+        if (is_array($old)) $history = $old;
+      }
+      array_unshift($history, [
+        "file" => $file,
+        "routesFile" => $routesFile,
+        "version" => $version,
+        "publishedAt" => $publishedAt
+      ]);
+      if (count($history) > 100) $history = array_slice($history, 0, 100);
+      if (!safe_atomic_write_json($RELEASES_PATH, $history)) {
+        throw new RuntimeException("Failed to update publish history");
+      }
+    } catch (Throwable $e) {
+      restore_file_from_backup($LIVE_MAP_PATH, $liveBackup);
+      restore_file_from_backup($DEFAULT_MODEL_PATH, $defaultBackup);
+      restore_file_from_backup($RELEASES_PATH, $releasesBackup);
+      json_error_and_exit(500, "Publish failed: " . $e->getMessage());
+    }
+
+    echo json_encode(["ok" => true, "published" => $manifest], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "load_overlay") {
     if (file_exists($OVERLAY_PATH)) {
       echo file_get_contents($OVERLAY_PATH);
     } else {
@@ -116,12 +764,7 @@ if (isset($_GET["action"])) {
     exit;
   }
 
-  if ($_GET["action"] === "save_overlay") {
-    if ($_SERVER["REQUEST_METHOD"] !== "POST") {
-      http_response_code(405);
-      echo json_encode(["ok" => false, "error" => "POST required"]);
-      exit;
-    }
+  if ($action === "save_overlay") {
 
     $raw = file_get_contents("php://input");
     $data = json_decode($raw, true);
@@ -131,23 +774,32 @@ if (isset($_GET["action"])) {
       echo json_encode(["ok" => false, "error" => "Invalid JSON"]);
       exit;
     }
+    foreach ($data["items"] as $idx => $item) {
+      if (!validate_overlay_item($item, $itemError)) {
+        http_response_code(400);
+        echo json_encode(["ok" => false, "error" => "items[{$idx}] invalid: " . ($itemError ?: "Malformed item")], JSON_PRETTY_PRINT);
+        exit;
+      }
+    }
 
     $overlayDir = dirname($OVERLAY_PATH);
     if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
 
-    file_put_contents($OVERLAY_PATH, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+    if (!safe_atomic_write_json($OVERLAY_PATH, $data)) {
+      json_error_and_exit(500, "Failed to save overlay file");
+    }
     echo json_encode(["ok" => true]);
     exit;
   }
 
-  if ($_GET["action"] === "export_glb") {
-    if ($_SERVER["REQUEST_METHOD"] !== "POST") {
-      http_response_code(405);
-      echo json_encode(["ok" => false, "error" => "POST required"]);
-      exit;
-    }
+  if ($action === "export_glb") {
 
     $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $sourceRaw = isset($_GET["sourceModel"]) ? trim((string)$_GET["sourceModel"]) : "";
+    $sourceModel = $sourceRaw !== "" ? basename($sourceRaw) : "";
+    if ($sourceModel !== "" && !preg_match('/\.glb$/i', $sourceModel)) {
+      json_error_and_exit(400, "Invalid source model");
+    }
     $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
     if ($safe === "" || $safe === "." || $safe === "..") {
       $safe = "tnts_map_export_" . date("Ymd_His") . ".glb";
@@ -170,14 +822,49 @@ if (isset($_GET["action"])) {
     }
 
     $raw = file_get_contents("php://input");
-    if ($raw === false || strlen($raw) < 12) {
+    $contentType = strtolower((string)($_SERVER["CONTENT_TYPE"] ?? ""));
+    if ($contentType !== "" && strpos($contentType, "model/gltf-binary") === false && strpos($contentType, "application/octet-stream") === false) {
+      json_error_and_exit(415, "Unsupported content type");
+    }
+    if ($raw === false || !is_valid_glb_binary($raw)) {
       http_response_code(400);
       echo json_encode(["ok" => false, "error" => "Empty or invalid GLB"]);
       exit;
     }
 
-    file_put_contents($path, $raw, LOCK_EX);
-    echo json_encode(["ok" => true, "file" => $finalName, "path" => "models/" . $finalName], JSON_PRETTY_PRINT);
+    if (!safe_atomic_write_bytes($path, $raw)) {
+      json_error_and_exit(500, "Failed to save GLB file");
+    }
+
+    $snapshotWarning = null;
+    try {
+      editor_ensure_snapshot_schema($conn);
+      if ($sourceModel !== "" && strcasecmp($sourceModel, $finalName) !== 0) {
+        $hash = @hash_file("sha256", $path);
+        if (!is_string($hash) || $hash === "") {
+          throw new RuntimeException("Failed to hash exported model");
+        }
+        $conn->begin_transaction();
+        try {
+          $versionId = editor_get_or_create_version_id($conn, $finalName, $hash);
+          editor_clone_model_snapshot($conn, $sourceModel, $finalName, $versionId);
+          editor_refresh_version_totals($conn, $versionId, $finalName);
+          $conn->commit();
+        } catch (Throwable $e) {
+          $conn->rollback();
+          throw $e;
+        }
+      }
+    } catch (Throwable $e) {
+      $snapshotWarning = $e->getMessage();
+    }
+
+    echo json_encode([
+      "ok" => true,
+      "file" => $finalName,
+      "path" => "models/" . $finalName,
+      "snapshotWarning" => $snapshotWarning
+    ], JSON_PRETTY_PRINT);
     exit;
   }
 
@@ -190,17 +877,327 @@ require_once __DIR__ . "/inc/layout.php";
 admin_layout_start("Map Editor", "mapeditor");
 ?>
 
-<div class="card">
-  <div class="section-title">Map Editor</div>
-  <div style="color:#667085;font-weight:800; line-height:1.6;">
-    Hover highlights ONE object at a time. Click selects and keeps highlight until another click. Move only works when Move tool is active.
-  </div>
-</div>
+<style>
+  .topbar {
+    display: none !important;
+  }
+  .admin-shell {
+    height: 100vh !important;
+  }
+  .sidebar {
+    height: 100vh !important;
+    overflow: hidden !important;
+  }
+  .main {
+    padding: 0 !important;
+    height: 100vh !important;
+  }
+  .content {
+    margin-top: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    height: 100% !important;
+  }
+  .map-box {
+    margin-top: 0 !important;
+    border: none !important;
+    border-radius: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    height: 100vh !important;
+  }
+  .me-layout {
+    --side-w: 360px;
+    position: relative;
+    height: 100% !important;
+  }
+  .me-stage-wrap {
+    position: relative;
+    height: 100% !important;
+  }
+  .me-layout.me-collapsed {
+    --side-w: 360px;
+  }
+  .me-float-sidebar {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: var(--side-w, 360px);
+    height: 100%;
+    z-index: 60;
+  }
+  .me-layout.me-collapsed .me-float-sidebar {
+    display: none !important;
+  }
+  .me-float-toggle {
+    position: absolute;
+    right: 14px;
+    top: 14px;
+    z-index: 70;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    font-weight: 900;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    display: none;
+  }
+  .me-sidebar {
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 10px;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.02);
+  }
+  .me-sidebar .map-title {
+    font-size: 12px !important;
+    font-weight: 900 !important;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #111827;
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin-bottom: 8px !important;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .me-sidebar-toggle {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    font-weight: 900;
+    cursor: pointer;
+  }
+  .me-section-title {
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: #111827;
+    margin-bottom: 6px;
+  }
+  .me-subtext {
+    font-size: 12px;
+    color: #6b7280;
+    font-weight: 700;
+    line-height: 1.45;
+  }
+  .me-sidebar hr {
+    margin: 10px 0 !important;
+    border: none !important;
+    border-top: 1px solid #e5e7eb !important;
+  }
+  .me-sidebar .btn {
+    padding: 6px 10px !important;
+    border-radius: 8px !important;
+    border: 1px solid #e5e7eb !important;
+    background: #fff !important;
+    font-weight: 800 !important;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.02);
+  }
+  .me-sidebar .btn:hover {
+    background: #f8fafc !important;
+  }
+  .me-sidebar .btn:disabled {
+    opacity: 0.6 !important;
+  }
+  .me-sidebar input[type="text"],
+  .me-sidebar input[type="range"],
+  .me-sidebar select {
+    border-radius: 8px !important;
+    border: 1px solid #e5e7eb !important;
+    padding: 6px 8px !important;
+    background: #fff !important;
+    font-weight: 700 !important;
+  }
+  .me-sidebar #building-list button,
+  .me-sidebar #asset-list button {
+    padding: 8px 10px !important;
+    border-radius: 8px !important;
+    border: 1px solid #e5e7eb !important;
+    background: #fff !important;
+    font-weight: 800 !important;
+    text-align: left !important;
+    cursor: pointer !important;
+  }
+  .me-sidebar #building-list button:hover,
+  .me-sidebar #asset-list button:hover {
+    background: #f8fafc !important;
+  }
+  .me-sidebar #building-list,
+  .me-sidebar #asset-list {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 6px;
+  }
+  .me-sidebar #road-controls {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 10px;
+  }
+  .me-sidebar .me-chip {
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 4px 6px;
+    font-size: 11px;
+    font-weight: 800;
+    color: #374151;
+  }
+  .me-tool-buttons .btn {
+    width: 34px !important;
+    height: 34px !important;
+    padding: 0 !important;
+    font-size: 0 !important;
+    position: relative;
+  }
+  .me-tool-buttons .btn::after {
+    content: attr(data-short);
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 900;
+    color: #111827;
+  }
+  .me-tool-buttons .btn:disabled::after {
+    color: #9ca3af;
+  }
+  .me-viewport-wrap {
+    padding: 0 !important;
+    margin: 0 !important;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+  .me-viewport-wrap .map-box,
+  .me-viewport-wrap .card {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+  }
+  .me-route-banner {
+    position: absolute;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 55;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: rgba(17,24,39,0.88);
+    color: #fff;
+    font-weight: 900;
+    font-size: 12px;
+    border: 1px solid rgba(255,255,255,0.12);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.15);
+    display: none;
+    pointer-events: none;
+  }
+  .me-modal {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 80;
+    pointer-events: none;
+  }
+  .me-modal.active {
+    display: flex;
+    pointer-events: auto;
+  }
+  .me-modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.35);
+  }
+  .me-modal-card {
+    position: relative;
+    z-index: 1;
+    min-width: 260px;
+    max-width: 360px;
+    background: #fff;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.18);
+    text-align: center;
+  }
+  .me-modal-title {
+    font-weight: 900;
+    font-size: 13px;
+    color: #111827;
+    margin-bottom: 6px;
+  }
+  .me-modal-text {
+    font-size: 12px;
+    color: #6b7280;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+  .me-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+  }
+  .me-modal-actions .btn {
+    padding: 8px 12px !important;
+    border-radius: 10px !important;
+    border: 1px solid #e5e7eb !important;
+    background: #fff !important;
+    font-weight: 900 !important;
+  }
+  .me-modal-actions .btn-danger {
+    background: #ef4444 !important;
+    border-color: #ef4444 !important;
+    color: #fff !important;
+  }
+</style>
 
-<div class="map-box">
-  <div style="--stage-h: clamp(620px, 78vh, 1100px); display:grid; grid-template-columns: 1fr 360px; gap:12px; padding:12px; align-items:stretch;">
-    <div style="position:relative;">
-      <div id="map-stage" style="width:100%; height: var(--stage-h); background:#f3f4f6; border-radius:14px; overflow:hidden; position:relative;"></div>
+<div class="map-box me-viewport-wrap">
+  <div id="map-layout" class="me-layout" style="padding:0; align-items:stretch;">
+    <div class="me-stage-wrap">
+      <div id="map-stage" style="width:100%; height: 100%; background:#f3f4f6; border-radius:14px; overflow:hidden; position:relative;"></div>
+      <button id="sidebar-float-toggle" class="me-float-toggle" type="button" title="Show panel">&#9776;</button>
+
+      <!-- Special points panel -->
+      <div id="special-points-panel"
+           style="position:absolute; left:14px; top:14px; z-index:40;
+                  width:260px; max-height:45vh; overflow:auto;
+                  background:rgba(255,255,255,0.96);
+                  border:1px solid #e5e7eb; border-radius:12px;
+                  padding:10px 12px; box-shadow:0 8px 20px rgba(0,0,0,0.08);">
+        <div style="font-weight:900; font-size:12px; color:#111827; margin-bottom:6px;">Special Points</div>
+        <div id="special-points-list" style="font-size:12px; color:#374151; font-weight:700; line-height:1.45;"></div>
+      </div>
+
+      <div id="route-banner" class="me-route-banner">Route</div>
+
+      <div id="delete-confirm" class="me-modal" aria-hidden="true">
+        <div class="me-modal-backdrop"></div>
+        <div class="me-modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+          <div id="delete-confirm-title" class="me-modal-title">Delete item?</div>
+          <div class="me-modal-text" id="delete-confirm-text">This action cannot be undone.</div>
+          <div class="me-modal-actions">
+            <button id="delete-confirm-no" class="btn" type="button">Cancel</button>
+            <button id="delete-confirm-yes" class="btn btn-danger" type="button">Delete</button>
+          </div>
+        </div>
+      </div>
 
       <!-- Angle readout -->
       <div id="angle-readout"
@@ -211,7 +1208,7 @@ admin_layout_start("Map Editor", "mapeditor");
                   background:rgba(0,0,0,0.55);
                   border:1px solid rgba(255,255,255,0.20);
                   color:#fff; z-index:50;">
-        0.0°
+        0.0Ã‚Â°
       </div>
 
       <div style="position:absolute; left:12px; bottom:12px; background:rgba(255,255,255,0.9); padding:8px 10px; border-radius:12px; font-weight:800; color:#374151; border:1px solid #e5e7eb;">
@@ -219,67 +1216,71 @@ admin_layout_start("Map Editor", "mapeditor");
       </div>
     </div>
 
-    <div style="background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:12px; height: var(--stage-h); overflow:auto;">
-      <div class="map-title" style="font-size:13px; margin-bottom:6px;">3D Map Editor</div>
+    <div class="me-sidebar me-float-sidebar" style="height: 100%; overflow:auto;">
+      <div class="map-title me-sidebar-header">
+        <span>3D Map Editor</span>
+        <button id="sidebar-toggle" class="me-sidebar-toggle" type="button" title="Collapse panel">&#9656;</button>
+      </div>
       <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-bottom:10px;">
         <button id="btn-undo" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Undo</button>
         <button id="btn-redo" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Redo</button>
-        <button id="btn-commit" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Commit (Lock)</button>
-        <button id="btn-edit" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Uncommit (Unlock)</button>
+        <button id="btn-commit" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Lock</button>
+        <button id="btn-edit" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Unlock</button>
         <button id="btn-top" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Top View</button>
         <button id="btn-reset" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Reset View</button>
       </div>
 
-      <div id="status" style="font-weight:900; color:#6b7280; margin-bottom:12px;">Booting&hellip;</div>
+      <div id="status" class="me-subtext" style="font-weight:900; margin-bottom:12px;">Booting&hellip;</div>
+      <div id="dirty-indicator" class="me-subtext" style="font-weight:800; margin:-8px 0 12px 0; color:#6b7280;">Saved</div>
 
       <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
 
-      <div style="font-weight:900; margin-bottom:6px;">Base Model</div>
+      <div class="me-section-title">Base Model</div>
       <select id="base-model-select" style="width:100%; padding:8px 10px; border-radius:10px; border:1px solid #e5e7eb; font-weight:700; margin-bottom:6px;"></select>
       <div style="display:flex; gap:8px; margin-bottom:6px;">
         <button id="base-model-default" class="btn" type="button" style="padding:6px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Set Default</button>
       </div>
-      <div id="base-model-note" style="font-size:12px; color:#6b7280; font-weight:700; margin-bottom:10px;">
-        Switch between original and exported maps. Non-original maps load without overlay JSON.
+      <div id="base-model-note" class="me-subtext" style="margin-bottom:10px;">
+        Switch between original and exported maps. Exported maps skip overlay assets but still load editable roads from per-model roadnet.
       </div>
 
       <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
 
-      <div style="font-weight:900; margin-bottom:6px;">Buildings</div>
-      <div id="building-selected" style="font-size:12px; color:#6b7280; font-weight:700; margin-bottom:6px;">Selected: None</div>
+      <div class="me-section-title">Buildings</div>
+      <div id="building-selected" class="me-subtext" style="margin-bottom:6px;">Selected: None</div>
       <input id="building-filter" type="text" placeholder="Filter buildings" style="width:100%; padding:8px 10px; border-radius:10px; border:1px solid #e5e7eb; font-weight:700; margin-bottom:8px;">
       <div id="building-list" style="display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto;"></div>
 
       <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
 
-      <div style="font-weight:900; margin-bottom:10px;">Assets</div>
+      <div class="me-section-title">Assets</div>
       <div id="asset-list" style="display:flex; flex-direction:column; gap:8px;"></div>
 
       <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
 
-      <div style="font-weight:900; margin-bottom:6px;">Tools</div>
-      <div id="tool-indicator" style="font-weight:800; color:#6b7280; margin-bottom:10px;">Active tool: None</div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button id="tool-move" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Move</button>
-        <button id="tool-rotate" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Rotate</button>
-        <button id="tool-scale" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Scale</button>
-        <button id="tool-road" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Road</button>
-        <button id="tool-align" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Auto Align</button>
-        <button id="tool-delete" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Delete</button>
-        <button id="tool-save" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Save</button>
-        <button id="tool-export" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Export GLB</button>
-        <button id="tool-cancel" class="btn" type="button" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#f8fafc;font-weight:800;">Cancel Tool</button>
+      <div class="me-section-title">Tools</div>
+      <div id="tool-indicator" class="me-subtext" style="font-weight:800; margin-bottom:10px;">Active tool: None</div>
+      <div class="me-tool-buttons" style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="tool-move" class="btn" type="button" data-short="M" title="Move" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Move</button>
+        <button id="tool-rotate" class="btn" type="button" data-short="R" title="Rotate" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Rotate</button>
+        <button id="tool-scale" class="btn" type="button" data-short="S" title="Scale" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Scale</button>
+        <button id="tool-road" class="btn" type="button" data-short="Rd" title="Road" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Road</button>
+        <button id="tool-delete" class="btn" type="button" data-short="Del" title="Delete" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Delete</button>
+        <button id="tool-save" class="btn" type="button" data-short="Sv" title="Save" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Save</button>
+        <button id="tool-export" class="btn" type="button" data-short="GLB" title="Export GLB" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Export GLB</button>
+        <button id="tool-publish" class="btn" type="button" data-short="Pub" title="Publish Current Map" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#fff;font-weight:800;">Publish</button>
+        <button id="tool-cancel" class="btn" type="button" data-short="X" title="Cancel Tool" style="padding:8px 10px;border-radius:10px;border:1px solid #e5e7eb;background:#f8fafc;font-weight:800;">Cancel Tool</button>
       </div>
 
       <div id="road-controls" style="display:none; margin-top:12px; padding-top:12px; border-top:1px dashed #e5e7eb;">
-        <div style="font-weight:900; margin-bottom:6px;">Road Tool</div>
-        <div style="font-size:12px; color:#6b7280; font-weight:700; line-height:1.45; margin-bottom:10px;">
+        <div class="me-section-title">Road Tool</div>
+        <div class="me-subtext" style="margin-bottom:10px;">
           Tap the map to place a road point. Drag a road point to draw a segment (Draw) or reposition it (Move). Use two-finger gestures to pan/zoom.
         </div>
 
         <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px;">
-          <div style="font-weight:900; font-size:12px;">Width</div>
-          <div id="road-width-readout" style="font-weight:900; font-size:12px; color:#6b7280;">12</div>
+          <div class="me-subtext" style="font-weight:900;">Width</div>
+          <div id="road-width-readout" class="me-subtext" style="font-weight:900;">12</div>
         </div>
         <input id="road-width" type="range" min="2" max="60" step="1" value="12" style="width:100%;">
 
@@ -289,30 +1290,15 @@ admin_layout_start("Map Editor", "mapeditor");
           <button id="road-new" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">New Road</button>
           <button id="road-snap" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Snap: On</button>
           <button id="road-building-snap" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Attach: Off</button>
+          <button id="road-auto-intersect" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Auto-Intersect: Off</button>
           <button id="road-drag-mode" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Drag: Draw</button>
+          <button id="road-kiosk" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Kiosk Start</button>
         </div>
 
         <div style="margin-top:12px; padding-top:12px; border-top:1px dashed #e5e7eb;">
-          <div style="font-size:12px; color:#6b7280; font-weight:800; line-height:1.45; margin-bottom:10px;">
+          <div class="me-subtext" style="font-weight:800; margin-bottom:10px;">
             Selected point: <span id="road-point-selected" style="font-weight:900; color:#111827;">None</span>
             <span style="margin-left:10px;">Extend from: <span id="road-extend-from" style="font-weight:900; color:#111827;">Auto</span></span>
-          </div>
-
-          <div style="font-weight:900; margin-bottom:6px;">Connect to Building</div>
-          <div style="font-size:12px; color:#6b7280; font-weight:800; line-height:1.45; margin-bottom:10px;">
-            Target: <span id="road-connect-target" style="font-weight:900; color:#111827;">None</span>
-          </div>
-
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button id="road-pick-building" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Pick Building</button>
-            <button id="road-clear-building" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Clear</button>
-          </div>
-
-          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-            <button id="road-connect-front" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Front</button>
-            <button id="road-connect-back" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Back</button>
-            <button id="road-connect-left" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Left</button>
-            <button id="road-connect-right" class="btn" type="button" style="padding:10px 12px;border-radius:12px;border:1px solid #e5e7eb;background:#fff;font-weight:900;">Right</button>
           </div>
         </div>
       </div>
@@ -336,31 +1322,33 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 
-// Allow editing base model objects too
+const CSRF_TOKEN = <?= json_encode($MAP_EDITOR_CSRF) ?>;
+const MAP_IMPORT_CSRF_TOKEN = <?= json_encode($MAP_IMPORT_CSRF) ?>;
+
+// Allow editing base-model objects in the editor.
 const ALLOW_EDIT_BASE_MODEL = true;
 
 // REQUIRE pressing a tool button before tool works
 let currentTool = "none"; // "none" | "move" | "rotate" | "scale" | "road"
 
-// Auto Align — works only with Move
-let autoAlignEnabled = false;
-const ALIGN_SNAP_DIST = 10;
-const ALIGN_GUIDE_Y_OFFSET = 0.05;
-
 // Roads (generated geometry)
-const ROAD_Y_OFFSET = 0.2;
+const ROAD_Y_OFFSET = 0.8;
 const ROAD_DEFAULT_WIDTH = 12;
 const ROAD_SNAP_STEP = 10;
-const ROAD_SNAP_FINE_DEG = 5; // when Snap is Off, lock angle to 5° increments
+const ROAD_SNAP_FINE_DEG = 5; // when Snap is Off, lock angle to 5Ã‚Â° increments
 const ROAD_MIN_POINT_DIST = 2;
-const ROAD_HANDLE_BASE_SIZE = 6;
+const ROAD_HANDLE_BASE_SIZE = 3.5;
 const ROAD_MITER_LIMIT = 2.5;
 const ROAD_BUILDING_SNAP_DIST = 18; // world units (XZ) to snap a dragged road point to a building side
 const ROAD_BUILDING_GAP = 0; // extra clearance between road edge and building wall (0 = touch)
+const ROAD_AUTO_INTERSECT_DIST = 8; // endpoint merge distance
+const ROAD_THICKNESS = 0.3; // vertical thickness of road mesh
 
 let roadSnapEnabled = true;
 let roadBuildingSnapEnabled = false;
+let roadAutoIntersectEnabled = false;
 let roadDragMode = "draw"; // "draw" | "move" (draw creates a new segment from a point; move drags an existing point)
+let overlayReady = false;
 let roadDraft = null; // { points: THREE.Vector3[], width: number, mesh: THREE.Mesh|null }
 let isDraggingRoadHandle = false;
 let roadHandleDrag = null; // { road: THREE.Object3D, index: number, pointerId: number, beforePoints: number[][], beforeWidth: number }
@@ -370,12 +1358,15 @@ let roadSegmentDrag = null; // { road: THREE.Object3D, startIndex: number, point
 let roadSelectedPointIndex = null; // number (0-based) or null
 let roadExtendFrom = null; // "start" | "end" | null (overrides nearest-end extension)
 let roadExtendFromRoadId = null; // road id string|null (guards extend-from state)
-let roadPickBuildingMode = false; // when true, next tap selects a building as connect target
-let roadConnectTarget = null; // THREE.Object3D|null (base model building)
+let roadKioskPlaceMode = false;
 
 const statusEl = document.getElementById("status");
+const dirtyIndicatorEl = document.getElementById("dirty-indicator");
 const mapStage = document.getElementById("map-stage");
 const angleReadoutEl = document.getElementById("angle-readout");
+const layoutEl = document.getElementById("map-layout");
+const sidebarToggleBtn = document.getElementById("sidebar-toggle");
+const sidebarFloatToggleBtn = document.getElementById("sidebar-float-toggle");
 
 const btnReset = document.getElementById("btn-reset");
 const btnTop = document.getElementById("btn-top");
@@ -397,10 +1388,10 @@ const toolMove = document.getElementById("tool-move");
 const toolRotate = document.getElementById("tool-rotate");
 const toolScale = document.getElementById("tool-scale");
 const toolRoad = document.getElementById("tool-road");
-const toolAlign = document.getElementById("tool-align");
 const toolDelete = document.getElementById("tool-delete");
 const toolSave = document.getElementById("tool-save");
 const toolExport = document.getElementById("tool-export");
+const toolPublish = document.getElementById("tool-publish");
 const toolCancel = document.getElementById("tool-cancel");
 const toolIndicator = document.getElementById("tool-indicator");
 
@@ -412,16 +1403,346 @@ const roadCancelBtn = document.getElementById("road-cancel");
 const roadNewBtn = document.getElementById("road-new");
 const roadSnapBtn = document.getElementById("road-snap");
 const roadBuildingSnapBtn = document.getElementById("road-building-snap");
+const roadAutoIntersectBtn = document.getElementById("road-auto-intersect");
 const roadDragModeBtn = document.getElementById("road-drag-mode");
+const roadKioskBtn = document.getElementById("road-kiosk");
 const roadPointSelectedEl = document.getElementById("road-point-selected");
 const roadExtendFromEl = document.getElementById("road-extend-from");
-const roadConnectTargetEl = document.getElementById("road-connect-target");
-const roadPickBuildingBtn = document.getElementById("road-pick-building");
-const roadClearBuildingBtn = document.getElementById("road-clear-building");
-const roadConnectFrontBtn = document.getElementById("road-connect-front");
-const roadConnectBackBtn = document.getElementById("road-connect-back");
-const roadConnectLeftBtn = document.getElementById("road-connect-left");
-const roadConnectRightBtn = document.getElementById("road-connect-right");
+
+const specialPointsPanel = document.getElementById("special-points-panel");
+const specialPointsListEl = document.getElementById("special-points-list");
+const routeBannerEl = document.getElementById("route-banner");
+const deleteConfirmEl = document.getElementById("delete-confirm");
+const deleteConfirmTextEl = document.getElementById("delete-confirm-text");
+const deleteConfirmYesBtn = document.getElementById("delete-confirm-yes");
+const deleteConfirmNoBtn = document.getElementById("delete-confirm-no");
+
+let buildingKbTargetInput = null;
+let buildingKbShift = false;
+
+function ensureBuildingKeyboardStyles() {
+  if (document.getElementById("me-kb-styles")) return;
+
+  const style = document.createElement("style");
+  style.id = "me-kb-styles";
+  style.textContent = `
+    #me-kb-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      display: none;
+      align-items: flex-end;
+      justify-content: center;
+      z-index: 9999;
+      touch-action: manipulation;
+    }
+    #me-kb {
+      width: min(900px, 98vw);
+      background: #f3f3f3;
+      border-top-left-radius: 16px;
+      border-top-right-radius: 16px;
+      box-shadow: 0 -10px 36px rgba(0, 0, 0, 0.25);
+      padding: 12px 12px 14px;
+      user-select: none;
+    }
+    #me-kb .kb-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 2px 8px;
+    }
+    #me-kb .kb-title {
+      font-size: 13px;
+      font-weight: 900;
+      color: #222;
+      letter-spacing: 0.2px;
+    }
+    #me-kb .kb-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .me-kb-btn {
+      border: 1px solid #c9c9c9;
+      background: #fff;
+      border-radius: 9px;
+      padding: 8px 10px;
+      font-size: 13px;
+      font-weight: 900;
+      min-width: 60px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .me-kb-btn:active {
+      transform: translateY(1px);
+    }
+    #me-kb .kb-rows {
+      display: grid;
+      gap: 8px;
+    }
+    .me-kb-row {
+      display: grid;
+      grid-auto-flow: column;
+      grid-auto-columns: 1fr;
+      gap: 7px;
+    }
+    .me-kb-key {
+      border: 1px solid #bdbdbd;
+      background: #fff;
+      border-radius: 10px;
+      padding: 12px 0;
+      font-size: 15px;
+      font-weight: 900;
+      text-align: center;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .me-kb-key:active {
+      background: #ececec;
+      transform: translateY(1px);
+    }
+    .me-kb-key.wide {
+      grid-column: span 2;
+    }
+    .me-kb-key.space {
+      grid-column: span 5;
+    }
+    .me-kb-key.primary {
+      background: #1f2937;
+      color: #fff;
+      border-color: #1f2937;
+    }
+    .me-kb-key.primary:active {
+      filter: brightness(0.95);
+    }
+    @media (max-width: 520px) {
+      .me-kb-key {
+        font-size: 13px;
+        padding: 11px 0;
+      }
+      .me-kb-btn {
+        font-size: 12px;
+        padding: 8px 9px;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function createBuildingKeyboard() {
+  ensureBuildingKeyboardStyles();
+  if (document.getElementById("me-kb-overlay")) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "me-kb-overlay";
+
+  const kb = document.createElement("div");
+  kb.id = "me-kb";
+  kb.innerHTML = `
+    <div class="kb-top">
+      <div class="kb-title">Building Filter Keyboard</div>
+      <div class="kb-actions">
+        <button class="me-kb-btn" data-kb-action="clear" type="button">CLEAR</button>
+        <button class="me-kb-btn" data-kb-action="close" type="button">CLOSE</button>
+      </div>
+    </div>
+    <div class="kb-rows">
+      <div class="me-kb-row">
+        ${"QWERTYUIOP".split("").map((k) => `<div class="me-kb-key" data-kb-key="${k}">${k}</div>`).join("")}
+      </div>
+      <div class="me-kb-row">
+        ${"ASDFGHJKL".split("").map((k) => `<div class="me-kb-key" data-kb-key="${k}">${k}</div>`).join("")}
+        <div class="me-kb-key wide" data-kb-action="backspace">BACK</div>
+      </div>
+      <div class="me-kb-row">
+        <div class="me-kb-key wide" data-kb-action="shift">SHIFT</div>
+        ${"ZXCVBNM".split("").map((k) => `<div class="me-kb-key" data-kb-key="${k}">${k}</div>`).join("")}
+        <div class="me-kb-key wide" data-kb-action="enter">ENTER</div>
+      </div>
+      <div class="me-kb-row">
+        <div class="me-kb-key wide" data-kb-key="-">-</div>
+        <div class="me-kb-key wide" data-kb-key="'">'</div>
+        <div class="me-kb-key space" data-kb-action="space">SPACE</div>
+        <div class="me-kb-key wide primary" data-kb-action="done">DONE</div>
+      </div>
+    </div>
+  `;
+
+  overlay.appendChild(kb);
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener("pointerdown", (e) => {
+    if (e.target === overlay) hideBuildingKeyboard();
+  }, { passive: false });
+}
+
+function ensureInputFocusAndCaretEnd(inputEl) {
+  if (!inputEl) return;
+  try {
+    inputEl.focus({ preventScroll: true });
+  } catch (_) {
+    try { inputEl.focus(); } catch (_) {}
+  }
+
+  const endPos = inputEl.value.length;
+  try { inputEl.setSelectionRange(endPos, endPos); } catch (_) {}
+}
+
+function getInputCaretSafe(inputEl) {
+  const len = inputEl.value.length;
+  let start = Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : len;
+  let end = Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : len;
+  start = Math.max(0, Math.min(start, len));
+  end = Math.max(0, Math.min(end, len));
+  return { start, end };
+}
+
+function emitFilterInputEvent(inputEl) {
+  if (!inputEl) return;
+  inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function insertInputText(inputEl, text) {
+  if (!inputEl) return;
+  ensureInputFocusAndCaretEnd(inputEl);
+  const { start, end } = getInputCaretSafe(inputEl);
+  const before = inputEl.value.slice(0, start);
+  const after = inputEl.value.slice(end);
+  inputEl.value = before + text + after;
+  const nextPos = start + text.length;
+  try { inputEl.setSelectionRange(nextPos, nextPos); } catch (_) {}
+  emitFilterInputEvent(inputEl);
+}
+
+function backspaceInputText(inputEl) {
+  if (!inputEl) return;
+  ensureInputFocusAndCaretEnd(inputEl);
+  const { start, end } = getInputCaretSafe(inputEl);
+  if (start !== end) {
+    inputEl.value = inputEl.value.slice(0, start) + inputEl.value.slice(end);
+    try { inputEl.setSelectionRange(start, start); } catch (_) {}
+  } else if (start > 0) {
+    inputEl.value = inputEl.value.slice(0, start - 1) + inputEl.value.slice(start);
+    try { inputEl.setSelectionRange(start - 1, start - 1); } catch (_) {}
+  }
+  emitFilterInputEvent(inputEl);
+}
+
+function clearInputText(inputEl) {
+  if (!inputEl) return;
+  inputEl.value = "";
+  emitFilterInputEvent(inputEl);
+  ensureInputFocusAndCaretEnd(inputEl);
+}
+
+function hideBuildingKeyboard() {
+  const overlay = document.getElementById("me-kb-overlay");
+  if (overlay) overlay.style.display = "none";
+  buildingKbShift = false;
+}
+
+function showBuildingKeyboardFor(inputEl) {
+  createBuildingKeyboard();
+  buildingKbTargetInput = inputEl;
+  const overlay = document.getElementById("me-kb-overlay");
+  if (overlay) overlay.style.display = "flex";
+  ensureInputFocusAndCaretEnd(inputEl);
+}
+
+function selectFirstFilteredBuilding() {
+  const first = buildingListEl?.querySelector?.("button");
+  if (!first) return false;
+  first.click();
+  return true;
+}
+
+function handleBuildingKeyboardPress(e) {
+  const keyEl = e.target.closest("[data-kb-key], [data-kb-action]");
+  if (!keyEl || !buildingKbTargetInput) return;
+
+  e.preventDefault();
+  e.stopPropagation();
+
+  ensureInputFocusAndCaretEnd(buildingKbTargetInput);
+
+  const action = keyEl.getAttribute("data-kb-action");
+  const key = keyEl.getAttribute("data-kb-key");
+
+  if (action) {
+    switch (action) {
+      case "close":
+        hideBuildingKeyboard();
+        return;
+      case "done":
+      case "enter":
+        refreshBuildingList();
+        selectFirstFilteredBuilding();
+        hideBuildingKeyboard();
+        return;
+      case "clear":
+        clearInputText(buildingKbTargetInput);
+        return;
+      case "backspace":
+        backspaceInputText(buildingKbTargetInput);
+        return;
+      case "space":
+        insertInputText(buildingKbTargetInput, " ");
+        return;
+      case "shift":
+        buildingKbShift = !buildingKbShift;
+        return;
+      default:
+        return;
+    }
+  }
+
+  if (key) {
+    const char = buildingKbShift ? key.toUpperCase() : key.toLowerCase();
+    insertInputText(buildingKbTargetInput, char);
+    if (buildingKbShift) buildingKbShift = false;
+  }
+}
+
+function setupBuildingFilterKeyboard() {
+  if (!buildingFilterEl) return;
+
+  createBuildingKeyboard();
+
+  const openKeyboard = () => showBuildingKeyboardFor(buildingFilterEl);
+  buildingFilterEl.addEventListener("focus", openKeyboard);
+  buildingFilterEl.addEventListener("pointerdown", openKeyboard, { passive: true });
+  buildingFilterEl.addEventListener("click", openKeyboard);
+  buildingFilterEl.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    refreshBuildingList();
+    selectFirstFilteredBuilding();
+    hideBuildingKeyboard();
+  });
+
+  buildingFilterEl.setAttribute("autocomplete", "off");
+  buildingFilterEl.setAttribute("autocorrect", "off");
+  buildingFilterEl.setAttribute("autocapitalize", "off");
+  buildingFilterEl.setAttribute("spellcheck", "false");
+
+  const overlay = document.getElementById("me-kb-overlay");
+  overlay?.addEventListener("pointerdown", handleBuildingKeyboardPress, { passive: false });
+}
+
+function withCsrfHeaders(headers = undefined) {
+  const out = new Headers(headers || {});
+  out.set("X-CSRF-Token", CSRF_TOKEN);
+  return out;
+}
+
+function apiFetch(url, options = {}) {
+  const opts = { credentials: "same-origin", ...options };
+  const method = String(opts.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    opts.headers = withCsrfHeaders(opts.headers);
+  }
+  return fetch(url, opts);
+}
 
  function setStatus(msg) {
    if (statusEl) statusEl.textContent = msg;
@@ -472,8 +1793,7 @@ function updateToolIndicator() {
   if (!toolIndicator) return;
   const labels = { none: "None", move: "Move", rotate: "Rotate", scale: "Scale", road: "Road" };
   const label = labels[currentTool] || "None";
-  const alignTag = (currentTool === "move" && autoAlignEnabled) ? " (Auto Align On)" : "";
-  toolIndicator.textContent = `Active tool: ${label}${alignTag}`;
+  toolIndicator.textContent = `Active tool: ${label}`;
   if (toolCancel) {
     toolCancel.disabled = currentTool === "none";
     toolCancel.style.opacity = toolCancel.disabled ? "0.6" : "1";
@@ -481,40 +1801,1088 @@ function updateToolIndicator() {
   updateRoadControls();
 }
 
-function updateAutoAlignButton() {
-  if (!toolAlign) return;
-  if (autoAlignEnabled) {
-    toolAlign.style.outline = "2px solid #ef4444";
-    toolAlign.style.outlineOffset = "2px";
-    toolAlign.style.background = "#fee2e2";
-  } else {
-    toolAlign.style.outline = "none";
-    toolAlign.style.outlineOffset = "0";
-    toolAlign.style.background = "#fff";
+function setSidebarCollapsed(collapsed) {
+  if (!layoutEl) return;
+  layoutEl.classList.toggle("me-collapsed", !!collapsed);
+  if (sidebarToggleBtn) {
+    sidebarToggleBtn.textContent = collapsed ? "\u25C0" : "\u25B6";
+    sidebarToggleBtn.title = collapsed ? "Expand panel" : "Collapse panel";
   }
+  if (sidebarFloatToggleBtn) {
+    sidebarFloatToggleBtn.textContent = collapsed ? "\u2630" : "\u00D7";
+    sidebarFloatToggleBtn.title = collapsed ? "Show panel" : "Hide panel";
+    sidebarFloatToggleBtn.style.display = collapsed ? "block" : "none";
+  }
+  requestAnimationFrame(() => resize());
+}
+
+function updateSpecialPointsPanel() {
+  if (!specialPointsPanel || !specialPointsListEl) return;
+  if (!overlayReady) return;
+  const items = [];
+  const seenBuildings = new Set();
+
+  try {
+    overlayRoot?.children?.forEach?.((obj) => {
+      if (!isRoadObject(obj)) return;
+      ensureRoadPointMetaArrays(obj);
+      const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+      for (const meta of metaArr) {
+        if (isKioskMeta(meta)) continue;
+        if (!meta || !meta.building || !meta.building.name) continue;
+        const buildingName = String(meta.building.name || "").trim();
+        if (!buildingName || seenBuildings.has(buildingName)) continue;
+        seenBuildings.add(buildingName);
+        const label = meta.label || `${buildingName}_${meta.building.side || "side"}`;
+        items.push({ buildingName, label });
+      }
+    });
+  } catch (_) {}
+
+  if (!items.length) {
+    specialPointsListEl.textContent = "None";
+    return;
+  }
+
+  items.sort((a, b) => (a.buildingName || "").localeCompare(b.buildingName || ""));
+  specialPointsListEl.textContent = "";
+  for (const it of items) {
+    const row = document.createElement("div");
+    row.textContent = `${it.buildingName} Pathway = ${it.label}`;
+    specialPointsListEl.appendChild(row);
+  }
+}
+
+// -------------------- Routing (kiosk -> building entrance) --------------------
+let routeLine = null;
+let savedRoutes = {};
+const ROUTE_LINE_WIDTH = 1.2;
+const ROUTE_LINE_Y_BIAS = 0.2;
+const routeMaterial = new THREE.MeshBasicMaterial({
+  color: 0xf59e0b,
+  transparent: true,
+  opacity: 0.9,
+  polygonOffset: true,
+  polygonOffsetFactor: -8,
+  polygonOffsetUnits: -8
+});
+
+function setRouteBanner(text) {
+  if (!routeBannerEl) return;
+  if (!text) {
+    routeBannerEl.style.display = "none";
+    routeBannerEl.textContent = "";
+    return;
+  }
+  routeBannerEl.textContent = text;
+  routeBannerEl.style.display = "block";
+}
+
+function clearRouteLine() {
+  if (!routeLine) return;
+  scene.remove(routeLine);
+  routeLine.geometry?.dispose?.();
+  routeLine = null;
+}
+
+function routeKey(name) {
+  return normalizeBuildingName(name);
+}
+
+function setSavedRoutes(routes) {
+  savedRoutes = (routes && typeof routes === "object") ? routes : {};
+}
+
+function getSavedRouteEntry(name) {
+  const key = routeKey(name);
+  return savedRoutes?.[key] || savedRoutes?.[name] || null;
+}
+
+function hasLiveRoadData() {
+  return !!overlayRoot?.children?.some?.(obj => isRoadObject(obj));
+}
+
+function drawRouteFromWorldPoints(pointsWorld) {
+  clearRouteLine();
+  if (!Array.isArray(pointsWorld) || pointsWorld.length < 2) return false;
+  const points = pointsWorld
+    .filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.z))
+    .map(p => new THREE.Vector3(p.x, (p.y || 0) + ROUTE_LINE_Y_BIAS, p.z));
+  if (points.length < 2) return false;
+
+  const geom = buildRoadGeometry(points, ROUTE_LINE_WIDTH);
+  routeLine = new THREE.Mesh(geom, routeMaterial);
+  routeLine.renderOrder = 9997;
+  routeLine.frustumCulled = false;
+  scene.add(routeLine);
+  return true;
+}
+
+// -------------------- Delete confirm modal --------------------
+let pendingDeleteObj = null;
+function showDeleteConfirm(obj) {
+  if (!deleteConfirmEl) return false;
+  const label = obj?.userData?.nameLabel || obj?.name || "item";
+  const isBaseObject = !obj?.userData?.isPlaced;
+  if (deleteConfirmTextEl) {
+    if (isBaseObject) {
+      deleteConfirmTextEl.textContent = `Delete base object "${label}"? You can Undo/Redo this. Export GLB to persist base edits.`;
+    } else {
+      deleteConfirmTextEl.textContent = `Delete "${label}"?`;
+    }
+  }
+  pendingDeleteObj = obj || null;
+  deleteConfirmEl.classList.add("active");
+  deleteConfirmEl.setAttribute("aria-hidden", "false");
+  return true;
+}
+function hideDeleteConfirm() {
+  if (!deleteConfirmEl) return;
+  deleteConfirmEl.classList.remove("active");
+  deleteConfirmEl.setAttribute("aria-hidden", "true");
+  pendingDeleteObj = null;
+}
+deleteConfirmNoBtn?.addEventListener("click", () => {
+  hideDeleteConfirm();
+});
+deleteConfirmYesBtn?.addEventListener("click", () => {
+  if (pendingDeleteObj) {
+    performDelete(pendingDeleteObj);
+  }
+  hideDeleteConfirm();
+});
+
+function normalizeBuildingName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+const EXPORT_ENTITY_KIOSK_ROUTE_RE = /^KIOSK_START(?:\.\d+|\d+)?$/i;
+
+function normalizeExportBuildingName(name) {
+  let n = String(name || "").trim();
+  if (!n) return "";
+  n = n.replace(/\.\d+$/, "");
+  n = n.replace(/\s+/g, " ").trim();
+  if (!n) return "";
+  if (isGroundLikeName(n)) return "";
+  if (EXPORT_ENTITY_KIOSK_ROUTE_RE.test(n)) return "";
+  return n;
+}
+
+function getTopLevelNamedAncestorForScene(obj, sceneRoot) {
+  if (!obj || !sceneRoot) return null;
+  let p = obj;
+  let top = null;
+  while (p && p !== sceneRoot) {
+    if (p.name && !isGenericNodeName(p.name) && !isGroundLikeName(p.name)) {
+      top = p;
+    }
+    p = p.parent;
+  }
+  return top;
+}
+
+function parseExportRoomCandidate(rawName) {
+  const source = String(rawName || "").trim();
+  if (!source) return null;
+  if (!/^ROOM(?:$|[\s._-]|\d)/i.test(source)) return null;
+
+  let tail = source.replace(/^ROOM/i, "");
+  tail = tail.replace(/^[\s._-]+/, "");
+  tail = tail.replace(/\s+/g, "");
+  if (!tail) return null;
+  if (!/^[0-9._-]+$/.test(tail)) return null;
+
+  const explicit = tail.match(/^(\d+)[._-](\d{3})$/);
+  if (explicit) {
+    return {
+      kind: "explicit_suffix",
+      baseDigits: explicit[1],
+      suffixDigits: explicit[2],
+      originalDigits: explicit[1] + explicit[2]
+    };
+  }
+
+  const loaderAlias = tail.match(/^(\d+)[._-](\d{1,3})$/);
+  if (loaderAlias) {
+    return {
+      kind: "loader_suffix",
+      baseDigits: loaderAlias[1],
+      suffixDigits: loaderAlias[2],
+      originalDigits: loaderAlias[1] + loaderAlias[2]
+    };
+  }
+
+  const plainDigits = tail.match(/^(\d+)$/);
+  if (!plainDigits) return null;
+  const digits = plainDigits[1];
+  if (digits.length <= 3) {
+    return {
+      kind: "plain",
+      baseDigits: digits,
+      suffixDigits: "",
+      originalDigits: digits
+    };
+  }
+
+  return {
+    kind: "compact_suffix",
+    baseDigits: digits.slice(0, -3),
+    suffixDigits: digits.slice(-3),
+    originalDigits: digits
+  };
+}
+
+function buildExportEntityExtraction(sceneRoot) {
+  if (!sceneRoot) return [];
+
+  const buildingEntries = new Map();
+  const canonicalBaseSet = new Set();
+  const canonicalByBuilding = new Map();
+  const compactByBaseCount = new Map();
+
+  sceneRoot.traverse((obj) => {
+    if (!obj) return;
+    const root = getTopLevelNamedAncestorForScene(obj, sceneRoot);
+    if (!root || !root.name) return;
+    const buildingName = normalizeExportBuildingName(root.name);
+    if (!buildingName) return;
+
+    let entry = buildingEntries.get(buildingName);
+    if (!entry) {
+      entry = { name: buildingName, roomCandidates: [] };
+      buildingEntries.set(buildingName, entry);
+    }
+
+    if (!obj.name) return;
+    const parsed = parseExportRoomCandidate(obj.name);
+    if (!parsed) return;
+
+    const row = {
+      buildingName,
+      parsed,
+      oldName: String(obj.name),
+      finalName: ""
+    };
+    entry.roomCandidates.push(row);
+
+    if (parsed.kind === "plain" || parsed.kind === "explicit_suffix" || parsed.kind === "loader_suffix") {
+      canonicalBaseSet.add(parsed.baseDigits);
+      if (!canonicalByBuilding.has(buildingName)) canonicalByBuilding.set(buildingName, new Set());
+      canonicalByBuilding.get(buildingName).add(parsed.baseDigits);
+    }
+    if (parsed.kind === "compact_suffix") {
+      compactByBaseCount.set(parsed.baseDigits, (compactByBaseCount.get(parsed.baseDigits) || 0) + 1);
+    }
+  });
+
+  const buildingsOut = [];
+  for (const entry of buildingEntries.values()) {
+    const roomMap = new Map();
+    for (const row of entry.roomCandidates) {
+      const p = row.parsed;
+      let finalDigits = p.originalDigits;
+
+      if (p.kind === "plain") {
+        finalDigits = p.baseDigits;
+      } else if (p.kind === "explicit_suffix") {
+        finalDigits = p.baseDigits;
+      } else if (p.kind === "compact_suffix") {
+        const suffixNum = Number(p.suffixDigits);
+        const compactLooksLikeDuplicate = p.baseDigits.length >= 1 && p.baseDigits.length <= 4 && suffixNum >= 1 && suffixNum <= 999;
+        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
+        const sameBuildingEvidence = canonicalByBuilding.get(entry.name)?.has(p.baseDigits) || false;
+        const repeatedCompactBase = (compactByBaseCount.get(p.baseDigits) || 0) >= 2;
+        if (compactLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence || repeatedCompactBase)) {
+          finalDigits = p.baseDigits;
+        }
+      } else if (p.kind === "loader_suffix") {
+        const suffixNum = Number(p.suffixDigits);
+        const loaderLooksLikeDuplicate =
+          p.baseDigits.length >= 1 &&
+          p.baseDigits.length <= 4 &&
+          suffixNum >= 1 &&
+          suffixNum <= 999;
+        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
+        const sameBuildingEvidence = canonicalByBuilding.get(entry.name)?.has(p.baseDigits) || false;
+        if (loaderLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence)) {
+          finalDigits = p.baseDigits;
+        }
+      }
+
+      row.finalName = `ROOM ${finalDigits}`;
+      if (!roomMap.has(row.finalName)) {
+        roomMap.set(row.finalName, { name: row.finalName });
+      }
+    }
+
+    const rooms = Array.from(roomMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+    buildingsOut.push({
+      name: entry.name,
+      classification: rooms.length ? "building" : "unclassified",
+      rooms
+    });
+  }
+
+  buildingsOut.sort((a, b) => a.name.localeCompare(b.name));
+  return buildingsOut;
+}
+
+async function syncModelEntitiesToDatabase(modelFile, sceneRoot = campusRoot) {
+  const targetModel = String(modelFile || "").trim();
+  if (!targetModel) throw new Error("Missing model file for database sync");
+
+  let workingRoot = sceneRoot;
+  let loadedScene = null;
+  if (!workingRoot) {
+    const loader = new GLTFLoader();
+    const url = `../models/${encodeURIComponent(targetModel)}?v=${Date.now()}`;
+    loadedScene = await new Promise((resolve, reject) => {
+      loader.load(url, (gltf) => resolve(gltf.scene), undefined, (err) => reject(err));
+    });
+    workingRoot = loadedScene;
+  }
+
+  const buildings = buildExportEntityExtraction(workingRoot);
+  if (!Array.isArray(buildings) || !buildings.length) {
+    throw new Error(`No buildings detected for ${targetModel}`);
+  }
+
+  const res = await fetch("mapImport.php?action=import_entities", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "Content-Type": "application/json",
+      "X-CSRF-Token": MAP_IMPORT_CSRF_TOKEN
+    },
+    body: JSON.stringify({
+      modelFile: targetModel,
+      buildings
+    })
+  });
+  const data = await res.json();
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.error || `HTTP ${res.status}`);
+  }
+  return data.summary || {};
+}
+
+function buildRoadGraph() {
+  const nodes = new Map(); // graphNodeId -> Vector3 (world)
+  const edges = new Map(); // graphNodeId -> [{ to, w }]
+  const idAliases = new Map(); // raw pointId -> graphNodeId
+  const edgeMin = new Map();   // undirected key -> { a, b, w }
+
+  const baseTol = Number(ROAD_AUTO_INTERSECT_DIST);
+  const mergeTol = Math.max(0.5, Math.min(3, Number.isFinite(baseTol) ? baseTol * 0.2 : 1.6));
+  const mergeTolSq = mergeTol * mergeTol;
+  const endpointSnapTol = Math.max(
+    3,
+    Math.min(
+      Number(ROAD_DEFAULT_WIDTH) || 12,
+      (Number.isFinite(baseTol) ? baseTol : 8) + 2
+    )
+  );
+  const cellSize = Math.max(0.25, mergeTol);
+  const nodeCells = new Map();
+  let syntheticNodeIdx = 1;
+
+  const toCell = (v) => Math.floor(v / cellSize);
+  const cellKey = (x, z) => `${toCell(x)},${toCell(z)}`;
+  const edgeKey = (a, b) => {
+    const sa = String(a);
+    const sb = String(b);
+    return sa < sb ? `${sa}\u0000${sb}` : `${sb}\u0000${sa}`;
+  };
+
+  const setAlias = (rawId, nodeId) => {
+    if (rawId == null || rawId === "" || nodeId == null || nodeId === "") return;
+    if (!idAliases.has(rawId)) idAliases.set(rawId, nodeId);
+  };
+
+  const registerNodeInCell = (id, pos) => {
+    const key = cellKey(pos.x, pos.z);
+    if (!nodeCells.has(key)) nodeCells.set(key, []);
+    nodeCells.get(key).push(id);
+  };
+
+  const findNearbyNodeId = (pos) => {
+    const cx = toCell(pos.x);
+    const cz = toCell(pos.z);
+    let bestId = null;
+    let bestSq = Infinity;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const key = `${cx + dx},${cz + dz}`;
+        const bucket = nodeCells.get(key);
+        if (!bucket) continue;
+        for (const id of bucket) {
+          const p = nodes.get(id);
+          if (!p) continue;
+          const ddx = p.x - pos.x;
+          const ddz = p.z - pos.z;
+          const d2 = ddx * ddx + ddz * ddz;
+          if (d2 <= mergeTolSq && d2 < bestSq) {
+            bestSq = d2;
+            bestId = id;
+          }
+        }
+      }
+    }
+    return bestId;
+  };
+
+  const newSyntheticNodeId = () => {
+    let id = `route_n_${syntheticNodeIdx++}`;
+    while (nodes.has(id)) id = `route_n_${syntheticNodeIdx++}`;
+    return id;
+  };
+
+  const getOrCreateNodeId = (worldPos, preferredId = null) => {
+    if (!worldPos) return null;
+    const hasPreferred = !(preferredId == null || preferredId === "");
+    if (hasPreferred && nodes.has(preferredId)) {
+      const existing = nodes.get(preferredId);
+      if (existing) {
+        const dx = existing.x - worldPos.x;
+        const dz = existing.z - worldPos.z;
+        if ((dx * dx + dz * dz) <= mergeTolSq) {
+          setAlias(preferredId, preferredId);
+          return preferredId;
+        }
+      }
+    }
+
+    const nearId = findNearbyNodeId(worldPos);
+    if (nearId) {
+      setAlias(preferredId, nearId);
+      return nearId;
+    }
+
+    const nodeId = (hasPreferred && !nodes.has(preferredId)) ? preferredId : newSyntheticNodeId();
+    nodes.set(nodeId, worldPos.clone());
+    registerNodeInCell(nodeId, worldPos);
+    setAlias(preferredId, nodeId);
+    return nodeId;
+  };
+
+  const addUndirectedEdge = (a, b, w) => {
+    if (a == null || a === "" || b == null || b === "" || a === b) return;
+    if (!Number.isFinite(w) || w <= 1e-6) return;
+    const key = edgeKey(a, b);
+    const prev = edgeMin.get(key);
+    if (!prev || w < prev.w) edgeMin.set(key, { a, b, w });
+  };
+
+  const segmentCutNear = (a, b) => {
+    if (!a || !b || !a.point || !b.point) return false;
+    if (Math.abs((a.t ?? 0) - (b.t ?? 0)) <= 1e-4) return true;
+    const dx = a.point.x - b.point.x;
+    const dz = a.point.z - b.point.z;
+    return ((dx * dx + dz * dz) <= (mergeTolSq * 0.25));
+  };
+
+  const pushSegmentCut = (segment, cut) => {
+    if (!segment || !cut || !cut.point || !Number.isFinite(cut.t)) return;
+    const t = Math.max(0, Math.min(1, cut.t));
+    const entry = { t, point: cut.point.clone(), pointId: cut.pointId || null };
+    const existing = segment.cuts.find(c => segmentCutNear(c, entry));
+    if (!existing) {
+      segment.cuts.push(entry);
+      return;
+    }
+    if (!existing.pointId && entry.pointId) existing.pointId = entry.pointId;
+  };
+
+  const projectPointOnSegmentXZ = (p, a, b, t) => {
+    const tt = Math.max(0, Math.min(1, Number(t) || 0));
+    const x = a.x + (b.x - a.x) * tt;
+    const z = a.z + (b.z - a.z) * tt;
+    const refY = Number.isFinite(p?.y) ? p.y : (a.y + b.y) * 0.5;
+    return new THREE.Vector3(x, sampleRoadBaseYAtXZ(x, z, refY), z);
+  };
+
+  const connectEndpointToSegmentIfNear = (segEndpointOwner, endpointT, segTarget) => {
+    if (!segEndpointOwner || !segTarget) return;
+    const endpoint = endpointT === 0 ? segEndpointOwner.a : segEndpointOwner.b;
+    if (!endpoint) return;
+
+    const widthA = Number(segEndpointOwner.roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+    const widthB = Number(segTarget.roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+    const widthTol = Math.max(
+      0,
+      (((Number.isFinite(widthA) ? widthA : ROAD_DEFAULT_WIDTH) + (Number.isFinite(widthB) ? widthB : ROAD_DEFAULT_WIDTH)) * 0.5) + 1
+    );
+    const nearTol = Math.max(endpointSnapTol, widthTol);
+
+    const res = pointSegmentDistanceXZ(endpoint, segTarget.a, segTarget.b);
+    if (!res || !Number.isFinite(res.dist) || res.dist > nearTol) return;
+
+    const tt = Math.max(0, Math.min(1, Number(res.t) || 0));
+    const projected = projectPointOnSegmentXZ(endpoint, segTarget.a, segTarget.b, tt);
+    const endpointPointId = endpointT === 0
+      ? (segEndpointOwner.cuts[0]?.pointId || null)
+      : (segEndpointOwner.cuts[1]?.pointId || null);
+    pushSegmentCut(segEndpointOwner, { t: endpointT, point: endpoint, pointId: endpointPointId });
+    pushSegmentCut(segTarget, { t: tt, point: projected });
+  };
+
+  const segments = [];
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const ptsLocal = getRoadLocalPoints(obj);
+    const ids = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
+    if (!Array.isArray(ptsLocal) || ptsLocal.length < 2) continue;
+
+    obj.updateMatrixWorld(true);
+    const ptsWorld = ptsLocal.map(p => obj.localToWorld(p.clone()));
+
+    for (let i = 0; i < ptsWorld.length - 1; i++) {
+      const a = ptsWorld[i];
+      const b = ptsWorld[i + 1];
+      if (!a || !b) continue;
+      const w = Math.hypot(b.x - a.x, b.z - a.z);
+      if (!Number.isFinite(w) || w <= 1e-6) continue;
+      segments.push({
+        roadObj: obj,
+        segIndex: i,
+        a,
+        b,
+        cuts: [
+          { t: 0, point: a.clone(), pointId: ids[i] || null },
+          { t: 1, point: b.clone(), pointId: ids[i + 1] || null }
+        ]
+      });
+    }
+  }
+
+  // Geometry-based splitting: connect any segment intersections, not just shared pointIds.
+  for (let i = 0; i < segments.length; i++) {
+    for (let j = i + 1; j < segments.length; j++) {
+      const s1 = segments[i];
+      const s2 = segments[j];
+      if (!s1 || !s2) continue;
+      if (s1.roadObj === s2.roadObj && Math.abs(s1.segIndex - s2.segIndex) <= 1) continue;
+
+      const hit = segmentIntersectXZ(s1.a, s1.b, s2.a, s2.b, 1e-6);
+      if (!hit) continue;
+      const refY = (s1.a.y + s1.b.y + s2.a.y + s2.b.y) * 0.25;
+      const p = new THREE.Vector3(hit.x, sampleRoadBaseYAtXZ(hit.x, hit.z, refY), hit.z);
+      pushSegmentCut(s1, { t: hit.t, point: p });
+      pushSegmentCut(s2, { t: hit.u, point: p });
+    }
+  }
+
+  // Treat near endpoint-to-segment touches as graph junctions.
+  for (let i = 0; i < segments.length; i++) {
+    for (let j = i + 1; j < segments.length; j++) {
+      const s1 = segments[i];
+      const s2 = segments[j];
+      if (!s1 || !s2) continue;
+      if (s1.roadObj === s2.roadObj && Math.abs(s1.segIndex - s2.segIndex) <= 1) continue;
+      connectEndpointToSegmentIfNear(s1, 0, s2);
+      connectEndpointToSegmentIfNear(s1, 1, s2);
+      connectEndpointToSegmentIfNear(s2, 0, s1);
+      connectEndpointToSegmentIfNear(s2, 1, s1);
+    }
+  }
+
+  for (const seg of segments) {
+    seg.cuts.sort((a, b) => a.t - b.t);
+    const resolved = [];
+    for (const cut of seg.cuts) {
+      const nodeId = getOrCreateNodeId(cut.point, cut.pointId || null);
+      if (!nodeId) continue;
+      if (resolved.length && resolved[resolved.length - 1].nodeId === nodeId) continue;
+      resolved.push({ nodeId, point: cut.point });
+    }
+    for (let i = 0; i < resolved.length - 1; i++) {
+      const c0 = resolved[i];
+      const c1 = resolved[i + 1];
+      const w = Math.hypot(c1.point.x - c0.point.x, c1.point.z - c0.point.z);
+      addUndirectedEdge(c0.nodeId, c1.nodeId, w);
+    }
+  }
+
+  for (const e of edgeMin.values()) {
+    if (!edges.has(e.a)) edges.set(e.a, []);
+    if (!edges.has(e.b)) edges.set(e.b, []);
+    edges.get(e.a).push({ to: e.b, w: e.w });
+    edges.get(e.b).push({ to: e.a, w: e.w });
+  }
+
+  return { nodes, edges, idAliases };
+}
+
+function resolveGraphNodeId(graph, rawId) {
+  if (!graph || rawId == null || rawId === "") return null;
+  if (graph.nodes?.has?.(rawId)) return rawId;
+  const alias = graph.idAliases?.get?.(rawId);
+  if (alias != null && alias !== "" && graph.nodes?.has?.(alias)) return alias;
+  return null;
+}
+
+function findNearestGraphNodeId(nodes, worldPoint, maxDist = Infinity) {
+  if (!nodes || !worldPoint) return null;
+  let bestId = null;
+  let bestDist = Infinity;
+  for (const [id, p] of nodes.entries()) {
+    if (!p) continue;
+    const d = Math.hypot(p.x - worldPoint.x, p.z - worldPoint.z);
+    if (d < bestDist) {
+      bestDist = d;
+      bestId = id;
+    }
+  }
+  if (!bestId) return null;
+  return (Number.isFinite(maxDist) && bestDist > maxDist) ? null : bestId;
+}
+
+function resolveCandidateNodeIds(graph, candidates) {
+  if (!graph || !Array.isArray(candidates) || !candidates.length) return [];
+  const ids = new Set();
+  const attachMax = Math.max(12, Number(ROAD_DEFAULT_WIDTH) || 10);
+  for (const it of candidates) {
+    const byId = resolveGraphNodeId(graph, it?.id || null);
+    if (byId) {
+      ids.add(byId);
+      continue;
+    }
+    if (it?.world) {
+      const nearest = findNearestGraphNodeId(graph.nodes, it.world, attachMax);
+      if (nearest) ids.add(nearest);
+    }
+  }
+  return Array.from(ids);
+}
+
+function findKioskStartPoints() {
+  const points = [];
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+    const idArr = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
+    const ptsLocal = getRoadLocalPoints(obj);
+    if (!metaArr.length || !ptsLocal.length) continue;
+    obj.updateMatrixWorld(true);
+    for (let i = 0; i < metaArr.length; i++) {
+      const meta = metaArr[i];
+      if (!isKioskMeta(meta)) continue;
+      const local = ptsLocal[i] || null;
+      const world = local ? obj.localToWorld(local.clone()) : null;
+      points.push({ id: idArr[i] || meta?.id || null, world });
+    }
+  }
+  return points;
+}
+
+function findKioskStartPointId() {
+  const points = findKioskStartPoints();
+  for (const p of points) {
+    if (p?.id != null && p.id !== "") return p.id;
+  }
+  return points[0]?.id || null;
+}
+
+function findBuildingEntrancePoints(buildingName) {
+  const target = normalizeBuildingName(buildingName);
+  if (!target) return [];
+  const points = [];
+
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+    const idArr = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
+    const ptsLocal = getRoadLocalPoints(obj);
+    if (!metaArr.length || !ptsLocal.length) continue;
+    obj.updateMatrixWorld(true);
+    for (let i = 0; i < metaArr.length; i++) {
+      const meta = metaArr[i];
+      if (!meta || isKioskMeta(meta)) continue;
+      const name = normalizeBuildingName(meta?.building?.name);
+      if (!name || name !== target) continue;
+      const local = ptsLocal[i] || null;
+      const world = local ? obj.localToWorld(local.clone()) : null;
+      points.push({ id: idArr[i] || meta?.id || null, world });
+    }
+  }
+
+  return points;
+}
+
+function findBuildingEntrancePointIds(buildingName) {
+  const ids = new Set();
+  const points = findBuildingEntrancePoints(buildingName);
+  for (const p of points) {
+    if (p?.id != null && p.id !== "") ids.add(p.id);
+  }
+  return Array.from(ids);
+}
+
+function getEntranceBuildingNames() {
+  const names = new Map(); // normalized -> original
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+    for (const meta of metaArr) {
+      if (!meta || isKioskMeta(meta)) continue;
+      const raw = String(meta?.building?.name || "").trim();
+      if (!raw) continue;
+      const key = routeKey(raw);
+      if (!names.has(key)) names.set(key, raw);
+    }
+  }
+  return Array.from(names.values());
+}
+
+function computeSavedRoutes() {
+  const graph = buildRoadGraph();
+  const { nodes, edges } = graph;
+  const kioskPoints = findKioskStartPoints();
+  const kioskNodeIds = resolveCandidateNodeIds(graph, kioskPoints);
+  if (!kioskNodeIds.length) return {};
+
+  const dijkstraRuns = kioskNodeIds.map(startId => {
+    const { dist, prev } = dijkstra(nodes, edges, startId);
+    return { startId, dist, prev };
+  });
+
+  const routes = {};
+  const buildingNames = getEntranceBuildingNames();
+
+  for (const name of buildingNames) {
+    const key = routeKey(name);
+    const targetPoints = findBuildingEntrancePoints(name);
+    const targetNodeIds = resolveCandidateNodeIds(graph, targetPoints);
+    if (!targetNodeIds.length) continue;
+
+    let best = null;
+    for (const run of dijkstraRuns) {
+      for (const targetId of targetNodeIds) {
+        const d = run.dist.get(targetId);
+        if (!Number.isFinite(d)) continue;
+        if (!best || d < best.dist) {
+          best = { startId: run.startId, targetId, dist: d, prev: run.prev };
+        }
+      }
+    }
+    if (!best || !Number.isFinite(best.dist)) continue;
+
+    const path = buildPath(best.prev, best.startId, best.targetId);
+    if (!path || path.length < 2) continue;
+
+    const points = [];
+    for (const id of path) {
+      const p = nodes.get(id);
+      if (!p) continue;
+      points.push([p.x, p.y, p.z]);
+    }
+    if (points.length < 2) continue;
+
+    routes[key] = {
+      name,
+      distance: best.dist,
+      points,
+      updated: Date.now()
+    };
+  }
+
+  return routes;
+}
+
+async function loadRoutesForModel(modelName) {
+  if (!modelName) return;
+  try {
+    const res = await apiFetch(`mapEditor.php?action=load_routes&name=${encodeURIComponent(modelName)}`);
+    const data = await res.json();
+    if (data && data.routes && typeof data.routes === "object") {
+      setSavedRoutes(data.routes);
+    } else {
+      setSavedRoutes({});
+    }
+  } catch (_) {
+    setSavedRoutes({});
+  }
+}
+
+async function saveRoutesForModel(modelName, routes) {
+  if (!modelName) return false;
+  try {
+    const payload = { routes: routes || {} };
+    const res = await apiFetch(`mapEditor.php?action=save_routes&name=${encodeURIComponent(modelName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    return !!data?.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function loadRoadnetForModel(modelName, opts = {}) {
+  const {
+    replaceExisting = true,
+    keepExistingWhenMissing = false
+  } = opts;
+
+  if (!modelName) return { exists: false, loaded: 0 };
+
+  let exists = false;
+  let roads = [];
+  try {
+    const res = await apiFetch(`mapEditor.php?action=load_roadnet&name=${encodeURIComponent(modelName)}`);
+    const data = await res.json();
+    exists = !!data?.exists;
+    roads = Array.isArray(data?.roads) ? data.roads : [];
+  } catch (_) {
+    exists = false;
+    roads = [];
+  }
+
+  const shouldReplace = replaceExisting && (exists || !keepExistingWhenMissing);
+  if (shouldReplace) clearRoadObjectsFromOverlay();
+
+  let loaded = 0;
+  for (const roadItem of roads) {
+    const roadObj = spawnSerializedRoadObject(roadItem);
+    if (roadObj) loaded++;
+  }
+
+  updateSpecialPointsPanel();
+  return { exists, loaded };
+}
+
+async function saveRoadnetForModel(modelName, roads) {
+  if (!modelName) return false;
+  try {
+    const payload = { roads: Array.isArray(roads) ? roads : [] };
+    const res = await apiFetch(`mapEditor.php?action=save_roadnet&name=${encodeURIComponent(modelName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    return !!data?.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function saveRoadDataForModel(modelName, opts = {}) {
+  if (!modelName) throw new Error("No model selected");
+
+  const roads = Array.isArray(opts.roads) ? opts.roads : serializeRoadnet();
+  const routes = (opts.routes && typeof opts.routes === "object") ? opts.routes : computeSavedRoutes();
+  setSavedRoutes(routes);
+
+  const [roadnetOk, routesOk] = await Promise.all([
+    saveRoadnetForModel(modelName, roads),
+    saveRoutesForModel(modelName, routes)
+  ]);
+
+  if (!roadnetOk || !routesOk) {
+    throw new Error("Failed to save road data");
+  }
+
+  return { roads, routes };
+}
+
+function dijkstra(nodes, edges, startId) {
+  const dist = new Map();
+  const prev = new Map();
+  const visited = new Set();
+
+  for (const id of nodes.keys()) dist.set(id, Infinity);
+  if (!nodes.has(startId)) return { dist, prev };
+  dist.set(startId, 0);
+
+  while (visited.size < nodes.size) {
+    let u = null;
+    let best = Infinity;
+    for (const [id, d] of dist.entries()) {
+      if (visited.has(id)) continue;
+      if (d < best) { best = d; u = id; }
+    }
+    if (!u || best === Infinity) break;
+    visited.add(u);
+    const neighbors = edges.get(u) || [];
+    for (const e of neighbors) {
+      const alt = best + (Number(e?.w) || 0);
+      if (alt < (dist.get(e.to) ?? Infinity)) {
+        dist.set(e.to, alt);
+        prev.set(e.to, u);
+      }
+    }
+  }
+  return { dist, prev };
+}
+
+function buildPath(prev, startId, endId) {
+  const path = [];
+  let cur = endId;
+  while (cur) {
+    path.push(cur);
+    if (cur === startId) break;
+    cur = prev.get(cur);
+  }
+  if (path[path.length - 1] !== startId) return null;
+  return path.reverse();
+}
+
+function drawRouteLine(pathIds, nodes) {
+  if (!Array.isArray(pathIds) || pathIds.length < 2) return false;
+
+  const points = [];
+  for (const id of pathIds) {
+    const p = nodes.get(id);
+    if (!p) continue;
+    points.push(p);
+  }
+  return drawRouteFromWorldPoints(points);
+}
+
+function routeToBuilding(buildingName) {
+  const name = String(buildingName || "").trim();
+  if (!name) return;
+  const key = routeKey(name);
+
+  if (!hasLiveRoadData()) {
+    const saved = getSavedRouteEntry(name);
+    const savedPointsArr = Array.isArray(saved?.points) ? saved.points : [];
+    if (savedPointsArr.length >= 2) {
+      const pts = savedPointsArr.map(p => Array.isArray(p) ? vec3FromArray(p) : p).filter(Boolean);
+      const ok = drawRouteFromWorldPoints(pts);
+      if (ok) {
+        let dist = Number(saved?.distance);
+        if (!Number.isFinite(dist)) {
+          dist = 0;
+          for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1], b = pts[i];
+            dist += Math.hypot((b.x - a.x), (b.z - a.z));
+          }
+        }
+        setRouteBanner(`Route to ${name} \u2022 ${dist.toFixed(0)} units`);
+      } else {
+        setRouteBanner(`No route found to ${name}`);
+      }
+      return;
+    }
+    clearRouteLine();
+    setRouteBanner(`No pathway for ${name} (no saved route)`);
+    return;
+  }
+
+  const graph = buildRoadGraph();
+  const { nodes, edges } = graph;
+
+  const kioskPoints = findKioskStartPoints();
+  if (!kioskPoints.length) {
+    clearRouteLine();
+    setRouteBanner("No kiosk start set");
+    return;
+  }
+  const kioskNodeIds = resolveCandidateNodeIds(graph, kioskPoints);
+  if (!kioskNodeIds.length) {
+    clearRouteLine();
+    setRouteBanner("Kiosk start is not connected to any road");
+    return;
+  }
+
+  const targetPoints = findBuildingEntrancePoints(name);
+  if (!targetPoints.length) {
+    clearRouteLine();
+    setRouteBanner(`No pathway for ${name} (no entrance point)`);
+    return;
+  }
+  const validTargets = resolveCandidateNodeIds(graph, targetPoints);
+  if (!validTargets.length) {
+    clearRouteLine();
+    setRouteBanner(`No pathway for ${name} (entrance not connected)`);
+    return;
+  }
+
+  let best = null;
+  for (const startId of kioskNodeIds) {
+    const { dist, prev } = dijkstra(nodes, edges, startId);
+    for (const targetId of validTargets) {
+      const d = dist.get(targetId);
+      if (!Number.isFinite(d)) continue;
+      if (!best || d < best.dist) {
+        best = { startId, targetId, dist: d, prev };
+      }
+    }
+  }
+
+  if (!best || !Number.isFinite(best.dist)) {
+    clearRouteLine();
+    setRouteBanner(`No route found to ${name}`);
+    return;
+  }
+
+  const path = buildPath(best.prev, best.startId, best.targetId);
+  if (!path || path.length < 2) {
+    if (path && path.length === 1) {
+      clearRouteLine();
+      setRouteBanner(`Kiosk is at ${name}`);
+      return;
+    }
+    clearRouteLine();
+    setRouteBanner(`No route found to ${name}`);
+    return;
+  }
+
+  const ok = drawRouteLine(path, nodes);
+  if (!ok) {
+    setRouteBanner(`No route found to ${name}`);
+    return;
+  }
+
+  const pathPoints = path
+    .map(id => nodes.get(id))
+    .filter(p => p)
+    .map(p => [p.x, p.y, p.z]);
+  if (pathPoints.length >= 2) {
+    savedRoutes[key] = {
+      name,
+      distance: best.dist,
+      points: pathPoints,
+      updated: Date.now()
+    };
+  }
+
+  setRouteBanner(`Route to ${name} \u2022 ${best.dist.toFixed(0)} units`);
 }
 
 function clearActiveTool(showStatus = true) {
   currentTool = "none";
-  autoAlignEnabled = false;
+  roadKioskPlaceMode = false;
   setActiveToolButton(null);
-  updateAutoAlignButton();
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
   hideRoadHoverPreview();
   syncTransformToSelection();
   updateToolIndicator();
-  clearAlignGuides();
   hideAngleReadout();
   if (controls) controls.enabled = true;
   if (showStatus) setStatus("Tool cleared");
 }
 
-setStatus("Booting…");
+setStatus("BootingÃ¢â‚¬Â¦");
 updateToolIndicator();
-updateAutoAlignButton();
+setSidebarCollapsed(false);
+sidebarToggleBtn?.addEventListener("click", () => {
+  setSidebarCollapsed(true);
+});
+sidebarFloatToggleBtn?.addEventListener("click", () => {
+  setSidebarCollapsed(!layoutEl?.classList.contains("me-collapsed"));
+});
 
 // Block TransformControls keyboard mode switching (W/E/R)
 const TRANSFORM_KEY_BLOCK = new Set(["KeyW", "KeyE", "KeyR"]);
@@ -530,23 +2898,34 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 mapStage.appendChild(renderer.domElement);
+const canvas = renderer.domElement;
+canvas.style.display = "block";
+canvas.style.width = "100%";
+canvas.style.height = "100%";
+canvas.style.touchAction = "none";
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xf3f4f6);
 
 const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
 camera.position.set(0, 500, 500);
-
-const controls = new OrbitControls(camera, renderer.domElement);
+const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
+controls.enableRotate = true;
+controls.enablePan = true;
+controls.enableZoom = true;
 controls.screenSpacePanning = true;
 controls.mouseButtons = {
   LEFT: THREE.MOUSE.ROTATE,
   MIDDLE: THREE.MOUSE.DOLLY,
   RIGHT: THREE.MOUSE.PAN
 };
-renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+controls.touches = {
+  ONE: THREE.TOUCH.ROTATE,
+  TWO: THREE.TOUCH.DOLLY_PAN
+};
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
 // Pointer tracking (helps make Road tool touch-friendly: 1-finger edits, 2-finger camera)
 const activeTouchPointerIds = new Set();
@@ -580,167 +2959,6 @@ scene.add(dir);
 scene.add(new THREE.GridHelper(5000, 200));
 scene.add(new THREE.AxesHelper(100));
 
-// Auto Align guides (red lines)
-const alignGuideMaterial = new THREE.LineBasicMaterial({
-  color: 0xef4444,
-  transparent: true,
-  opacity: 0.9,
-  depthTest: false
-});
-const alignGuides = new THREE.Group();
-alignGuides.renderOrder = 20;
-scene.add(alignGuides);
-
-function clearAlignGuides() {
-  while (alignGuides.children.length) {
-    const child = alignGuides.children.pop();
-    child.geometry?.dispose?.();
-  }
-}
-
-function addGuideLine(a, b) {
-  const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
-  const line = new THREE.Line(geom, alignGuideMaterial);
-  line.renderOrder = 20;
-  alignGuides.add(line);
-}
-
-function getBoxValues(box) {
-  return {
-    minX: box.min.x, maxX: box.max.x, centerX: (box.min.x + box.max.x) / 2,
-    minY: box.min.y, maxY: box.max.y, centerY: (box.min.y + box.max.y) / 2,
-    minZ: box.min.z, maxZ: box.max.z, centerZ: (box.min.z + box.max.z) / 2,
-  };
-}
-
-function findBestAlignment(movingBox, otherBox, axis) {
-  const m = getBoxValues(movingBox);
-  const o = getBoxValues(otherBox);
-  const isX = axis === "x";
-
-  const mMin = isX ? m.minX : m.minZ;
-  const mMax = isX ? m.maxX : m.maxZ;
-  const mCenter = isX ? m.centerX : m.centerZ;
-
-  const oMin = isX ? o.minX : o.minZ;
-  const oMax = isX ? o.maxX : o.maxZ;
-  const oCenter = isX ? o.centerX : o.centerZ;
-
-  const candidates = [
-    { delta: oMin - mMin, type: "minToMin" },
-    { delta: oMax - mMax, type: "maxToMax" },
-    { delta: oCenter - mCenter, type: "centerToCenter" },
-    { delta: oMax - mMin, type: "minToMax" },
-    { delta: oMin - mMax, type: "maxToMin" },
-  ];
-
-  let best = null;
-  for (const c of candidates) {
-    const abs = Math.abs(c.delta);
-    if (abs > ALIGN_SNAP_DIST) continue;
-    if (!best || abs < best.absDelta) {
-      best = { ...c, absDelta: abs };
-    }
-  }
-  return best;
-}
-
-function edgeValueForType(type, box, axis, isMoving) {
-  const min = axis === "x" ? box.min.x : box.min.z;
-  const max = axis === "x" ? box.max.x : box.max.z;
-  const center = axis === "x" ? (box.min.x + box.max.x) / 2 : (box.min.z + box.max.z) / 2;
-
-  if (type === "minToMin") return min;
-  if (type === "maxToMax") return max;
-  if (type === "centerToCenter") return center;
-  if (type === "minToMax") return isMoving ? min : max;
-  if (type === "maxToMin") return isMoving ? max : min;
-  return center;
-}
-
-function applyAutoAlign(obj) {
-  clearAlignGuides();
-  if (!autoAlignEnabled || currentTool !== "move") return;
-  if (!obj) return;
-  if (obj.userData?.type === "road") return;
-
-  const movingBox = new THREE.Box3().setFromObject(obj);
-  if (movingBox.isEmpty()) return;
-
-  let bestX = null;
-  let bestZ = null;
-
-  for (const other of overlayRoot.children) {
-    if (!other || other === obj || !other.visible) continue;
-    if (other.userData?.type === "road") continue;
-
-    const otherBox = new THREE.Box3().setFromObject(other);
-    if (otherBox.isEmpty()) continue;
-
-    const candX = findBestAlignment(movingBox, otherBox, "x");
-    if (candX && (!bestX || candX.absDelta < bestX.absDelta)) {
-      bestX = { ...candX, otherBox };
-    }
-
-    const candZ = findBestAlignment(movingBox, otherBox, "z");
-    if (candZ && (!bestZ || candZ.absDelta < bestZ.absDelta)) {
-      bestZ = { ...candZ, otherBox };
-    }
-  }
-
-  if (bestX) obj.position.x += bestX.delta;
-  if (bestZ) obj.position.z += bestZ.delta;
-
-  obj.updateMatrixWorld(true);
-
-  if (bestX || bestZ) {
-    movingBox.setFromObject(obj);
-    const m = getBoxValues(movingBox);
-
-    if (bestX) {
-      const o = getBoxValues(bestX.otherBox);
-      const y = Math.max(m.minY, o.minY) + ALIGN_GUIDE_Y_OFFSET;
-
-      if (bestX.type === "centerToCenter") {
-        const x = m.centerX;
-        addGuideLine(
-          new THREE.Vector3(x, y, m.centerZ),
-          new THREE.Vector3(x, y, o.centerZ)
-        );
-      } else {
-        const x1 = edgeValueForType(bestX.type, movingBox, "x", true);
-        const x2 = edgeValueForType(bestX.type, bestX.otherBox, "x", false);
-        const z = (m.centerZ + o.centerZ) / 2;
-        addGuideLine(
-          new THREE.Vector3(x1, y, z),
-          new THREE.Vector3(x2, y, z)
-        );
-      }
-    }
-
-    if (bestZ) {
-      const o = getBoxValues(bestZ.otherBox);
-      const y = Math.max(m.minY, o.minY) + ALIGN_GUIDE_Y_OFFSET;
-
-      if (bestZ.type === "centerToCenter") {
-        const z = m.centerZ;
-        addGuideLine(
-          new THREE.Vector3(m.centerX, y, z),
-          new THREE.Vector3(o.centerX, y, z)
-        );
-      } else {
-        const z1 = edgeValueForType(bestZ.type, movingBox, "z", true);
-        const z2 = edgeValueForType(bestZ.type, bestZ.otherBox, "z", false);
-        const x = (m.centerX + o.centerX) / 2;
-        addGuideLine(
-          new THREE.Vector3(x, y, z1),
-          new THREE.Vector3(x, y, z2)
-        );
-      }
-    }
-  }
-}
-
 // Resize
 function resize() {
   const w = mapStage.clientWidth;
@@ -753,7 +2971,7 @@ window.addEventListener("resize", resize);
 
 // -------------------- Base Model --------------------
 const MODEL_DIR = "../models/";
-const ORIGINAL_MODEL_NAME = "tnts_map.glb";
+const ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
 let currentModelName = ORIGINAL_MODEL_NAME;
 let assetsLoaded = false;
 let isModelSwitching = false;
@@ -768,6 +2986,150 @@ let isTopView = false;
 const overlayRoot = new THREE.Group();
 overlayRoot.name = "overlayRoot";
 scene.add(overlayRoot);
+overlayReady = true;
+
+let overlayBaselineSnapshot = null;
+let baseBaselineSnapshot = null;
+let dirtyRefreshTimer = null;
+
+function roundSnapshotNumber(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Number(v.toFixed(6));
+}
+function isOverlaySaveAllowed() {
+  return currentModelName === ORIGINAL_MODEL_NAME;
+}
+function isRoadnetSaveAllowed() {
+  return !!currentModelName && !!campusRoot;
+}
+function updateOverlaySaveAvailability() {
+  if (!toolSave) return;
+  const canSave = isRoadnetSaveAllowed();
+  toolSave.disabled = !canSave;
+  toolSave.style.opacity = canSave ? "1" : "0.6";
+  toolSave.title = isOverlaySaveAllowed()
+    ? "Save Overlay + Roads"
+    : "Save Roads for this model (overlay assets save stays original-model only).";
+}
+function buildOverlaySnapshot() {
+  const out = [];
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!obj?.userData?.isPlaced) continue;
+    const type = obj.userData?.type || "asset";
+    const entry = {
+      type,
+      id: obj.userData?.id || null,
+      asset: type === "asset" ? (obj.userData?.asset || null) : null,
+      name: obj.userData?.nameLabel || "",
+      position: [roundSnapshotNumber(obj.position.x), roundSnapshotNumber(obj.position.y), roundSnapshotNumber(obj.position.z)],
+      rotation: [roundSnapshotNumber(obj.rotation.x), roundSnapshotNumber(obj.rotation.y), roundSnapshotNumber(obj.rotation.z)],
+      scale: [roundSnapshotNumber(obj.scale.x), roundSnapshotNumber(obj.scale.y), roundSnapshotNumber(obj.scale.z)],
+      locked: !!obj.userData?.locked,
+    };
+    if (type === "road") {
+      const road = obj.userData?.road || {};
+      entry.width = roundSnapshotNumber(Number(road.width || ROAD_DEFAULT_WIDTH));
+      entry.points = Array.isArray(road.points)
+        ? road.points.map((p) => Array.isArray(p)
+          ? [roundSnapshotNumber(p[0]), roundSnapshotNumber(p[1]), roundSnapshotNumber(p[2])]
+          : null)
+        : [];
+      entry.pointIds = Array.isArray(road.pointIds) ? road.pointIds.slice() : [];
+      entry.pointMeta = Array.isArray(road.pointMeta)
+        ? JSON.parse(JSON.stringify(road.pointMeta))
+        : [];
+    }
+    out.push(entry);
+  }
+  return JSON.stringify(out);
+}
+function buildBaseSnapshot() {
+  if (!campusRoot) return "";
+  const out = [];
+  campusRoot.traverse((obj) => {
+    if (!obj || obj.userData?.isPlaced) return;
+    out.push([
+      obj.uuid,
+      roundSnapshotNumber(obj.position.x), roundSnapshotNumber(obj.position.y), roundSnapshotNumber(obj.position.z),
+      roundSnapshotNumber(obj.quaternion.x), roundSnapshotNumber(obj.quaternion.y), roundSnapshotNumber(obj.quaternion.z), roundSnapshotNumber(obj.quaternion.w),
+      roundSnapshotNumber(obj.scale.x), roundSnapshotNumber(obj.scale.y), roundSnapshotNumber(obj.scale.z),
+    ]);
+  });
+  return JSON.stringify(out);
+}
+function hasUnsavedOverlayChanges() {
+  if (overlayBaselineSnapshot == null) return false;
+  return buildOverlaySnapshot() !== overlayBaselineSnapshot;
+}
+function hasUnsavedBaseChanges() {
+  if (baseBaselineSnapshot == null) return false;
+  return buildBaseSnapshot() !== baseBaselineSnapshot;
+}
+function getUnsavedChangeState() {
+  const overlay = hasUnsavedOverlayChanges();
+  const base = hasUnsavedBaseChanges();
+  return { overlay, base, any: overlay || base };
+}
+function updateDirtyIndicator() {
+  const state = getUnsavedChangeState();
+  if (dirtyIndicatorEl) {
+    if (!state.any) {
+      dirtyIndicatorEl.textContent = "Saved";
+      dirtyIndicatorEl.style.color = "#6b7280";
+    } else if (state.overlay && state.base) {
+      dirtyIndicatorEl.textContent = isOverlaySaveAllowed()
+        ? "Unsaved changes: overlay + base model"
+        : "Unsaved changes: roads + base model";
+      dirtyIndicatorEl.style.color = "#b45309";
+    } else if (state.overlay) {
+      dirtyIndicatorEl.textContent = isOverlaySaveAllowed()
+        ? "Unsaved overlay changes"
+        : "Unsaved road changes";
+      dirtyIndicatorEl.style.color = "#b45309";
+    } else {
+      dirtyIndicatorEl.textContent = "Unsaved base-model changes";
+      dirtyIndicatorEl.style.color = "#b45309";
+    }
+  }
+  updateOverlaySaveAvailability();
+}
+function scheduleDirtyRefresh() {
+  if (dirtyRefreshTimer != null) return;
+  dirtyRefreshTimer = setTimeout(() => {
+    dirtyRefreshTimer = null;
+    updateDirtyIndicator();
+  }, 0);
+}
+function captureDirtyBaselines(opts = {}) {
+  const { overlay = true, base = true } = opts;
+  if (overlay) overlayBaselineSnapshot = buildOverlaySnapshot();
+  if (base) baseBaselineSnapshot = buildBaseSnapshot();
+  updateDirtyIndicator();
+}
+function getUnsavedSwitchWarning() {
+  const state = getUnsavedChangeState();
+  if (!state.any) return "";
+  if (state.overlay && state.base) {
+    if (!isOverlaySaveAllowed()) {
+      return "You have unsaved road edits and unsaved base-model edits.\n\nUse Save to persist road edits and Export GLB for base-model edits.\n\nContinue switching models?";
+    }
+    return "You have unsaved overlay edits and unsaved base-model edits.\n\nUse Save Overlay for overlay edits and Export GLB for base-model edits.\n\nContinue switching models?";
+  }
+  if (state.overlay) {
+    if (!isOverlaySaveAllowed()) {
+      return "You have unsaved road edits.\n\nUse Save to persist road edits for this model.\n\nContinue switching models?";
+    }
+    return "You have unsaved overlay edits.\n\nUse Save Overlay to persist them before switching models.\n\nContinue switching models?";
+  }
+  return "You have unsaved base-model edits.\n\nUse Export GLB to persist them before switching models.\n\nContinue switching models?";
+}
+function withBaseEditExportHint(msg, obj) {
+  if (!obj) return msg;
+  if (obj.userData?.isPlaced) return msg;
+  if (obj.userData?.locked) return msg;
+  return `${msg} Use Export GLB to persist this base-model edit.`;
+}
 
 // -------------------- Roads (generated geometry) --------------------
 const roadDraftRoot = new THREE.Group();
@@ -793,6 +3155,14 @@ const roadMaterial = new THREE.MeshStandardMaterial({
   polygonOffsetFactor: -4,
   polygonOffsetUnits: -4
 });
+const roadSideMaterial = new THREE.MeshStandardMaterial({
+  color: 0x6b7280,
+  roughness: 1.0,
+  metalness: 0.0,
+  polygonOffset: true,
+  polygonOffsetFactor: -3,
+  polygonOffsetUnits: -3
+});
 const roadPreviewMaterial = new THREE.MeshBasicMaterial({
   color: 0x2563eb,
   transparent: true,
@@ -801,6 +3171,10 @@ const roadPreviewMaterial = new THREE.MeshBasicMaterial({
 });
 const roadHandleMaterial = new THREE.MeshBasicMaterial({
   color: 0xf59e0b,
+  depthTest: false
+});
+const roadKioskHandleMaterial = new THREE.MeshBasicMaterial({
+  color: 0xef4444,
   depthTest: false
 });
 
@@ -863,7 +3237,7 @@ function getRoadSurfacePointFromEvent(event) {
   for (const h of hits) {
     const obj = h?.object;
     if (!obj) continue;
-    if (obj.userData?.isRoadMesh) continue; // don't place onto existing road meshes
+    if (obj.userData?.isRoadMesh || obj.userData?.isRoadMeshSide) continue; // don't place onto existing road meshes
     if (!h.face) return h.point.clone();
 
     _roadNormalMatrix.getNormalMatrix(obj.matrixWorld);
@@ -892,7 +3266,7 @@ function sampleRoadSurfaceYAtXZ(x, z, refY = null) {
     for (const h of hits) {
       const obj = h?.object;
       if (!obj) continue;
-      if (obj.userData?.isRoadMesh) continue;
+      if (obj.userData?.isRoadMesh || obj.userData?.isRoadMeshSide) continue;
       if (!h.face) return h.point.y;
 
       _roadNormalMatrix.getNormalMatrix(obj.matrixWorld);
@@ -910,7 +3284,7 @@ function sampleRoadSurfaceYAtXZ(x, z, refY = null) {
   for (const h of hits) {
     const obj = h?.object;
     if (!obj) continue;
-    if (obj.userData?.isRoadMesh) continue;
+    if (obj.userData?.isRoadMesh || obj.userData?.isRoadMeshSide) continue;
     if (h.face) {
       _roadNormalMatrix.getNormalMatrix(obj.matrixWorld);
       _roadFaceNormal.copy(h.face.normal).applyNormalMatrix(_roadNormalMatrix).normalize();
@@ -967,12 +3341,18 @@ function rebuildRoadGroundTargets() {
 }
 
 function sampleRoadBaseYAtXZ(x, z, refY = null) {
-  if (!roadGroundTargets || !roadGroundTargets.length) return 0;
+  if (!roadGroundTargets || !roadGroundTargets.length) {
+    // Fallback for models where a dedicated ground node isn't detected by name.
+    return sampleRoadSurfaceYAtXZ(x, z, refY);
+  }
   _roadDownOrigin.set(x, ROAD_SURFACE_RAY_Y, z);
   raycaster.set(_roadDownOrigin, _roadDownDir);
 
   const hits = raycaster.intersectObjects(roadGroundTargets, true);
-  if (!hits.length) return 0;
+  if (!hits.length) {
+    // Fallback if ground targets don't intersect at this XZ.
+    return sampleRoadSurfaceYAtXZ(x, z, refY);
+  }
 
   let bestY = null;
   let bestScore = Infinity;
@@ -981,7 +3361,7 @@ function sampleRoadBaseYAtXZ(x, z, refY = null) {
   for (const h of hits) {
     const obj = h?.object;
     if (!obj) continue;
-    if (obj.userData?.isRoadMesh) continue;
+    if (obj.userData?.isRoadMesh || obj.userData?.isRoadMeshSide) continue;
 
     const y = h.point.y;
     if (firstY == null) firstY = y;
@@ -1003,12 +3383,39 @@ function sampleRoadBaseYAtXZ(x, z, refY = null) {
     }
   }
 
-  // If normals are flipped or filtered out, fall back to the first hit on the named ground object.
-  return bestY ?? firstY ?? 0;
+  // If normals are flipped or filtered out, fall back to a generic surface sample.
+  return bestY ?? firstY ?? sampleRoadSurfaceYAtXZ(x, z, refY);
 }
 
 function newRoadPointId() {
   return `rp_${Date.now()}_${_roadPointIdSeq++}`;
+}
+
+function isKioskMeta(meta) {
+  return !!(meta && (meta.type === "kiosk_start" || meta.kiosk === true));
+}
+
+function makeKioskMeta(pointId) {
+  return {
+    id: pointId || null,
+    type: "kiosk_start",
+    kiosk: true,
+    label: "Kiosk_Start",
+    building: null,
+    linkedAt: Date.now(),
+  };
+}
+
+function normalizeKioskMeta(meta, pointId) {
+  return {
+    ...(meta && typeof meta === "object" ? meta : {}),
+    id: (meta && meta.id) ? meta.id : (pointId || null),
+    type: "kiosk_start",
+    kiosk: true,
+    label: "Kiosk_Start",
+    building: null,
+    linkedAt: (meta && meta.linkedAt) ? meta.linkedAt : Date.now(),
+  };
 }
 
 function cloneRoadPointMeta(metaArr) {
@@ -1032,6 +3439,54 @@ function ensureRoadPointMetaArrays(roadObj) {
 
   if (road.pointIds.length > pts.length) road.pointIds.length = pts.length;
   if (road.pointMeta.length > pts.length) road.pointMeta.length = pts.length;
+}
+
+function clearKioskMetaAll() {
+  const changes = [];
+  for (const obj of overlayRoot.children) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const road = obj.userData.road;
+    const beforeMeta = cloneRoadPointMeta(road.pointMeta || []);
+    let changed = false;
+    for (let i = 0; i < road.pointMeta.length; i++) {
+      if (isKioskMeta(road.pointMeta[i])) {
+        road.pointMeta[i] = null;
+        changed = true;
+      }
+    }
+    if (changed) {
+      const afterMeta = cloneRoadPointMeta(road.pointMeta || []);
+      const beforePoints = clonePointsArray(road.points || []);
+      const beforeWidth = Number(road.width || ROAD_DEFAULT_WIDTH);
+      const beforeIds = Array.isArray(road.pointIds) ? road.pointIds.slice() : [];
+      const afterPoints = clonePointsArray(road.points || []);
+      const afterIds = Array.isArray(road.pointIds) ? road.pointIds.slice() : [];
+      changes.push({
+        obj,
+        beforePoints,
+        afterPoints,
+        beforeWidth,
+        afterWidth: beforeWidth,
+        beforeIds,
+        afterIds,
+        beforeMeta,
+        afterMeta
+      });
+    }
+  }
+  if (changes.length) {
+    for (const ch of changes) {
+      pushUndo({ type: "road_edit", obj: ch.obj, beforePoints: ch.beforePoints, afterPoints: ch.afterPoints, beforeWidth: ch.beforeWidth, afterWidth: ch.afterWidth, beforeIds: ch.beforeIds, afterIds: ch.afterIds, beforeMeta: ch.beforeMeta, afterMeta: ch.afterMeta });
+    }
+    redoStack = [];
+  }
+  if (changes.length && currentTool === "road" && selected && isRoadObject(selected)) {
+    buildRoadHandlesFor(selected);
+    syncRoadHandlesToRoad(selected);
+    updateRoadHandleScale();
+  }
+  return changes.length;
 }
 
 function distSqPointToBoxXZ(x, z, box) {
@@ -1085,24 +3540,26 @@ function determineApproachSide(anchorW, endX, endZ, buildingCenter) {
   return dz < 0 ? "back" : "front";
 }
 
-function getBuildingLabelForObject(obj) {
+function getTopLevelNamedAncestor(obj) {
+  if (!obj || !campusRoot) return null;
   let p = obj;
+  let top = null;
   while (p && p !== campusRoot) {
-    if (p.name && !isGenericNodeName(p.name) && !isGroundLikeName(p.name)) return p.name;
+    if (p.name && !isGenericNodeName(p.name) && !isGroundLikeName(p.name)) {
+      top = p;
+    }
     p = p.parent;
   }
-  if (obj?.name && !isGenericNodeName(obj.name) && !isGroundLikeName(obj.name)) return obj.name;
-  return null;
+  return top;
+}
+
+function getBuildingLabelForObject(obj) {
+  const root = getTopLevelNamedAncestor(obj);
+  return root?.name || null;
 }
 
 function getBuildingRootFromObject(obj) {
-  let p = obj;
-  while (p && p !== campusRoot) {
-    if (p.name && !isGenericNodeName(p.name) && !isGroundLikeName(p.name)) return p;
-    p = p.parent;
-  }
-  if (obj?.name && !isGenericNodeName(obj.name) && !isGroundLikeName(obj.name)) return obj;
-  return null;
+  return getTopLevelNamedAncestor(obj);
 }
 
 function buildLiveRoadSnapSources() {
@@ -1117,18 +3574,13 @@ function buildLiveRoadSnapSources() {
   // Named buildings (for metadata + soft snapping)
   const byName = new Map();
   campusRoot.traverse((obj) => {
-    if (!obj || !obj.name || isGenericNodeName(obj.name)) return;
+    if (!obj) return;
     if (obj.userData?.isPlaced) return;
     if (isGroundLikeName(obj.name)) return;
-
-    const existing = byName.get(obj.name);
-    if (!existing) {
-      byName.set(obj.name, obj);
-      return;
-    }
-    if (isEmptyGroup(obj) && !isEmptyGroup(existing)) {
-      byName.set(obj.name, obj);
-    }
+    const root = getTopLevelNamedAncestor(obj);
+    if (!root || !root.name) return;
+    if (byName.has(root.name)) return;
+    byName.set(root.name, root);
   });
   for (const [name, obj] of byName.entries()) {
     const box = new THREE.Box3().setFromObject(obj);
@@ -1138,7 +3590,7 @@ function buildLiveRoadSnapSources() {
     buildings.push({ name, obj, box, center: box.getCenter(new THREE.Vector3()) });
   }
 
-  // Obstacles (for hard-stop collisions) — use collider meshes when available
+  // Obstacles (for hard-stop collisions) Ã¢â‚¬â€ use collider meshes when available
   const seenObstacle = new Set();
   const addObstacle = (mesh) => {
     if (!mesh) return;
@@ -1180,18 +3632,13 @@ function rebuildRoadSnapBuildingCache() {
   // 1) Named buildings (for metadata + soft snapping)
   const byName = new Map();
   campusRoot.traverse((obj) => {
-    if (!obj || !obj.name || isGenericNodeName(obj.name)) return;
+    if (!obj) return;
     if (obj.userData?.isPlaced) return;
     if (isGroundLikeName(obj.name)) return;
-
-    const existing = byName.get(obj.name);
-    if (!existing) {
-      byName.set(obj.name, obj);
-      return;
-    }
-    if (isEmptyGroup(obj) && !isEmptyGroup(existing)) {
-      byName.set(obj.name, obj);
-    }
+    const root = getTopLevelNamedAncestor(obj);
+    if (!root || !root.name) return;
+    if (byName.has(root.name)) return;
+    byName.set(root.name, root);
   });
   for (const [name, obj] of byName.entries()) {
     const box = new THREE.Box3().setFromObject(obj);
@@ -1201,7 +3648,7 @@ function rebuildRoadSnapBuildingCache() {
     roadSnapBuildingCache.push({ name, obj, box, center: box.getCenter(new THREE.Vector3()) });
   }
 
-  // 2) Obstacles (for hard-stop collisions) — use collider meshes when available
+  // 2) Obstacles (for hard-stop collisions) Ã¢â‚¬â€ use collider meshes when available
   const obstacleMeshes = (Array.isArray(baseColliderMeshes) && baseColliderMeshes.length)
     ? baseColliderMeshes
     : [];
@@ -1245,11 +3692,37 @@ function rebuildRoadSnapBuildingCache() {
   }
 }
 
+function isBuildingLinkTaken(buildingName, exceptPointId = null) {
+  const name = String(buildingName || "").trim();
+  if (!name) return false;
+  const except = exceptPointId ? String(exceptPointId) : null;
+
+  const roads = overlayRoot?.children || [];
+  for (const obj of roads) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+    const idArr = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
+
+    for (let i = 0; i < metaArr.length; i++) {
+      const meta = metaArr[i];
+      if (!meta || isKioskMeta(meta)) continue;
+      const metaName = String(meta?.building?.name || "").trim();
+      if (!metaName || metaName !== name) continue;
+      const pid = (idArr[i] ?? meta.id ?? null);
+      if (except && pid && String(pid) === except) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
   const obstacles = [];
   const providedObstacles = Array.isArray(opts?.obstacles) ? opts.obstacles : null;
   const providedBuildings = Array.isArray(opts?.buildings) ? opts.buildings : null;
   const providedMeshes = Array.isArray(opts?.meshes) ? opts.meshes : null;
+  const exceptPointId = opts?.exceptPointId ?? null;
 
   if (providedObstacles && providedObstacles.length) {
     obstacles.push(...providedObstacles);
@@ -1287,7 +3760,7 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
         for (const h of hits) {
           const obj = h?.object;
           if (!obj) continue;
-          if (obj.userData?.isRoadMesh) continue;
+          if (obj.userData?.isRoadMesh || obj.userData?.isRoadMeshSide) continue;
           if (isGroundLikeName(obj.name)) continue;
           if (isGroundObjectOrChild(obj)) {
             // If it's ground-like, ignore it for road-wall collisions.
@@ -1307,14 +3780,15 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
 
           const outX = pt.x - _roadRayDir.x * backOff;
           const outZ = pt.z - _roadRayDir.z * backOff;
+          const taken = buildingName && isBuildingLinkTaken(buildingName, exceptPointId);
 
           raycaster.far = prevFar;
           return {
             x: outX,
             z: outZ,
             buildingObj: root || obj,
-            buildingName: buildingName || null,
-            side,
+            buildingName: taken ? null : (buildingName || null),
+            side: taken ? null : side,
           };
         }
         raycaster.far = prevFar;
@@ -1361,13 +3835,14 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
         // Pull slightly back along the ray so we stay OUTSIDE the expanded volume.
         const outX = hitX - dirX * backOff;
         const outZ = hitZ - dirZ * backOff;
+        const taken = bestHit.buildingName && isBuildingLinkTaken(bestHit.buildingName, exceptPointId);
 
         return {
           x: outX,
           z: outZ,
           buildingObj: bestHit.buildingObj,
-          buildingName: bestHit.buildingName,
-          side,
+          buildingName: taken ? null : bestHit.buildingName,
+          side: taken ? null : side,
         };
       }
     }
@@ -1382,6 +3857,7 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
   let best = null;
   for (const b of buildingList) {
     if (!b?.box) continue;
+    if (b?.name && isBuildingLinkTaken(b.name, exceptPointId)) continue;
     const dSq = distSqPointToBoxXZ(endX, endZ, b.box);
     if (dSq > maxSq) continue;
     if (!best || dSq < best.dSq) best = { ...b, dSq };
@@ -1430,7 +3906,7 @@ function makeBuildingLinkMeta(buildingName, side, pointId) {
 }
 
 function computeSnappedRoadEnd(anchorW, rawOnPlane, opts = {}) {
-  const { width = null, out = null, snapSources = null } = opts;
+  const { width = null, out = null, snapSources = null, exceptPointId = null } = opts;
   if (!anchorW || !rawOnPlane) return null;
   const dx = rawOnPlane.x - anchorW.x;
   const dz = rawOnPlane.z - anchorW.z;
@@ -1458,14 +3934,17 @@ function computeSnappedRoadEnd(anchorW, rawOnPlane, opts = {}) {
   }
 
   if (roadBuildingSnapEnabled) {
-    snap = snapRoadEndToBuildingSide(anchorW, x, z, w, snapSources || null);
+    const snapOpts = (snapSources && typeof snapSources === "object") ? { ...snapSources } : {};
+    if (exceptPointId) snapOpts.exceptPointId = exceptPointId;
+    snap = snapRoadEndToBuildingSide(anchorW, x, z, w, snapOpts);
     if (snap) {
       x = snap.x;
       z = snap.z;
       if (out && typeof out === "object") {
-        out.snapped = true;
-        out.buildingName = snap.buildingName || null;
-        out.side = snap.side || null;
+        const hasLink = !!(snap.buildingName && snap.side);
+        out.snapped = hasLink;
+        out.buildingName = hasLink ? (snap.buildingName || null) : null;
+        out.side = hasLink ? (snap.side || null) : null;
       }
     }
   }
@@ -1527,10 +4006,22 @@ function updateRoadControls() {
     roadBuildingSnapBtn.textContent = `Attach: ${roadBuildingSnapEnabled ? "On" : "Off"}`;
     roadBuildingSnapBtn.style.opacity = roadBuildingSnapBtn.disabled ? "0.6" : "1";
   }
+  if (roadAutoIntersectBtn) {
+    roadAutoIntersectBtn.disabled = !isActive;
+    roadAutoIntersectBtn.textContent = `Auto-Intersect: ${roadAutoIntersectEnabled ? "On" : "Off"}`;
+    roadAutoIntersectBtn.style.opacity = roadAutoIntersectBtn.disabled ? "0.6" : "1";
+  }
   if (roadDragModeBtn) {
     roadDragModeBtn.disabled = !isActive;
     roadDragModeBtn.textContent = `Drag: ${roadDragMode === "move" ? "Move" : "Draw"}`;
     roadDragModeBtn.style.opacity = roadDragModeBtn.disabled ? "0.6" : "1";
+  }
+  if (roadKioskBtn) {
+    roadKioskBtn.disabled = !isActive;
+    roadKioskBtn.textContent = roadKioskPlaceMode ? "Kiosk Start: Place" : "Kiosk Start";
+    roadKioskBtn.style.opacity = roadKioskBtn.disabled ? "0.6" : "1";
+    roadKioskBtn.style.outline = roadKioskPlaceMode ? "2px solid #10b981" : "none";
+    roadKioskBtn.style.outlineOffset = roadKioskPlaceMode ? "2px" : "0";
   }
 
   // Selected point + extend-from labels
@@ -1556,32 +4047,7 @@ function updateRoadControls() {
     if (roadExtendFromEl) roadExtendFromEl.textContent = extendLabel;
   }
 
-  // Building connect UI
-  if (roadConnectTargetEl) {
-    roadConnectTargetEl.textContent = roadConnectTarget?.name || "None";
-  }
-
-  const canPickBuilding = isActive && hasEditableSelectedRoad;
-  if (roadPickBuildingBtn) {
-    roadPickBuildingBtn.disabled = !canPickBuilding;
-    roadPickBuildingBtn.textContent = roadPickBuildingMode ? "Picking…" : "Pick Building";
-    roadPickBuildingBtn.style.opacity = roadPickBuildingBtn.disabled ? "0.6" : "1";
-  }
-  if (roadClearBuildingBtn) {
-    roadClearBuildingBtn.disabled = !isActive || !roadConnectTarget;
-    roadClearBuildingBtn.style.opacity = roadClearBuildingBtn.disabled ? "0.6" : "1";
-  }
-
-  let canConnect = false;
-  if (isActive && hasEditableSelectedRoad && roadConnectTarget && Number.isInteger(roadSelectedPointIndex)) {
-    const ptsArr = Array.isArray(selected?.userData?.road?.points) ? selected.userData.road.points : [];
-    canConnect = roadSelectedPointIndex >= 0 && roadSelectedPointIndex < ptsArr.length;
-  }
-  for (const b of [roadConnectFrontBtn, roadConnectBackBtn, roadConnectLeftBtn, roadConnectRightBtn]) {
-    if (!b) continue;
-    b.disabled = !canConnect;
-    b.style.opacity = b.disabled ? "0.6" : "1";
-  }
+  updateSpecialPointsPanel();
 }
 
 function clearRoadPointSelection() {
@@ -1619,7 +4085,7 @@ function selectRoadPoint(roadObj, index, opts = {}) {
     } else {
       roadExtendFrom = endpoint;
       roadExtendFromRoadId = roadObj.userData?.id || null;
-      if (showStatus) setStatus(`Extend from ${endpoint === "start" ? "Start" : "End"} selected — drag the point to draw a segment`);
+      if (showStatus) setStatus(`Extend from ${endpoint === "start" ? "Start" : "End"} selected Ã¢â‚¬â€ drag the point to draw a segment`);
     }
   } else {
     // Interior point selected; extension goes back to auto.
@@ -1628,109 +4094,11 @@ function selectRoadPoint(roadObj, index, opts = {}) {
       roadExtendFromRoadId = null;
     }
     if (showStatus) setStatus(roadDragMode === "draw"
-      ? "Road point selected — drag to branch a new segment"
-      : "Road point selected — drag to move (switch Drag mode to Draw to create segments)");
+      ? "Road point selected Ã¢â‚¬â€ drag to branch a new segment"
+      : "Road point selected Ã¢â‚¬â€ drag to move (switch Drag mode to Draw to create segments)");
   }
 
   updateRoadControls();
-}
-
-function isConnectableBuilding(obj) {
-  return !!(obj && !obj.userData?.isPlaced && obj.parent === campusRoot && !isGroundLikeName(obj.name));
-}
-
-function setRoadConnectTarget(obj, opts = {}) {
-  const { showStatus = true } = opts;
-  roadConnectTarget = obj || null;
-  roadPickBuildingMode = false;
-  updateRoadControls();
-  if (showStatus) {
-    setStatus(roadConnectTarget ? `Road connect target: ${roadConnectTarget.name}` : "Road connect target cleared");
-  }
-}
-
-function getBuildingSideCenterWorld(buildingObj, side) {
-  if (!buildingObj) return null;
-  const box = new THREE.Box3().setFromObject(buildingObj);
-  if (box.isEmpty()) return null;
-  const center = box.getCenter(new THREE.Vector3());
-  const p = new THREE.Vector3(center.x, box.min.y, center.z);
-  if (side === "front") p.z = box.max.z;
-  else if (side === "back") p.z = box.min.z;
-  else if (side === "left") p.x = box.min.x;
-  else if (side === "right") p.x = box.max.x;
-  return p;
-}
-
-function connectRoadPointToBuilding(roadObj, pointIndex, buildingObj, side) {
-  if (!roadObj || !isRoadObject(roadObj) || !canEditObject(roadObj)) return false;
-  if (!Number.isInteger(pointIndex)) return false;
-  if (!buildingObj) return false;
-
-  const targetW = getBuildingSideCenterWorld(buildingObj, side);
-  if (!targetW) return false;
-
-  const ptsLocal = getRoadLocalPoints(roadObj);
-  if (!ptsLocal[pointIndex]) return false;
-
-  ensureRoadPointMetaArrays(roadObj);
-  const beforePoints = clonePointsArray(roadObj.userData?.road?.points || []);
-  const beforeWidth = Number(roadObj.userData?.road?.width || ROAD_DEFAULT_WIDTH);
-  const beforeIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
-  const beforeMeta = cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []);
-
-  // Push the connection point OUTSIDE the building by (half road width + epsilon),
-  // so road segments don't pass through the building volume.
-  const connectW = Number(roadObj.userData?.road?.width || roadWidthEl?.value || ROAD_DEFAULT_WIDTH);
-  const half = Math.max(0.1, connectW / 2);
-  const gap = Math.max(0, Number(ROAD_BUILDING_GAP) || 0);
-  const offset = half + gap;
-  const box = new THREE.Box3().setFromObject(buildingObj);
-  if (!box.isEmpty()) {
-    const clamp = THREE.MathUtils.clamp;
-    if (side === "left") {
-      targetW.x = box.min.x - offset;
-      targetW.z = clamp(targetW.z, box.min.z, box.max.z);
-    } else if (side === "right") {
-      targetW.x = box.max.x + offset;
-      targetW.z = clamp(targetW.z, box.min.z, box.max.z);
-    } else if (side === "front") {
-      targetW.z = box.max.z + offset;
-      targetW.x = clamp(targetW.x, box.min.x, box.max.x);
-    } else if (side === "back") {
-      targetW.z = box.min.z - offset;
-      targetW.x = clamp(targetW.x, box.min.x, box.max.x);
-    }
-  }
-
-  // Keep the point on the same "ground/base" height near the current point.
-  const currentW = roadObj.localToWorld(ptsLocal[pointIndex].clone());
-  targetW.y = sampleRoadBaseYAtXZ(targetW.x, targetW.z, currentW.y);
-
-  const local = roadObj.worldToLocal(targetW.clone());
-
-  ptsLocal[pointIndex].copy(local);
-  setRoadLocalPoints(roadObj, ptsLocal);
-  roadObj.userData.road.width = beforeWidth;
-
-  // Mark this node as building-linked for later routing.
-  if (Array.isArray(roadObj.userData?.road?.pointIds) && Array.isArray(roadObj.userData?.road?.pointMeta)) {
-    const pid = roadObj.userData.road.pointIds[pointIndex];
-    roadObj.userData.road.pointMeta[pointIndex] = makeBuildingLinkMeta(buildingObj.name, side, pid);
-  }
-
-  rebuildRoadObject(roadObj);
-  buildRoadHandlesFor(roadObj);
-  syncRoadHandlesToRoad(roadObj);
-
-  const afterPoints = clonePointsArray(roadObj.userData?.road?.points || []);
-  const afterIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
-  const afterMeta = cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []);
-  undoStack.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth: beforeWidth, beforeIds, afterIds, beforeMeta, afterMeta });
-  redoStack = [];
-  setStatus(`Connected point to ${buildingObj.name} (${side}) ✓ (undo available)`);
-  updateRoadControls();
-  return true;
 }
 
 function computeDraftPreviewPoint(ptWorld) {
@@ -1798,7 +4166,6 @@ function computeExtendPreviewSegment(roadObj, ptsLocal, ptWorld, extendEnd) {
 
 function updateRoadPreview(event) {
   if (currentTool !== "road") return hideRoadHoverPreview();
-  if (roadPickBuildingMode) return hideRoadHoverPreview();
   if (activeTouchPointerIds.size >= 2) return hideRoadHoverPreview();
   if (!event || !isEventOnStage(event)) return hideRoadHoverPreview();
   const liveSources = roadBuildingSnapEnabled ? buildLiveRoadSnapSources() : null;
@@ -2043,7 +4410,7 @@ function buildRoadGeometry(points, width) {
 
     const delta = endAng - startAng;
     const absDelta = Math.abs(delta);
-    const steps = Math.max(1, Math.min(24, Math.ceil(absDelta / (Math.PI / 18)))); // ~10° per step
+    const steps = Math.max(1, Math.min(24, Math.ceil(absDelta / (Math.PI / 18)))); // ~10Ã‚Â° per step
 
     const arcIdx = [];
     for (let s = 0; s <= steps; s++) {
@@ -2076,6 +4443,44 @@ function buildRoadGeometry(points, width) {
   return geom;
 }
 
+function buildRoadSideGeometry(topGeom, thickness) {
+  const geom = new THREE.BufferGeometry();
+  if (!topGeom || !topGeom.attributes?.position) return geom;
+  const t = Number(thickness || 0);
+  if (!(t > 0)) return geom;
+
+  const edges = new THREE.EdgesGeometry(topGeom);
+  const pos = edges.attributes?.position?.array;
+  if (!pos || pos.length < 6) return geom;
+
+  const positions = [];
+  const indices = [];
+  let v = 0;
+
+  for (let i = 0; i < pos.length; i += 6) {
+    const ax = pos[i], ay = pos[i + 1], az = pos[i + 2];
+    const bx = pos[i + 3], by = pos[i + 4], bz = pos[i + 5];
+
+    const ayb = ay - t;
+    const byb = by - t;
+
+    positions.push(
+      ax, ay, az,
+      bx, by, bz,
+      bx, byb, bz,
+      ax, ayb, az
+    );
+
+    indices.push(v, v + 1, v + 2, v, v + 2, v + 3);
+    v += 4;
+  }
+
+  geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geom.setIndex(indices);
+  geom.computeVertexNormals();
+  return geom;
+}
+
 function replaceMeshGeometry(mesh, geom) {
   if (!mesh) return;
   const old = mesh.geometry;
@@ -2086,17 +4491,35 @@ function replaceMeshGeometry(mesh, geom) {
 function ensureRoadMeshFor(targetRoot, points, width, opts = {}) {
   const { preview = false } = opts;
   const existing = targetRoot?.children?.find?.(c => c && c.isMesh && c.userData?.isRoadMesh === true) || null;
+  const existingSide = targetRoot?.children?.find?.(c => c && c.isMesh && c.userData?.isRoadMeshSide === true) || null;
   const geom = buildRoadGeometry(points, width);
   if (existing) {
     replaceMeshGeometry(existing, geom);
     existing.material = preview ? roadPreviewMaterial : roadMaterial;
-    return existing;
+  } else {
+    const mesh = new THREE.Mesh(geom, preview ? roadPreviewMaterial : roadMaterial);
+    mesh.userData.isRoadMesh = true;
+    mesh.renderOrder = preview ? 15 : 1;
+    targetRoot.add(mesh);
   }
-  const mesh = new THREE.Mesh(geom, preview ? roadPreviewMaterial : roadMaterial);
-  mesh.userData.isRoadMesh = true;
-  mesh.renderOrder = preview ? 15 : 1;
-  targetRoot.add(mesh);
-  return mesh;
+
+  if (!preview && ROAD_THICKNESS > 0) {
+    const sideGeom = buildRoadSideGeometry(geom, ROAD_THICKNESS);
+    if (existingSide) {
+      replaceMeshGeometry(existingSide, sideGeom);
+      existingSide.material = roadSideMaterial;
+    } else {
+      const sideMesh = new THREE.Mesh(sideGeom, roadSideMaterial);
+      sideMesh.userData.isRoadMeshSide = true;
+      sideMesh.renderOrder = 0;
+      targetRoot.add(sideMesh);
+    }
+  } else if (existingSide) {
+    existingSide.geometry?.dispose?.();
+    targetRoot.remove(existingSide);
+  }
+
+  return targetRoot?.children?.find?.(c => c && c.isMesh && c.userData?.isRoadMesh === true) || null;
 }
 
 function clearRoadDraft() {
@@ -2164,7 +4587,7 @@ function createRoadFromWorldPoints(pointsWorld, width, opts = {}) {
 
   overlayRoot.add(group);
   if (recordHistory) {
-    undoStack.push({ type: "add", obj: group, parent: overlayRoot });
+    pushUndo({ type: "add", obj: group, parent: overlayRoot });
     redoStack = [];
   }
 
@@ -2181,10 +4604,62 @@ function spawnRoadNodeAt(pointWorld, opts = {}) {
   const pt = pointWorld?.clone?.();
   if (!pt) return null;
   // Keep road nodes at ground/base height (avoid ramping up onto roofs).
-  pt.y = sampleRoadBaseYAtXZ(pt.x, pt.z, 0);
+  pt.y = sampleRoadBaseYAtXZ(pt.x, pt.z, Number.isFinite(pt.y) ? pt.y : null);
   const w = Number(roadWidthEl?.value || ROAD_DEFAULT_WIDTH);
   const road = createRoadFromWorldPoints([pt], w, opts);
-  if (road) setStatus("Road point placed — drag a point to create a segment");
+  if (road) setStatus("Road point placed Ã¢â‚¬â€ drag a point to create a segment");
+  return road;
+}
+
+function placeKioskStartAt(pointWorld) {
+  const pt = pointWorld?.clone?.();
+  if (!pt) return null;
+  pt.y = sampleRoadBaseYAtXZ(pt.x, pt.z, Number.isFinite(pt.y) ? pt.y : null);
+
+  // Ensure only one kiosk start exists.
+  clearKioskMetaAll();
+
+  const w = Number(roadWidthEl?.value || ROAD_DEFAULT_WIDTH);
+  const road = createRoadFromWorldPoints([pt], w, { recordHistory: true, autoSelect: true });
+  if (!road) return null;
+
+  ensureRoadPointMetaArrays(road);
+  const roadData = road.userData.road;
+  const pid = Array.isArray(roadData.pointIds) ? roadData.pointIds[0] : null;
+
+  const beforePoints = clonePointsArray(roadData.points || []);
+  const beforeWidth = Number(roadData.width || ROAD_DEFAULT_WIDTH);
+  const beforeIds = Array.isArray(roadData.pointIds) ? roadData.pointIds.slice() : [];
+  const beforeMeta = cloneRoadPointMeta(roadData.pointMeta || []);
+
+  roadData.pointMeta[0] = makeKioskMeta(pid);
+
+  const afterPoints = clonePointsArray(roadData.points || []);
+  const afterIds = Array.isArray(roadData.pointIds) ? roadData.pointIds.slice() : [];
+  const afterMeta = cloneRoadPointMeta(roadData.pointMeta || []);
+
+  pushUndo({
+    type: "road_edit",
+    obj: road,
+    beforePoints,
+    afterPoints,
+    beforeWidth,
+    afterWidth: beforeWidth,
+    beforeIds,
+    afterIds,
+    beforeMeta,
+    afterMeta,
+  });
+  redoStack = [];
+
+  if (currentTool === "road" && selected === road) {
+    buildRoadHandlesFor(road);
+    syncRoadHandlesToRoad(road);
+    updateRoadHandleScale();
+  }
+
+  setStatus("Kiosk start placed Ã¢â‚¬â€ drag it to create the first segment");
+  updateRoadControls();
   return road;
 }
 
@@ -2196,7 +4671,7 @@ function beginRoadDraft(ptWorld) {
   roadDraft = { points: [pt], width, mesh: null };
   roadDraft.mesh = ensureRoadMeshFor(roadDraftRoot, roadDraft.points, roadDraft.width, { preview: true });
   updateRoadControls();
-  setStatus("Road: start point set — tap to add more points, then Finish Road");
+  setStatus("Road: start point set Ã¢â‚¬â€ tap to add more points, then Finish Road");
 }
 
 function snapDirToCardinal(dir) {
@@ -2294,7 +4769,7 @@ function finishRoadDraft() {
   });
 
   overlayRoot.add(group);
-  undoStack.push({ type: "add", obj: group, parent: overlayRoot });
+  pushUndo({ type: "add", obj: group, parent: overlayRoot });
   redoStack = [];
   clearRoadDraft();
   selectObject(group);
@@ -2355,11 +4830,11 @@ function spawnDefaultRoadSegment() {
   });
 
   overlayRoot.add(group);
-  undoStack.push({ type: "add", obj: group, parent: overlayRoot });
+  pushUndo({ type: "add", obj: group, parent: overlayRoot });
   redoStack = [];
 
   selectObject(group);
-  setStatus("Road spawned — drag a road point to draw a segment (Draw) or reposition it (Move)");
+  setStatus("Road spawned Ã¢â‚¬â€ drag a road point to draw a segment (Draw) or reposition it (Move)");
   updateRoadControls();
   return group;
 }
@@ -2373,39 +4848,154 @@ function clearRoadHandles() {
 function updateRoadHandleScale() {
   if (!roadEditRoot.visible) return;
   const d = camera.position.distanceTo(controls.target);
-  const s = Math.max(0.6, Math.min(4.0, d / 250)) * ROAD_HANDLE_BASE_SIZE;
+  const s = Math.max(0.35, Math.min(1.8, d / 600)) * ROAD_HANDLE_BASE_SIZE;
   for (const h of roadEditRoot.children) {
     if (!h?.userData?.isRoadHandle) continue;
     h.scale.setScalar(s);
   }
 }
 
+function getRoadById(id) {
+  if (!id) return null;
+  for (const obj of overlayRoot.children) {
+    if (isRoadObject(obj) && obj.userData?.id === id) return obj;
+  }
+  return null;
+}
+
+function roadsSharePointIds(a, b) {
+  if (!a || !b) return false;
+  ensureRoadPointMetaArrays(a);
+  ensureRoadPointMetaArrays(b);
+  const aIds = new Set(a.userData?.road?.pointIds || []);
+  const bIds = b.userData?.road?.pointIds || [];
+  for (const id of bIds) {
+    if (aIds.has(id)) return true;
+  }
+  return false;
+}
+
+function getConnectedRoads(startRoad) {
+  if (!startRoad || !isRoadObject(startRoad)) return [];
+  const roads = overlayRoot.children.filter(obj => isRoadObject(obj));
+  const connected = new Set([startRoad]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const r of roads) {
+      if (connected.has(r)) continue;
+      for (const c of connected) {
+        if (roadsSharePointIds(r, c)) {
+          connected.add(r);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return Array.from(connected);
+}
+
+function getConnectedRoadsForTransform() {
+  if (!selected || !isRoadObject(selected)) return [];
+  const roads = getConnectedRoads(selected).filter(r => canEditObject(r));
+  return roads.length > 1 ? roads : [];
+}
+
+function computeConnectedRoadsPivot(roads) {
+  const box = new THREE.Box3();
+  for (const r of roads) {
+    if (!r) continue;
+    box.expandByObject(r);
+  }
+  const center = new THREE.Vector3(0, 0, 0);
+  if (!box.isEmpty()) box.getCenter(center);
+  return center;
+}
+
+function applyConnectedTransformFromProxy() {
+  if (!connectedTransform || !roadGroupProxy) return;
+  const { roads, start, pivot, startProxy } = connectedTransform;
+  if (!roads || !roads.length) return;
+
+  const deltaPos = roadGroupProxy.position.clone().sub(startProxy.position);
+  const invStartQuat = startProxy.quaternion.clone().invert();
+  const deltaQuat = roadGroupProxy.quaternion.clone().multiply(invStartQuat);
+  const scaleRatio = new THREE.Vector3(
+    startProxy.scale.x ? (roadGroupProxy.scale.x / startProxy.scale.x) : 1,
+    startProxy.scale.y ? (roadGroupProxy.scale.y / startProxy.scale.y) : 1,
+    startProxy.scale.z ? (roadGroupProxy.scale.z / startProxy.scale.z) : 1
+  );
+
+  for (const r of roads) {
+    const s = start.get(r);
+    if (!s) continue;
+    const offset = s.position.clone().sub(pivot);
+    offset.multiply(scaleRatio);
+    offset.applyQuaternion(deltaQuat);
+    const newPos = pivot.clone().add(offset).add(deltaPos);
+    r.position.copy(newPos);
+    r.quaternion.copy(deltaQuat.clone().multiply(s.quaternion));
+    r.scale.set(
+      s.scale.x * scaleRatio.x,
+      s.scale.y * scaleRatio.y,
+      s.scale.z * scaleRatio.z
+    );
+    r.updateMatrixWorld(true);
+  }
+
+  // Keep handles in sync if visible
+  syncRoadHandlesToRoad(null);
+
+  return { deltaQuat };
+}
+
 function buildRoadHandlesFor(roadObj) {
   clearRoadHandles();
   roadEditRoot.visible = false;
   if (!roadObj || !isRoadObject(roadObj)) return;
-  if (!canEditObject(roadObj)) return;
-  const ptsLocal = getRoadLocalPoints(roadObj);
-  for (let i = 0; i < ptsLocal.length; i++) {
-    const handle = new THREE.Mesh(roadHandleGeometry, roadHandleMaterial);
-    handle.userData.isRoadHandle = true;
-    handle.userData.roadId = roadObj.userData.id;
-    handle.userData.pointIndex = i;
+  const roads = getConnectedRoads(roadObj);
+  if (!roads.length) return;
+  for (const r of roads) {
+    const ptsLocal = getRoadLocalPoints(r);
+    const metaArr = Array.isArray(r.userData?.road?.pointMeta) ? r.userData.road.pointMeta : [];
+    for (let i = 0; i < ptsLocal.length; i++) {
+      const meta = metaArr[i] || null;
+      const isKiosk = isKioskMeta(meta);
+      const handle = new THREE.Mesh(roadHandleGeometry, isKiosk ? roadKioskHandleMaterial : roadHandleMaterial);
+      handle.userData.isRoadHandle = true;
+      handle.userData.roadId = r.userData.id;
+      handle.userData.pointIndex = i;
 
-    const wp = roadObj.localToWorld(ptsLocal[i].clone());
-    handle.position.copy(wp);
-    handle.renderOrder = 9998;
-    roadEditRoot.add(handle);
+      const wp = r.localToWorld(ptsLocal[i].clone());
+      handle.position.copy(wp);
+      handle.renderOrder = 9998;
+      roadEditRoot.add(handle);
+    }
   }
   roadEditRoot.visible = true;
   updateRoadHandleScale();
 }
 
 function syncRoadHandlesToRoad(roadObj) {
-  if (!roadObj || !isRoadObject(roadObj) || !roadEditRoot.visible) return;
+  if (!roadEditRoot.visible) return;
+  if (!roadObj || !isRoadObject(roadObj)) {
+    for (const h of roadEditRoot.children) {
+      if (!h?.userData?.isRoadHandle) continue;
+      const r = getRoadById(h.userData.roadId);
+      if (!r) continue;
+      const ptsLocal = getRoadLocalPoints(r);
+      const idx = h.userData.pointIndex;
+      if (idx == null || !ptsLocal[idx]) continue;
+      const wp = r.localToWorld(ptsLocal[idx].clone());
+      h.position.copy(wp);
+    }
+    return;
+  }
   const ptsLocal = getRoadLocalPoints(roadObj);
   for (const h of roadEditRoot.children) {
     if (!h?.userData?.isRoadHandle) continue;
+    if (h.userData.roadId !== roadObj.userData?.id) continue;
     const idx = h.userData.pointIndex;
     if (idx == null || !ptsLocal[idx]) continue;
     const wp = roadObj.localToWorld(ptsLocal[idx].clone());
@@ -2423,7 +5013,7 @@ function pickRoadHandle(event) {
   if (!hit?.userData?.isRoadHandle) return null;
   const idx = hit.userData.pointIndex;
   if (idx == null) return null;
-  return { index: idx, handle: hit };
+  return { index: idx, roadId: hit.userData.roadId || null, handle: hit };
 }
 
 function setRoadPointIndexFromWorld(roadObj, index, ptWorld) {
@@ -2441,6 +5031,342 @@ function setRoadPointIndexFromWorld(roadObj, index, ptWorld) {
   rebuildRoadObject(roadObj);
   syncRoadHandlesToRoad(roadObj);
   return true;
+}
+
+function isRoadEndpointIndex(roadObj, index) {
+  if (!roadObj || !isRoadObject(roadObj)) return false;
+  const ptsLocal = getRoadLocalPoints(roadObj);
+  const lastIdx = ptsLocal.length - 1;
+  if (!Number.isInteger(index)) return false;
+  return index === 0 || index === lastIdx || ptsLocal.length === 1;
+}
+
+function maybeMergeRoadEndpoint(roadObj, index, opts = {}) {
+  if (!roadObj || !isRoadObject(roadObj)) return false;
+  if (!isRoadEndpointIndex(roadObj, index)) return false;
+
+  const allow = !!(roadAutoIntersectEnabled || opts.force || opts?.event?.shiftKey);
+  if (!allow) return false;
+
+  const threshold = Math.max(2, Number(ROAD_AUTO_INTERSECT_DIST) || 8);
+  roadObj.updateMatrixWorld(true);
+  ensureRoadPointMetaArrays(roadObj);
+
+  const ptsLocal = getRoadLocalPoints(roadObj);
+  const local = ptsLocal[index];
+  if (!local) return false;
+  const wpt = roadObj.localToWorld(local.clone());
+
+  let best = null;
+  for (const other of overlayRoot.children) {
+    if (!other || other === roadObj) continue;
+    if (!isRoadObject(other)) continue;
+
+    other.updateMatrixWorld(true);
+    ensureRoadPointMetaArrays(other);
+    const oPts = getRoadLocalPoints(other);
+    if (!oPts.length) continue;
+    const oIndices = [0, oPts.length - 1];
+
+    for (const oi of oIndices) {
+      const op = oPts[oi];
+      if (!op) continue;
+      const ow = other.localToWorld(op.clone());
+      const dx = ow.x - wpt.x;
+      const dz = ow.z - wpt.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist <= threshold && (!best || dist < best.dist)) {
+        const oid = Array.isArray(other.userData?.road?.pointIds) ? other.userData.road.pointIds[oi] : null;
+        best = { dist, world: ow, otherRoad: other, otherIndex: oi, otherId: oid };
+      }
+    }
+  }
+
+  if (!best) return false;
+
+  const snapped = best.world.clone();
+  snapped.y = sampleRoadBaseYAtXZ(snapped.x, snapped.z, wpt.y);
+  if (!setRoadPointIndexFromWorld(roadObj, index, snapped)) return false;
+
+  // Share pointId with the other road endpoint (makes intersection "unified").
+  if (best.otherId && Array.isArray(roadObj.userData?.road?.pointIds)) {
+    roadObj.userData.road.pointIds[index] = best.otherId;
+  }
+
+  buildRoadHandlesFor(roadObj);
+  syncRoadHandlesToRoad(roadObj);
+  setStatus("Road endpoints merged");
+  updateRoadControls();
+  return true;
+}
+
+function getRoadWorldPoints(roadObj) {
+  const ptsLocal = getRoadLocalPoints(roadObj);
+  return ptsLocal.map(p => roadObj.localToWorld(p.clone()));
+}
+
+function segmentIntersectXZ(a, b, c, d, eps = 1e-6) {
+  const ax = a.x, az = a.z;
+  const bx = b.x, bz = b.z;
+  const cx = c.x, cz = c.z;
+  const dx = d.x, dz = d.z;
+  const rX = bx - ax;
+  const rZ = bz - az;
+  const sX = dx - cx;
+  const sZ = dz - cz;
+  const rxs = rX * sZ - rZ * sX;
+  if (Math.abs(rxs) < eps) return null; // parallel/colinear
+
+  const qpx = cx - ax;
+  const qpz = cz - az;
+  const t = (qpx * sZ - qpz * sX) / rxs;
+  const u = (qpx * rZ - qpz * rX) / rxs;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+
+  return { x: ax + t * rX, z: az + t * rZ, t, u };
+}
+
+function pointSegmentDistanceXZ(p, a, b) {
+  const ax = a.x, az = a.z;
+  const bx = b.x, bz = b.z;
+  const px = p.x, pz = p.z;
+  const vx = bx - ax;
+  const vz = bz - az;
+  const wx = px - ax;
+  const wz = pz - az;
+  const lenSq = vx * vx + vz * vz;
+  let t = 0;
+  if (lenSq > 1e-8) t = (wx * vx + wz * vz) / lenSq;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const qx = ax + vx * t;
+  const qz = az + vz * t;
+  const dx = px - qx;
+  const dz = pz - qz;
+  return { dist: Math.hypot(dx, dz), t };
+}
+
+function findSegmentIndexForPointXZ(pointsW, p, tol) {
+  let best = null;
+  for (let i = 0; i < pointsW.length - 1; i++) {
+    const a = pointsW[i];
+    const b = pointsW[i + 1];
+    if (!a || !b) continue;
+    const res = pointSegmentDistanceXZ(p, a, b);
+    if (res.dist <= tol && (!best || res.dist < best.dist)) {
+      best = { index: i, dist: res.dist, t: res.t };
+    }
+  }
+  return best;
+}
+
+function findNearbyPointIndexWorld(pointsW, wpt, tol) {
+  const tolSq = tol * tol;
+  for (let i = 0; i < pointsW.length; i++) {
+    const p = pointsW[i];
+    if (!p) continue;
+    const dx = p.x - wpt.x;
+    const dz = p.z - wpt.z;
+    if ((dx * dx + dz * dz) <= tolSq) return i;
+  }
+  return -1;
+}
+
+function insertRoadPointAtSegment(roadObj, segIndex, worldPoint, meta = null, pointId = null) {
+  if (!roadObj || !isRoadObject(roadObj)) return false;
+  ensureRoadPointMetaArrays(roadObj);
+
+  const ptsLocal = getRoadLocalPoints(roadObj);
+  if (!ptsLocal[segIndex] || !ptsLocal[segIndex + 1]) return false;
+
+  const local = roadObj.worldToLocal(worldPoint.clone());
+  ptsLocal.splice(segIndex + 1, 0, local);
+  const newId = pointId || newRoadPointId();
+  roadObj.userData.road.pointIds.splice(segIndex + 1, 0, newId);
+  roadObj.userData.road.pointMeta.splice(segIndex + 1, 0, meta);
+
+  setRoadLocalPoints(roadObj, ptsLocal);
+  rebuildRoadObject(roadObj);
+  return true;
+}
+
+function applyAutoIntersectionsForSegment(roadObj, segStartIndex, segEndIndex, opts = {}) {
+  if (!roadObj || !isRoadObject(roadObj)) return { modifiedOthers: [] };
+  if (!roadAutoIntersectEnabled && !opts?.event?.shiftKey) return { modifiedOthers: [] };
+
+  ensureRoadPointMetaArrays(roadObj);
+  const ptsLocal = getRoadLocalPoints(roadObj);
+  if (!ptsLocal[segStartIndex] || !ptsLocal[segEndIndex]) return { modifiedOthers: [] };
+
+  roadObj.updateMatrixWorld(true);
+  const a = roadObj.localToWorld(ptsLocal[segStartIndex].clone());
+  const b = roadObj.localToWorld(ptsLocal[segEndIndex].clone());
+  const tol = Math.max(2, Number(ROAD_AUTO_INTERSECT_DIST) || 8) * 0.5;
+
+  const intersections = [];
+  for (const other of overlayRoot.children) {
+    if (!other) continue;
+    if (!isRoadObject(other)) continue;
+
+    other.updateMatrixWorld(true);
+    const oPtsW = getRoadWorldPoints(other);
+    for (let i = 0; i < oPtsW.length - 1; i++) {
+      if (other === roadObj) {
+        if (i === segStartIndex) continue;
+        if (i === segStartIndex - 1) continue;
+        if (i === segStartIndex + 1) continue;
+      }
+      const c = oPtsW[i];
+      const d = oPtsW[i + 1];
+      const hit = segmentIntersectXZ(a, b, c, d);
+      if (!hit) continue;
+
+      const wpt = new THREE.Vector3(hit.x, sampleRoadBaseYAtXZ(hit.x, hit.z, a.y), hit.z);
+      intersections.push({
+        t: hit.t,
+        u: hit.u,
+        point: wpt,
+        otherRoad: other,
+        otherSegIndex: i,
+      });
+    }
+  }
+
+  if (!intersections.length) return { modifiedOthers: [] };
+
+  // De-dupe intersections close to each other
+  const deduped = [];
+  for (const it of intersections) {
+    const exists = deduped.find(d => d.point.distanceTo(it.point) <= tol);
+    if (!exists) deduped.push(it);
+  }
+
+  // Assign shared pointId for each intersection (so roads are connected as one)
+  for (const it of deduped) {
+    try {
+      const curPtsW = getRoadWorldPoints(roadObj);
+      const curIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds : [];
+      const curIdx = findNearbyPointIndexWorld(curPtsW, it.point, tol);
+
+      ensureRoadPointMetaArrays(it.otherRoad);
+      const othPtsW = getRoadWorldPoints(it.otherRoad);
+      const othIds = Array.isArray(it.otherRoad.userData?.road?.pointIds) ? it.otherRoad.userData.road.pointIds : [];
+      const othIdx = findNearbyPointIndexWorld(othPtsW, it.point, tol);
+
+      let sharedId = null;
+      if (curIdx !== -1) sharedId = curIds[curIdx];
+      else if (othIdx !== -1) sharedId = othIds[othIdx];
+      else sharedId = newRoadPointId();
+
+      it.sharedId = sharedId;
+      it.curIdx = curIdx;
+      it.otherIdx = othIdx;
+    } catch (_) {
+      it.sharedId = newRoadPointId();
+      it.curIdx = -1;
+      it.otherIdx = -1;
+    }
+  }
+
+  // Insert into current road (descending t so order is preserved)
+  const currentInsert = deduped
+    .slice()
+    .sort((a, b) => b.t - a.t);
+
+  const currentPointsW = getRoadWorldPoints(roadObj);
+  for (const it of currentInsert) {
+    const nearIdx = findNearbyPointIndexWorld(currentPointsW, it.point, tol);
+    if (nearIdx !== -1) continue;
+    insertRoadPointAtSegment(roadObj, segStartIndex, it.point, null, it.sharedId);
+    // refresh world points after insertion
+    roadObj.updateMatrixWorld(true);
+    currentPointsW.length = 0;
+    currentPointsW.push(...getRoadWorldPoints(roadObj));
+  }
+
+  // Insert into other roads (group by road/segment; descending order prevents index shifts)
+  const modifiedOthers = new Map();
+  const byRoad = new Map();
+  for (const it of deduped) {
+    if (!byRoad.has(it.otherRoad)) byRoad.set(it.otherRoad, []);
+    byRoad.get(it.otherRoad).push(it);
+  }
+
+  for (const [other, list] of byRoad.entries()) {
+    if (other === roadObj) {
+      other.updateMatrixWorld(true);
+      let oPtsW = getRoadWorldPoints(other);
+      const grouped = list.slice().sort((a, b) => {
+        if (a.otherSegIndex !== b.otherSegIndex) return b.otherSegIndex - a.otherSegIndex;
+        return b.u - a.u;
+      });
+
+      for (const it of grouped) {
+        const nearIdx = findNearbyPointIndexWorld(oPtsW, it.point, tol);
+        if (nearIdx !== -1) {
+          const ids = other.userData?.road?.pointIds || [];
+          if (ids[nearIdx] && it.sharedId && ids[nearIdx] !== it.sharedId) {
+            ids[nearIdx] = it.sharedId;
+          }
+          continue;
+        }
+
+        const seg = findSegmentIndexForPointXZ(oPtsW, it.point, tol);
+        if (!seg) continue;
+        insertRoadPointAtSegment(other, seg.index, it.point, null, it.sharedId);
+        other.updateMatrixWorld(true);
+        oPtsW = getRoadWorldPoints(other);
+      }
+      continue;
+    }
+
+    const beforePoints = clonePointsArray(other.userData?.road?.points || []);
+    const beforeWidth = Number(other.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+    const beforeIds = Array.isArray(other.userData?.road?.pointIds) ? other.userData.road.pointIds.slice() : [];
+    const beforeMeta = cloneRoadPointMeta(other.userData?.road?.pointMeta || []);
+
+    const grouped = list.slice().sort((a, b) => {
+      if (a.otherSegIndex !== b.otherSegIndex) return b.otherSegIndex - a.otherSegIndex;
+      return b.u - a.u;
+    });
+
+    other.updateMatrixWorld(true);
+    let oPtsW = getRoadWorldPoints(other);
+    for (const it of grouped) {
+      const nearIdx = findNearbyPointIndexWorld(oPtsW, it.point, tol);
+      if (nearIdx !== -1) {
+        const ids = other.userData?.road?.pointIds || [];
+        if (ids[nearIdx] && it.sharedId && ids[nearIdx] !== it.sharedId) {
+          ids[nearIdx] = it.sharedId;
+        }
+        continue;
+      }
+      insertRoadPointAtSegment(other, it.otherSegIndex, it.point, null, it.sharedId);
+      other.updateMatrixWorld(true);
+      oPtsW = getRoadWorldPoints(other);
+    }
+
+    const afterPoints = clonePointsArray(other.userData?.road?.points || []);
+    const afterWidth = Number(other.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+    const afterIds = Array.isArray(other.userData?.road?.pointIds) ? other.userData.road.pointIds.slice() : [];
+    const afterMeta = cloneRoadPointMeta(other.userData?.road?.pointMeta || []);
+
+    const changed = JSON.stringify(beforePoints) !== JSON.stringify(afterPoints);
+    if (changed) {
+      modifiedOthers.set(other, {
+        beforePoints,
+        afterPoints,
+        beforeWidth,
+        afterWidth,
+        beforeIds,
+        afterIds,
+        beforeMeta,
+        afterMeta
+      });
+    }
+  }
+
+  return { modifiedOthers: Array.from(modifiedOthers.entries()) };
 }
 
 function beginRoadSegmentDrag(roadObj, startIndex, pointerId, clientX, clientY) {
@@ -2472,7 +5398,7 @@ function beginRoadSegmentDrag(roadObj, startIndex, pointerId, clientX, clientY) 
 
   controls.enabled = false;
   try { renderer.domElement.setPointerCapture(pointerId); } catch (_) {}
-  setStatus("Road: drag to place next point…");
+  setStatus("Road: drag to place next pointÃ¢â‚¬Â¦");
   return true;
 }
 
@@ -2551,23 +5477,50 @@ function endRoadSegmentDrag(pointerId = null, event = null) {
   const lastIdx = ptsLocal.length - 1;
 
   // Endpoint extension edits the same road; interior-point drag branches into a new road.
-  const isEndpoint = (startIndex === 0 || startIndex === lastIdx || ptsLocal.length === 1);
+  ensureRoadPointMetaArrays(roadObj);
+  const startMeta = Array.isArray(roadObj.userData?.road?.pointMeta) ? roadObj.userData.road.pointMeta[startIndex] : null;
+  const startPid = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds[startIndex] : null;
+  const isKioskStart = isKioskMeta(startMeta);
+  const isEndpoint = !isKioskStart && (startIndex === 0 || startIndex === lastIdx || ptsLocal.length === 1);
   if (!isEndpoint) {
     const width = Number(roadObj.userData?.road?.width || roadWidthEl?.value || ROAD_DEFAULT_WIDTH);
-    const branch = createRoadFromWorldPoints([startWorld, endWorld], width, { recordHistory: true, autoSelect: true });
+    const branch = createRoadFromWorldPoints([startWorld, endWorld], width, { recordHistory: false, autoSelect: true });
     if (branch) {
-      ensureRoadPointMetaArrays(roadObj);
+      const batchCmds = [{ type: "add", obj: branch, parent: overlayRoot }];
       ensureRoadPointMetaArrays(branch);
+      if (startPid && Array.isArray(branch.userData?.road?.pointIds)) {
+        branch.userData.road.pointIds[0] = startPid;
+      }
       // Copy start-point meta if present, and set end-point meta if snapped to a building.
-      const startMeta = Array.isArray(roadObj.userData?.road?.pointMeta) ? roadObj.userData.road.pointMeta[startIndex] : null;
       if (Array.isArray(branch.userData?.road?.pointMeta)) {
-        branch.userData.road.pointMeta[0] = startMeta ? { ...startMeta, building: (startMeta.building ? { ...startMeta.building } : null) } : null;
+        if (startMeta) {
+          const cloned = isKioskMeta(startMeta)
+            ? normalizeKioskMeta(startMeta, startPid)
+            : { ...startMeta, building: (startMeta.building ? { ...startMeta.building } : null) };
+          if (startPid && cloned && typeof cloned === "object") cloned.id = startPid;
+          branch.userData.road.pointMeta[0] = cloned;
+        } else {
+          branch.userData.road.pointMeta[0] = null;
+        }
       }
       if (endSnap?.buildingName && endSnap?.side && Array.isArray(branch.userData?.road?.pointIds) && Array.isArray(branch.userData?.road?.pointMeta)) {
         const pid = branch.userData.road.pointIds[1];
         branch.userData.road.pointMeta[1] = makeBuildingLinkMeta(endSnap.buildingName, endSnap.side, pid);
       }
-      selectRoadPoint(branch, 1, { mode: "set", showStatus: false });
+      // Auto-intersect on newly created branch segment
+      const res = applyAutoIntersectionsForSegment(branch, 0, 1, { event });
+      if (Array.isArray(res.modifiedOthers)) {
+        for (const [other, st] of res.modifiedOthers) {
+          batchCmds.push({ type: "road_edit", obj: other, beforePoints: st.beforePoints, afterPoints: st.afterPoints, beforeWidth: st.beforeWidth, afterWidth: st.afterWidth, beforeIds: st.beforeIds, afterIds: st.afterIds, beforeMeta: st.beforeMeta, afterMeta: st.afterMeta });
+        }
+      }
+      pushUndoBatch(batchCmds);
+      redoStack = [];
+      buildRoadHandlesFor(branch);
+      syncRoadHandlesToRoad(branch);
+      const branchPts = getRoadLocalPoints(branch);
+      const branchIdx = Math.max(0, branchPts.length - 1);
+      selectRoadPoint(branch, branchIdx, { mode: "set", showStatus: false });
       setStatus("Road branch created (undo available)");
     }
     updateRoadControls();
@@ -2606,17 +5559,33 @@ function endRoadSegmentDrag(pointerId = null, event = null) {
   buildRoadHandlesFor(roadObj);
   syncRoadHandlesToRoad(roadObj);
 
-  const afterPoints = clonePointsArray(roadObj.userData?.road?.points || []);
-  const afterIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
-  const afterMeta = cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []);
-  undoStack.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth: beforeWidth, beforeIds, afterIds, beforeMeta, afterMeta });
-  redoStack = [];
-
   // Auto-select the new endpoint so the user can keep drawing.
   const wasSinglePoint = Array.isArray(beforePoints) && beforePoints.length === 1;
   const extendedAtStart = !wasSinglePoint && startIndex === 0;
   const newIdx = extendedAtStart ? 0 : (ptsLocal.length - 1);
-  selectRoadPoint(roadObj, newIdx, { mode: "set", showStatus: false });
+
+  const res = applyAutoIntersectionsForSegment(roadObj, extendedAtStart ? 0 : (ptsLocal.length - 2), extendedAtStart ? 1 : (ptsLocal.length - 1), { event });
+  const batchCmds = [];
+  if (Array.isArray(res.modifiedOthers)) {
+    for (const [other, st] of res.modifiedOthers) {
+      batchCmds.push({ type: "road_edit", obj: other, beforePoints: st.beforePoints, afterPoints: st.afterPoints, beforeWidth: st.beforeWidth, afterWidth: st.afterWidth, beforeIds: st.beforeIds, afterIds: st.afterIds, beforeMeta: st.beforeMeta, afterMeta: st.afterMeta });
+    }
+  }
+
+  const ptsAfter = getRoadLocalPoints(roadObj);
+  const mergedIdx = extendedAtStart ? 0 : (ptsAfter.length - 1);
+  maybeMergeRoadEndpoint(roadObj, mergedIdx, { event });
+  buildRoadHandlesFor(roadObj);
+  syncRoadHandlesToRoad(roadObj);
+  const afterPoints = clonePointsArray(roadObj.userData?.road?.points || []);
+  const afterIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
+  const afterMeta = cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []);
+  batchCmds.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth: beforeWidth, beforeIds, afterIds, beforeMeta, afterMeta });
+  pushUndoBatch(batchCmds);
+  redoStack = [];
+
+  const finalIdx = extendedAtStart ? 0 : (getRoadLocalPoints(roadObj).length - 1);
+  selectRoadPoint(roadObj, finalIdx, { mode: "set", showStatus: false });
   setStatus("Road segment added (undo available)");
   updateRoadControls();
 }
@@ -2639,7 +5608,7 @@ function beginRoadHandleDrag(roadObj, index, pointerId) {
   };
   controls.enabled = false;
   try { renderer.domElement.setPointerCapture(pointerId); } catch (_) {}
-  setStatus("Road point: dragging…");
+  setStatus("Road point: draggingÃ¢â‚¬Â¦");
   return true;
 }
 
@@ -2653,21 +5622,74 @@ function endRoadHandleDrag(pointerId = null) {
   const beforeWidth = roadHandleDrag.beforeWidth;
   const beforeIds = roadHandleDrag.beforeIds || [];
   const beforeMeta = roadHandleDrag.beforeMeta || [];
-  const afterPoints = clonePointsArray(roadObj?.userData?.road?.points || []);
-  const afterWidth = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
-  const afterIds = Array.isArray(roadObj?.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
-  const afterMeta = cloneRoadPointMeta(roadObj?.userData?.road?.pointMeta || []);
 
   isDraggingRoadHandle = false;
   roadHandleDrag = null;
   controls.enabled = true;
 
-  const changed = JSON.stringify(beforePoints) !== JSON.stringify(afterPoints) || Math.abs(beforeWidth - afterWidth) > 1e-6;
+  if (roadObj && isRoadEndpointIndex(roadObj, handleIndex)) {
+    maybeMergeRoadEndpoint(roadObj, handleIndex, { event: lastPointerEvent });
+  }
+
+  const movedPointId = roadObj?.userData?.road?.pointIds?.[handleIndex] ?? null;
+
+  const afterPointsPre = clonePointsArray(roadObj?.userData?.road?.points || []);
+  const afterWidthPre = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+  const movedChanged = JSON.stringify(beforePoints) !== JSON.stringify(afterPointsPre) || Math.abs(beforeWidth - afterWidthPre) > 1e-6;
+
+  // Auto-intersect adjacent segments when a point is moved (if enabled).
+  const otherChanges = new Map();
+  if (movedChanged && roadObj) {
+    const ptsLocalNow = getRoadLocalPoints(roadObj);
+    const segs = [];
+    if (handleIndex > 0) segs.push({ start: handleIndex - 1, end: handleIndex });
+    if (handleIndex < ptsLocalNow.length - 1) segs.push({ start: handleIndex, end: handleIndex + 1 });
+    segs.sort((a, b) => b.start - a.start);
+
+    for (const seg of segs) {
+      const res = applyAutoIntersectionsForSegment(roadObj, seg.start, seg.end, { event: lastPointerEvent });
+      if (!Array.isArray(res.modifiedOthers)) continue;
+      for (const [other, st] of res.modifiedOthers) {
+        if (!otherChanges.has(other)) {
+          otherChanges.set(other, st);
+        } else {
+          const prev = otherChanges.get(other);
+          prev.afterPoints = st.afterPoints;
+          prev.afterWidth = st.afterWidth;
+          prev.afterIds = st.afterIds;
+          prev.afterMeta = st.afterMeta;
+        }
+      }
+    }
+  }
+
+  const batchCmds = [];
+  if (otherChanges.size) {
+    for (const [other, st] of otherChanges) {
+      batchCmds.push({ type: "road_edit", obj: other, beforePoints: st.beforePoints, afterPoints: st.afterPoints, beforeWidth: st.beforeWidth, afterWidth: st.afterWidth, beforeIds: st.beforeIds, afterIds: st.afterIds, beforeMeta: st.beforeMeta, afterMeta: st.afterMeta });
+    }
+  }
+
+  const afterPoints = clonePointsArray(roadObj?.userData?.road?.points || []);
+  const afterWidth = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+  const afterIds = Array.isArray(roadObj?.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
+  const afterMeta = cloneRoadPointMeta(roadObj?.userData?.road?.pointMeta || []);
+
+  const changed = movedChanged;
   if (changed && roadObj) {
-    undoStack.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth, beforeIds, afterIds, beforeMeta, afterMeta });
+    batchCmds.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth, beforeIds, afterIds, beforeMeta, afterMeta });
+    pushUndoBatch(batchCmds);
     redoStack = [];
-    selectRoadPoint(roadObj, handleIndex, { mode: "set", showStatus: false });
-    setStatus("Road edited ✓ (undo available)");
+
+    const handleIndexAfter = (movedPointId && Array.isArray(roadObj.userData?.road?.pointIds))
+      ? roadObj.userData.road.pointIds.indexOf(movedPointId)
+      : handleIndex;
+    const finalIndex = (handleIndexAfter != null && handleIndexAfter >= 0) ? handleIndexAfter : handleIndex;
+
+    buildRoadHandlesFor(roadObj);
+    syncRoadHandlesToRoad(roadObj);
+    selectRoadPoint(roadObj, finalIndex, { mode: "set", showStatus: false });
+    setStatus("Road edited Ã¢Å“â€œ (undo available)");
   } else {
     // Treat a simple tap as point selection (and endpoint selection for extension).
     selectRoadPoint(roadObj, handleIndex, { mode: "toggle", showStatus: true });
@@ -2764,9 +5786,9 @@ function extendRoadAtPoint(roadObj, ptWorld) {
   const afterPoints = clonePointsArray(roadObj.userData?.road?.points || []);
   const afterIds = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
   const afterMeta = cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []);
-  undoStack.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth: beforeWidth, beforeIds, afterIds, beforeMeta, afterMeta });
+  pushUndo({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth: beforeWidth, beforeIds, afterIds, beforeMeta, afterMeta });
   redoStack = [];
-  setStatus("Road extended ✓ (undo available)");
+  setStatus("Road extended Ã¢Å“â€œ (undo available)");
   updateRoadControls();
   return true;
 }
@@ -2813,6 +5835,13 @@ const rotateProxy = new THREE.Object3D();
 rotateProxy.name = "rotateProxy";
 scene.add(rotateProxy);
 
+// -------------------- CONNECTED ROAD TRANSFORM PROXY --------------------
+const roadGroupProxy = new THREE.Object3D();
+roadGroupProxy.name = "roadGroupProxy";
+scene.add(roadGroupProxy);
+
+let connectedTransform = null; // { roads: [], start: Map, pivot: Vector3, startProxy: {position, quaternion, scale} }
+
 function getWorldBBoxCenter(obj, out = new THREE.Vector3()) {
   const box = new THREE.Box3().setFromObject(obj);
   box.getCenter(out);
@@ -2853,7 +5882,7 @@ window.addEventListener("pointermove", (e) => {
 // -------------------- Transform Controls (FIXED) --------------------
 const transform = new TransformControls(camera, renderer.domElement);
 
-// ✅ FIX: Add the helper (Object3D) to the scene, NOT transform itself
+// Ã¢Å“â€¦ FIX: Add the helper (Object3D) to the scene, NOT transform itself
 const transformHelper = transform.getHelper();
 transformHelper.visible = false;
 scene.add(transformHelper);
@@ -2888,9 +5917,9 @@ forceGizmoAlwaysVisible();
 function updateGizmoSize() {
   if (!transform || !transform.object) return;
   const d = camera.position.distanceTo(controls.target);
-  let size = Math.max(0.75, Math.min(6, d / 150));
+  let size = Math.max(0.7, Math.min(4.5, d / 220));
   if (currentTool === "rotate" && transform.object === rotateProxy) {
-    size = Math.max(1.5, Math.min(4.5, d / 220));
+    size = Math.max(1.2, Math.min(3.2, d / 300));
   }
   transform.setSize(size);
 }
@@ -2912,7 +5941,6 @@ transform.addEventListener("dragging-changed", (e) => {
 
   if (!e.value) {
     isGizmoPointerDown = false;
-    clearAlignGuides();
     hideAngleReadout();
 
     if (currentTool === "rotate" && selected) {
@@ -2924,6 +5952,22 @@ transform.addEventListener("dragging-changed", (e) => {
 // -------------------- Undo/Redo --------------------
 let undoStack = [];
 let redoStack = [];
+
+function pushUndo(cmd) {
+  undoStack.push(cmd);
+  scheduleDirtyRefresh();
+}
+
+function pushUndoBatch(commands) {
+  const list = Array.isArray(commands) ? commands.filter(Boolean) : [];
+  if (!list.length) return;
+  if (list.length === 1) {
+    pushUndo(list[0]);
+    return;
+  }
+  undoStack.push({ type: "batch", commands: list });
+  scheduleDirtyRefresh();
+}
 
 function cloneTRS(obj) {
   return {
@@ -2959,6 +6003,7 @@ function insertObject(parent, obj) {
 let activeBefore = null;
 
 function historyTargetObject() {
+  if (transform.object === roadGroupProxy) return roadGroupProxy;
   if (currentTool === "rotate" && selected) return selected;
   return transform.object;
 }
@@ -2967,8 +6012,47 @@ transform.addEventListener("mouseDown", () => {
   const targetObj = historyTargetObject();
   if (!targetObj) return;
 
-  activeBefore = cloneTRS(targetObj);
   isGizmoPointerDown = true;
+
+  if (targetObj === roadGroupProxy) {
+    const roads = getConnectedRoadsForTransform();
+    if (roads.length) {
+      const pivot = computeConnectedRoadsPivot(roads);
+      roadGroupProxy.position.copy(pivot);
+      roadGroupProxy.quaternion.identity();
+      roadGroupProxy.scale.set(1, 1, 1);
+      roadGroupProxy.updateMatrixWorld(true);
+
+      const start = new Map();
+      for (const r of roads) {
+        start.set(r, {
+          position: r.position.clone(),
+          rotation: r.rotation.clone(),
+          quaternion: r.quaternion.clone(),
+          scale: r.scale.clone()
+        });
+      }
+      connectedTransform = {
+        roads,
+        start,
+        pivot,
+        startProxy: {
+          position: roadGroupProxy.position.clone(),
+          quaternion: roadGroupProxy.quaternion.clone(),
+          scale: roadGroupProxy.scale.clone()
+        }
+      };
+    }
+    activeBefore = null;
+    gizmoLastSafePos = null;
+    if (currentTool === "rotate") {
+      rotateAxis = transform.axis || null;
+      showAngleReadout("0.0Ã‚Â°");
+    }
+    return;
+  }
+
+  activeBefore = cloneTRS(targetObj);
 
   if (currentTool === "move") gizmoLastSafePos = targetObj.position.clone();
   else gizmoLastSafePos = null;
@@ -2979,23 +6063,36 @@ transform.addEventListener("mouseDown", () => {
     rotateStartSelQuat.copy(selected.quaternion);
     rotateStartSelPos.copy(selected.position);
     rotateCenterWorld.copy(getWorldBBoxCenter(selected));
-    showAngleReadout("0.0°");
+    showAngleReadout("0.0Ã‚Â°");
   }
 });
 
 transform.addEventListener("objectChange", () => {
+  if (connectedTransform && transform.object === roadGroupProxy) {
+    const info = applyConnectedTransformFromProxy();
+    if (currentTool === "rotate" && info?.deltaQuat) {
+      const eul = new THREE.Euler().setFromQuaternion(info.deltaQuat, "XYZ");
+      let deg = 0;
+      if (rotateAxis === "X") deg = THREE.MathUtils.radToDeg(eul.x);
+      else if (rotateAxis === "Y") deg = THREE.MathUtils.radToDeg(eul.y);
+      else if (rotateAxis === "Z") deg = THREE.MathUtils.radToDeg(eul.z);
+      else {
+        const ang = 2 * Math.acos(Math.max(-1, Math.min(1, info.deltaQuat.w)));
+        deg = THREE.MathUtils.radToDeg(ang);
+      }
+      showAngleReadout(`${deg.toFixed(1)}Ã‚Â°`);
+    }
+    return;
+  }
+
   if (currentTool === "move") {
     const obj = transform.object;
     if (!obj) return;
     if (!gizmoLastSafePos) gizmoLastSafePos = obj.position.clone();
 
-    if (autoAlignEnabled) applyAutoAlign(obj);
-    else clearAlignGuides();
-
     if (isColliding(obj)) {
       obj.position.copy(gizmoLastSafePos);
       obj.updateMatrixWorld();
-      clearAlignGuides();
     } else {
       gizmoLastSafePos.copy(obj.position);
     }
@@ -3025,11 +6122,33 @@ transform.addEventListener("objectChange", () => {
       const ang = 2 * Math.acos(Math.max(-1, Math.min(1, delta.w)));
       deg = THREE.MathUtils.radToDeg(ang);
     }
-    showAngleReadout(`${deg.toFixed(1)}°`);
+    showAngleReadout(`${deg.toFixed(1)}Ã‚Â°`);
   }
 });
 
 transform.addEventListener("mouseUp", () => {
+  if (connectedTransform && transform.object === roadGroupProxy) {
+    const items = [];
+    for (const r of connectedTransform.roads) {
+      const s = connectedTransform.start.get(r);
+      if (!s) continue;
+      items.push({
+        obj: r,
+        before: { position: s.position.clone(), rotation: s.rotation.clone(), scale: s.scale.clone() },
+        after: cloneTRS(r)
+      });
+    }
+    if (items.length) {
+      pushUndo({ type: "transform_group", items });
+      redoStack = [];
+      setStatus("Changed (undo available)");
+    }
+    connectedTransform = null;
+    isGizmoPointerDown = false;
+    hideAngleReadout();
+    return;
+  }
+
   const targetObj = historyTargetObject();
   if (!targetObj || !activeBefore) return;
 
@@ -3038,11 +6157,10 @@ transform.addEventListener("mouseUp", () => {
   activeBefore = null;
   gizmoLastSafePos = null;
 
-  undoStack.push({ type: "transform", obj: targetObj, before, after });
+  pushUndo({ type: "transform", obj: targetObj, before, after });
   redoStack = [];
   setStatus("Changed (undo available)");
   isGizmoPointerDown = false;
-  clearAlignGuides();
 
   if (currentTool === "rotate" && selected) updateRotateProxyAtSelection();
 });
@@ -3051,25 +6169,123 @@ function doUndo() {
   const cmd = undoStack.pop();
   if (!cmd) return;
 
-  if (cmd.type === "transform") applyTRS(cmd.obj, cmd.before);
-  else if (cmd.type === "road_edit") applyRoadEdit(cmd.obj, cmd.beforePoints, cmd.beforeWidth, cmd.beforeIds, cmd.beforeMeta);
-  else if (cmd.type === "add") removeObject(cmd.obj);
-  else if (cmd.type === "remove") insertObject(cmd.parent, cmd.obj);
+  const applyOneUndo = (c) => {
+    if (!c) return;
+    if (c.type === "transform") applyTRS(c.obj, c.before);
+    else if (c.type === "transform_group") {
+      for (const it of (c.items || [])) {
+        applyTRS(it.obj, it.before);
+      }
+    }
+    else if (c.type === "road_edit") applyRoadEdit(c.obj, c.beforePoints, c.beforeWidth, c.beforeIds, c.beforeMeta);
+    else if (c.type === "add") removeObject(c.obj);
+    else if (c.type === "remove") insertObject(c.parent, c.obj);
+    else if (c.type === "batch") {
+      const list = Array.isArray(c.commands) ? c.commands : [];
+      for (let i = list.length - 1; i >= 0; i--) applyOneUndo(list[i]);
+    }
+  };
+  applyOneUndo(cmd);
 
   redoStack.push(cmd);
-  setStatus("Undo ✓");
+  scheduleDirtyRefresh();
+  if (commandTouchesBaseSceneGraph(cmd)) {
+    refreshBaseModelDerivedData();
+  }
+  if (currentTool === "road" && selected && isRoadObject(selected)) {
+    buildRoadHandlesFor(selected);
+    syncRoadHandlesToRoad(selected);
+    updateRoadHandleScale();
+  }
+  setStatus("Undo");
 }
 function doRedo() {
   const cmd = redoStack.pop();
   if (!cmd) return;
 
-  if (cmd.type === "transform") applyTRS(cmd.obj, cmd.after);
-  else if (cmd.type === "road_edit") applyRoadEdit(cmd.obj, cmd.afterPoints, cmd.afterWidth, cmd.afterIds, cmd.afterMeta);
-  else if (cmd.type === "add") insertObject(cmd.parent, cmd.obj);
-  else if (cmd.type === "remove") removeObject(cmd.obj);
+  const applyOneRedo = (c) => {
+    if (!c) return;
+    if (c.type === "transform") applyTRS(c.obj, c.after);
+    else if (c.type === "transform_group") {
+      for (const it of (c.items || [])) {
+        applyTRS(it.obj, it.after);
+      }
+    }
+    else if (c.type === "road_edit") applyRoadEdit(c.obj, c.afterPoints, c.afterWidth, c.afterIds, c.afterMeta);
+    else if (c.type === "add") insertObject(c.parent, c.obj);
+    else if (c.type === "remove") removeObject(c.obj);
+    else if (c.type === "batch") {
+      for (const sub of (c.commands || [])) applyOneRedo(sub);
+    }
+  };
+  applyOneRedo(cmd);
 
   undoStack.push(cmd);
-  setStatus("Redo ✓");
+  scheduleDirtyRefresh();
+  if (commandTouchesBaseSceneGraph(cmd)) {
+    refreshBaseModelDerivedData();
+  }
+  if (currentTool === "road" && selected && isRoadObject(selected)) {
+    buildRoadHandlesFor(selected);
+    syncRoadHandlesToRoad(selected);
+    updateRoadHandleScale();
+  }
+  setStatus("Redo");
+}
+
+function canDeleteObject(obj) {
+  if (!obj) return { ok: false, message: "Select an object first", isBaseObject: false };
+  if (obj.userData?.locked) return { ok: false, message: "Locked - press Unlock to delete", isBaseObject: false };
+  if (obj.userData?.isPlaced) return { ok: true, message: "", isBaseObject: false };
+  if (ALLOW_EDIT_BASE_MODEL === true) return { ok: true, message: "", isBaseObject: true };
+  return { ok: false, message: "Delete only removes placed overlay objects", isBaseObject: false };
+}
+
+function refreshBaseModelDerivedData() {
+  if (!campusRoot) return;
+  rebuildBaseColliders();
+  refreshBuildingList();
+  rebuildRoadSnapBuildingCache();
+  rebuildRoadGroundTargets();
+}
+
+function commandTouchesBaseSceneGraph(cmd) {
+  if (!cmd || typeof cmd !== "object") return false;
+  if (cmd.type === "batch") {
+    return Array.isArray(cmd.commands) && cmd.commands.some((sub) => commandTouchesBaseSceneGraph(sub));
+  }
+  if (cmd.type === "add" || cmd.type === "remove") {
+    return !!cmd.obj && !cmd.obj.userData?.isPlaced;
+  }
+  return false;
+}
+
+function performDelete(obj) {
+  const rule = canDeleteObject(obj);
+  if (!rule.ok) return setStatus(rule.message);
+
+  const parent = obj.parent;
+
+  clearSelected(obj);
+  transform.detach();
+  transformHelper.visible = false;
+  selected = null;
+  hideAngleReadout();
+  updateCommitButtons();
+  clearRoadHandles();
+  roadEditRoot.visible = false;
+  updateRoadControls();
+
+  pushUndo({ type: "remove", obj, parent });
+  redoStack = [];
+
+  parent?.remove?.(obj);
+  if (rule.isBaseObject) {
+    refreshBaseModelDerivedData();
+    setStatus("Base object deleted (undo available). Export GLB to persist.");
+  } else {
+    setStatus("Deleted (undo available)");
+  }
 }
 
 function applyRoadEdit(obj, points, width, pointIds = null, pointMeta = null) {
@@ -3081,9 +6297,10 @@ function applyRoadEdit(obj, points, width, pointIds = null, pointMeta = null) {
   if (Array.isArray(pointMeta)) obj.userData.road.pointMeta = cloneRoadPointMeta(pointMeta);
   ensureRoadPointMetaArrays(obj);
   rebuildRoadObject(obj);
-  if (selected === obj && currentTool === "road") {
-    buildRoadHandlesFor(obj);
-    syncRoadHandlesToRoad(obj);
+  if (currentTool === "road" && selected && isRoadObject(selected)) {
+    buildRoadHandlesFor(selected);
+    syncRoadHandlesToRoad(selected);
+    updateRoadHandleScale();
   }
   updateRoadControls();
 }
@@ -3125,6 +6342,14 @@ function getMaterialsArray(material) {
   if (!material) return [];
   return Array.isArray(material) ? material : [material];
 }
+function disposeReplacedMaterials(currentMaterial, originalMaterial) {
+  const originals = new Set(getMaterialsArray(originalMaterial));
+  const current = getMaterialsArray(currentMaterial);
+  current.forEach((m) => {
+    if (!m || originals.has(m) || !m.dispose) return;
+    m.dispose();
+  });
+}
 function applyTint(mesh, type) {
   const mats = getMaterialsArray(mesh.material);
   const isHover = type === "hover";
@@ -3141,8 +6366,25 @@ function applyTint(mesh, type) {
 function restoreOriginal(map, mesh) {
   const saved = map.get(mesh.uuid);
   if (!saved) return;
+  const current = mesh.material;
   mesh.material = saved.material;
+  disposeReplacedMaterials(current, saved.material);
   map.delete(mesh.uuid);
+}
+function releaseHighlightStateForObject(obj) {
+  if (!obj) return;
+  obj.traverse((n) => {
+    if (!n.isMesh) return;
+    restoreOriginal(hoverOriginal, n);
+    restoreOriginal(selectOriginal, n);
+    selectTransparencyBackup.delete(n.uuid);
+  });
+}
+function removeAndDisposeObject(obj) {
+  if (!obj) return;
+  releaseHighlightStateForObject(obj);
+  if (obj.parent) obj.parent.remove(obj);
+  disposeObject3D(obj);
 }
 function isMeshInsideObject(mesh, obj) {
   if (!mesh || !obj) return false;
@@ -3285,14 +6527,31 @@ function isColliding(obj) {
 // -------------------- Building list helpers --------------------
 function isGenericNodeName(name) {
   if (!name) return true;
-  const n = String(name).toLowerCase();
-  return n === "scene" ||
-    n === "auxscene" ||
-    n === "root" ||
-    n === "rootnode" ||
-    n === "gltf" ||
-    n === "model" ||
-    n === "group";
+  const raw = String(name).trim().toLowerCase();
+  if (!raw) return true;
+  if (
+    raw === "scene" ||
+    raw === "auxscene" ||
+    raw === "root" ||
+    raw === "rootnode" ||
+    raw === "gltf" ||
+    raw === "model" ||
+    raw === "group"
+  ) {
+    return true;
+  }
+
+  // Treat suffixed wrapper variants like Scene.001 / AuxScene_1 as generic too.
+  const deSuffixed = raw.replace(/([._-]\d+)+$/g, "");
+  return (
+    deSuffixed === "scene" ||
+    deSuffixed === "auxscene" ||
+    deSuffixed === "root" ||
+    deSuffixed === "rootnode" ||
+    deSuffixed === "gltf" ||
+    deSuffixed === "model" ||
+    deSuffixed === "group"
+  );
 }
 
 function isRenderableObject(obj) {
@@ -3322,19 +6581,13 @@ function refreshBuildingList() {
 
   const byName = new Map();
   campusRoot.traverse((obj) => {
-    if (!obj || !obj.name || isGenericNodeName(obj.name)) return;
+    if (!obj) return;
     if (obj.userData?.isPlaced) return;
-
-    const existing = byName.get(obj.name);
-    if (!existing) {
-      byName.set(obj.name, obj);
-      return;
-    }
-
-    // Prefer named empty/group over meshes
-    if (isEmptyGroup(obj) && !isEmptyGroup(existing)) {
-      byName.set(obj.name, obj);
-    }
+    if (isGroundLikeName(obj.name)) return;
+    const root = getTopLevelNamedAncestor(obj);
+    if (!root || !root.name) return;
+    if (byName.has(root.name)) return;
+    byName.set(root.name, root);
   });
 
   const filter = (buildingFilterEl?.value || "").trim().toLowerCase();
@@ -3360,10 +6613,6 @@ function refreshBuildingList() {
     btn.style.cursor = "pointer";
 
     btn.addEventListener("click", () => {
-      if (currentTool === "road" && selected && isRoadObject(selected) && canEditObject(selected)) {
-        setRoadConnectTarget(obj);
-        return;
-      }
       selectObject(obj);
     });
 
@@ -3374,6 +6623,7 @@ function refreshBuildingList() {
 buildingFilterEl?.addEventListener("input", () => {
   refreshBuildingList();
 });
+setupBuildingFilterKeyboard();
 
 // -------------------- Picking (overlay + base) --------------------
 function pickObject(event) {
@@ -3392,7 +6642,7 @@ function pickObject(event) {
     return false;
   };
 
-  // 1) Overlay objects first (roads/assets) — ignore ground meshes.
+  // 1) Overlay objects first (roads/assets) Ã¢â‚¬â€ ignore ground meshes.
   for (const h of hits) {
     let obj = h.object;
     if (isGroundHit(obj)) continue;
@@ -3408,18 +6658,31 @@ function pickObject(event) {
   for (const h of hits) {
     let obj = h.object;
     if (isGroundHit(obj)) continue;
+    const namedRoot = getTopLevelNamedAncestor(obj);
+    if (namedRoot && namedRoot !== campusRoot) return namedRoot;
     while (obj) {
-      if (obj.parent === campusRoot) return obj;
+      if (obj.parent === campusRoot) {
+        // Never promote generic wrapper nodes (Scene/AuxScene/etc.) as selectable objects.
+        if (!isGenericNodeName(obj.name) && !isGroundLikeName(obj.name)) return obj;
+        break;
+      }
       obj = obj.parent;
     }
   }
 
-  // 3) Ground fallback only if no overlay hit.
+  // 3) Ground fallback: keep ground selectable, but never escalate to wrapper/root nodes.
+  // Return the concrete ground hit object so only the ground surface is highlighted.
   for (const h of hits) {
     let obj = h.object;
     if (!isGroundHit(obj)) continue;
-    while (obj && obj.parent !== campusRoot) obj = obj.parent;
-    return obj || h.object;
+    if (obj && (obj.isMesh || obj.isLine || obj.isPoints)) return obj;
+
+    // If the hit is not directly renderable, pick the nearest ground-like ancestor.
+    let p = obj;
+    while (p && p !== campusRoot) {
+      if (isGroundLikeName(p.name) && !isGenericNodeName(p.name)) return p;
+      p = p.parent;
+    }
   }
 
   return null;
@@ -3466,6 +6729,33 @@ function syncTransformToSelection() {
 
   transformHelper.visible = true;
 
+  const connected = getConnectedRoadsForTransform();
+  if (connected.length) {
+    const pivot = computeConnectedRoadsPivot(connected);
+    roadGroupProxy.position.copy(pivot);
+    roadGroupProxy.quaternion.identity();
+    roadGroupProxy.scale.set(1, 1, 1);
+    roadGroupProxy.updateMatrixWorld(true);
+
+    transform.detach();
+    transform.attach(roadGroupProxy);
+
+    if (currentTool === "move") {
+      transform.setMode("translate");
+    }
+    if (currentTool === "scale") {
+      transform.setMode("scale");
+    }
+    if (currentTool === "rotate") {
+      transform.setMode("rotate");
+      transform.setSpace("local");
+    }
+
+    updateGizmoSize();
+    forceGizmoAlwaysVisible();
+    return;
+  }
+
   if (currentTool === "move") {
     transform.detach();
     transform.attach(selected);
@@ -3495,7 +6785,6 @@ function syncTransformToSelection() {
 
    // Clear road point/extend selection when changing selection
    clearRoadPointSelection();
-   roadPickBuildingMode = false;
    hideRoadHoverPreview();
 
    selected = obj || null;
@@ -3505,6 +6794,8 @@ function syncTransformToSelection() {
      transformHelper.visible = false;
      hideAngleReadout();
      updateBuildingSelected(null);
+     clearRouteLine();
+     setRouteBanner("");
      clearRoadHandles();
      roadEditRoot.visible = false;
      setStatus("No selection");
@@ -3528,19 +6819,25 @@ function syncTransformToSelection() {
    if (isRoad) rebuildRoadObject(selected);
    
    if (isLocked) {
-      if (isRoad) setStatus("Selected road (committed/locked) — press Uncommit to edit");
+      if (isRoad) setStatus("Selected road (locked) Ã¢â‚¬â€ press Unlock to edit");
       else setStatus(isPlaced
-        ? "Selected overlay (committed/locked) — press Uncommit to edit"
-       : "Selected base object (committed/locked) — press Uncommit to edit");
+        ? "Selected overlay (locked) Ã¢â‚¬â€ press Unlock to edit"
+       : "Selected base object (locked) Ã¢â‚¬â€ press Unlock to edit");
     } else if (canEditObject(selected)) {
       if (isRoad && currentTool === "road") {
-       setStatus("Selected road (editable) — drag a road point to draw a segment (Draw) or reposition it (Move)");
+       setStatus("Selected road (editable) Ã¢â‚¬â€ drag a road point to draw a segment (Draw) or reposition it (Move)");
       } else if (isTransformToolActive()) {
-        setStatus(isRoad ? "Selected road (editable)" : (isPlaced ? "Selected overlay (editable)" : "Selected base object (editable)"));
+        setStatus(isRoad
+          ? "Selected road (editable)"
+          : (isPlaced
+            ? "Selected overlay (editable)"
+            : withBaseEditExportHint("Selected base object (editable)", selected)));
       } else {
        setStatus(isRoad
          ? "Selected road (press Road tool to edit points)"
-         : (isPlaced ? "Selected overlay (click Move/Rotate/Scale to edit)" : "Selected base object (click Move/Rotate/Scale to edit)"));
+          : (isPlaced
+            ? "Selected overlay (click Move/Rotate/Scale to edit)"
+            : withBaseEditExportHint("Selected base object (click Move/Rotate/Scale to edit)", selected)));
      }
    } else {
      setStatus(isRoad ? "Selected road (view only)" : (isPlaced ? "Selected overlay (view only)" : "Selected base object (view only)"));
@@ -3548,6 +6845,14 @@ function syncTransformToSelection() {
 
    updateBuildingSelected(selected);
    updateCommitButtons();
+
+   if (!selected.userData?.isPlaced && !isGroundLikeName(selected.name) && !isGroundObjectOrChild(selected)) {
+     const routeRoot = getBuildingRootFromObject(selected);
+     const routeName = routeRoot?.name && routeRoot.name !== "overlayRoot" ? routeRoot.name : null;
+     if (routeName) {
+       routeToBuilding(routeName);
+     }
+   }
 
    if (currentTool === "road" && isRoadObject(selected)) buildRoadHandlesFor(selected);
    else {
@@ -3560,32 +6865,56 @@ function syncTransformToSelection() {
 
 function commitSelected() {
   if (!selected) return setStatus("Select an object first");
-  if (selected.userData?.locked) return setStatus("Already committed (locked)");
+  if (selected.userData?.locked) return setStatus("Already locked");
  
-  selected.userData.locked = true;
+ selected.userData.locked = true;
  
-   // Prevent Undo/Redo from modifying a committed object
-   undoStack = undoStack.filter(cmd => cmd?.obj !== selected);
-   redoStack = redoStack.filter(cmd => cmd?.obj !== selected);
+  // Prevent Undo/Redo from modifying a locked object
+  undoStack = undoStack.filter(cmd => {
+    if (cmd?.obj === selected) return false;
+    if (cmd?.type === "transform_group" && Array.isArray(cmd.items)) {
+      return !cmd.items.some(it => it?.obj === selected);
+    }
+    return true;
+  });
+  redoStack = redoStack.filter(cmd => {
+    if (cmd?.obj === selected) return false;
+    if (cmd?.type === "transform_group" && Array.isArray(cmd.items)) {
+      return !cmd.items.some(it => it?.obj === selected);
+    }
+    return true;
+  });
  
   syncTransformToSelection();
   updateCommitButtons();
   if (currentTool === "road" && isRoadObject(selected)) buildRoadHandlesFor(selected);
   updateRoadControls();
-  setStatus("Committed (locked)");
+  persistLockStateChangeFor(selected);
+  scheduleDirtyRefresh();
+  setStatus("Locked");
 }
- 
+
+function persistLockStateChangeFor(obj) {
+  if (!obj?.userData?.isPlaced) return;
+  if (currentModelName !== ORIGINAL_MODEL_NAME) return;
+  saveOverlay({ silent: true }).catch((err) => {
+    console.warn("LOCK SAVE ERROR", err);
+  });
+}
+
  function uncommitSelected() {
    if (!selected) return setStatus("Select an object first");
-   if (!selected.userData?.locked) return setStatus("Not committed");
+   if (!selected.userData?.locked) return setStatus("Already unlocked");
  
    selected.userData.locked = false;
    syncTransformToSelection();
    updateCommitButtons();
    if (currentTool === "road" && isRoadObject(selected)) buildRoadHandlesFor(selected);
    updateRoadControls();
-   setStatus("Uncommitted (unlocked)");
- }
+   persistLockStateChangeFor(selected);
+   scheduleDirtyRefresh();
+   setStatus("Unlocked");
+  }
  
  btnCommit?.addEventListener("click", commitSelected);
  btnEdit?.addEventListener("click", uncommitSelected);
@@ -3595,8 +6924,8 @@ toolMove?.addEventListener("click", () => {
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
   hideRoadHoverPreview();
+  roadKioskPlaceMode = false;
   currentTool = "move";
   transform.setMode("translate");
   setActiveToolButton(toolMove);
@@ -3605,22 +6934,19 @@ toolMove?.addEventListener("click", () => {
   if (!selected) return setStatus("Move tool active (select an object)");
   if (!canEditObject(selected)) {
     return setStatus(selected.userData?.locked
-      ? "Move tool active (selection is committed/locked — press Uncommit)"
+      ? "Move tool active (selection is locked Ã¢â‚¬â€ press Unlock)"
       : "Move tool active (selection is view only)");
   }
-  setStatus("Move tool active");
+  setStatus(withBaseEditExportHint("Move tool active", selected));
 });
 
 toolRotate?.addEventListener("click", () => {
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
   hideRoadHoverPreview();
+  roadKioskPlaceMode = false;
   currentTool = "rotate";
-  autoAlignEnabled = false;
-  updateAutoAlignButton();
-  clearAlignGuides();
 
   transform.setMode("rotate");
   transform.setSpace("local");
@@ -3631,22 +6957,19 @@ toolRotate?.addEventListener("click", () => {
   if (!selected) return setStatus("Rotate tool active (select an object)");
   if (!canEditObject(selected)) {
     return setStatus(selected.userData?.locked
-      ? "Rotate tool active (selection is committed/locked — press Uncommit)"
+      ? "Rotate tool active (selection is locked Ã¢â‚¬â€ press Unlock)"
       : "Rotate tool active (selection is view only)");
   }
-  setStatus("Rotate tool active");
+  setStatus(withBaseEditExportHint("Rotate tool active", selected));
 });
 
 toolScale?.addEventListener("click", () => {
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
   hideRoadHoverPreview();
+  roadKioskPlaceMode = false;
   currentTool = "scale";
-  autoAlignEnabled = false;
-  updateAutoAlignButton();
-  clearAlignGuides();
 
   transform.setMode("scale");
   setActiveToolButton(toolScale);
@@ -3655,17 +6978,13 @@ toolScale?.addEventListener("click", () => {
   if (!selected) return setStatus("Scale tool active (select an object)");
   if (!canEditObject(selected)) {
     return setStatus(selected.userData?.locked
-      ? "Scale tool active (selection is committed/locked — press Uncommit)"
+      ? "Scale tool active (selection is locked Ã¢â‚¬â€ press Unlock)"
       : "Scale tool active (selection is view only)");
   }
-  setStatus("Scale tool active");
+  setStatus(withBaseEditExportHint("Scale tool active", selected));
 });
 
 toolRoad?.addEventListener("click", () => {
-  autoAlignEnabled = false;
-  updateAutoAlignButton();
-  clearAlignGuides();
-
   currentTool = "road";
   setActiveToolButton(toolRoad);
   syncTransformToSelection();
@@ -3688,17 +7007,17 @@ toolRoad?.addEventListener("click", () => {
       buildRoadHandlesFor(selected);
       syncRoadHandlesToRoad(selected);
       setStatus(roadDragMode === "draw"
-        ? "Road tool active — drag a road point to draw a segment (Snap On=90°, Off=5°)"
-        : "Road tool active — drag a road point to move it (switch Drag mode to Draw to create segments)");
+        ? "Road tool active Ã¢â‚¬â€ drag a road point to draw a segment (Snap On=90Ã‚Â°, Off=5Ã‚Â°)"
+        : "Road tool active Ã¢â‚¬â€ drag a road point to move it (switch Drag mode to Draw to create segments)");
     } else {
       clearRoadHandles();
       roadEditRoot.visible = false;
-      setStatus("Road tool active — selected road is locked (press Uncommit to edit)");
+      setStatus("Road tool active Ã¢â‚¬â€ selected road is locked (press Unlock to edit)");
     }
   } else {
     clearRoadHandles();
     roadEditRoot.visible = false;
-    setStatus("Road tool active — tap the map to place a road point");
+    setStatus("Road tool active Ã¢â‚¬â€ tap the map to place a road point");
   }
 });
 
@@ -3717,8 +7036,8 @@ roadNewBtn?.addEventListener("click", () => {
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
   hideRoadHoverPreview();
+  roadKioskPlaceMode = false;
   if (pendingAssetPath) {
     pendingAssetPath = null;
     clearPreview();
@@ -3729,14 +7048,21 @@ roadNewBtn?.addEventListener("click", () => {
 roadSnapBtn?.addEventListener("click", () => {
   roadSnapEnabled = !roadSnapEnabled;
   updateRoadControls();
-  setStatus(roadSnapEnabled ? "Snap: On (90° cardinal)" : `Snap: Off (${ROAD_SNAP_FINE_DEG}° increments)`);
+  setStatus(roadSnapEnabled ? "Snap: On (90Ã‚Â° cardinal)" : `Snap: Off (${ROAD_SNAP_FINE_DEG}Ã‚Â° increments)`);
 });
 roadBuildingSnapBtn?.addEventListener("click", () => {
   roadBuildingSnapEnabled = !roadBuildingSnapEnabled;
   updateRoadControls();
   setStatus(roadBuildingSnapEnabled
-    ? "Attach enabled — drag a road point to snap to a building"
-    : "Attach disabled — free layout mode");
+    ? "Attach enabled Ã¢â‚¬â€ drag a road point to snap to a building"
+    : "Attach disabled Ã¢â‚¬â€ free layout mode");
+});
+roadAutoIntersectBtn?.addEventListener("click", () => {
+  roadAutoIntersectEnabled = !roadAutoIntersectEnabled;
+  updateRoadControls();
+  setStatus(roadAutoIntersectEnabled
+    ? "Auto-Intersect enabled - endpoints can merge"
+    : "Auto-Intersect disabled");
 });
 roadDragModeBtn?.addEventListener("click", () => {
   roadDragMode = (roadDragMode === "draw") ? "move" : "draw";
@@ -3746,29 +7072,16 @@ roadDragModeBtn?.addEventListener("click", () => {
     : "Road drag mode: Move (drag a point to reposition)");
 });
 
-roadPickBuildingBtn?.addEventListener("click", () => {
-  if (!(selected && isRoadObject(selected))) return setStatus("Select a road first");
-  if (!canEditObject(selected)) return setStatus("Road locked — press Uncommit");
-  roadPickBuildingMode = !roadPickBuildingMode;
-  hideRoadHoverPreview();
+roadKioskBtn?.addEventListener("click", () => {
+  if (currentTool !== "road") {
+    toolRoad?.click();
+  }
+  roadKioskPlaceMode = !roadKioskPlaceMode;
   updateRoadControls();
-  setStatus(roadPickBuildingMode ? "Pick Building: tap a building (or click in list)" : "Pick Building canceled");
+  setStatus(roadKioskPlaceMode
+    ? "Kiosk Start: click the map to place the start point"
+    : "Kiosk Start canceled");
 });
-roadClearBuildingBtn?.addEventListener("click", () => {
-  setRoadConnectTarget(null);
-});
-
-function connectSelectedRoadPointTo(side) {
-  if (!(selected && isRoadObject(selected))) return setStatus("Select a road first");
-  if (!canEditObject(selected)) return setStatus("Road locked — press Uncommit");
-  if (!roadConnectTarget) return setStatus("Pick a building target first");
-  if (!Number.isInteger(roadSelectedPointIndex)) return setStatus("Tap a road point first");
-  connectRoadPointToBuilding(selected, roadSelectedPointIndex, roadConnectTarget, side);
-}
-roadConnectFrontBtn?.addEventListener("click", () => connectSelectedRoadPointTo("front"));
-roadConnectBackBtn?.addEventListener("click", () => connectSelectedRoadPointTo("back"));
-roadConnectLeftBtn?.addEventListener("click", () => connectSelectedRoadPointTo("left"));
-roadConnectRightBtn?.addEventListener("click", () => connectSelectedRoadPointTo("right"));
 
 roadWidthEl?.addEventListener("input", () => {
   setRoadWidthReadout(roadWidthEl.value);
@@ -3793,7 +7106,7 @@ roadWidthEl?.addEventListener("change", () => {
       const afterPoints = clonePointsArray(selected.userData?.road?.points || []);
       const afterIds = Array.isArray(selected.userData?.road?.pointIds) ? selected.userData.road.pointIds.slice() : [];
       const afterMeta = cloneRoadPointMeta(selected.userData?.road?.pointMeta || []);
-      undoStack.push({
+      pushUndo({
         type: "road_edit",
         obj: selected,
         beforePoints,
@@ -3812,54 +7125,14 @@ roadWidthEl?.addEventListener("change", () => {
   updateRoadControls();
 });
 
-toolAlign?.addEventListener("click", () => {
-  clearRoadDraft();
-  clearRoadHandles();
-  roadEditRoot.visible = false;
-  roadPickBuildingMode = false;
-  hideRoadHoverPreview();
-  autoAlignEnabled = !autoAlignEnabled;
-  updateAutoAlignButton();
-
-  if (autoAlignEnabled) {
-    if (currentTool !== "move") {
-      currentTool = "move";
-      transform.setMode("translate");
-      setActiveToolButton(toolMove);
-      syncTransformToSelection();
-    }
-    updateToolIndicator();
-    setStatus("Auto Align enabled (Move)");
-  } else {
-    clearAlignGuides();
-    updateToolIndicator();
-    setStatus("Auto Align disabled");
-  }
-});
-
 toolDelete?.addEventListener("click", () => {
-  if (!selected) return setStatus("Select an object first");
-  if (!selected.userData?.isPlaced) return setStatus("Delete only removes placed overlay objects");
-  if (selected.userData.locked) return setStatus("Locked — press Uncommit to delete");
+  const rule = canDeleteObject(selected);
+  if (!rule.ok) return setStatus(rule.message);
 
-  const obj = selected;
-  const parent = obj.parent;
-
-  clearSelected(obj);
-  transform.detach();
-  transformHelper.visible = false;
-  selected = null;
-  hideAngleReadout();
-  updateCommitButtons();
-  clearRoadHandles();
-  roadEditRoot.visible = false;
-  updateRoadControls();
-
-  undoStack.push({ type: "remove", obj, parent });
-  redoStack = [];
-
-  parent.remove(obj);
-  setStatus("Deleted (undo available)");
+  const opened = showDeleteConfirm(selected);
+  if (!opened) {
+    performDelete(selected);
+  }
 });
 
 // -------------------- Asset palette --------------------
@@ -3972,7 +7245,7 @@ function updatePreviewPosition(event) {
 }
 
 async function loadAssetList() {
-  const res = await fetch("mapEditor.php?action=list_assets");
+  const res = await apiFetch("mapEditor.php?action=list_assets");
   const data = await res.json();
   if (!data.ok) throw new Error("Failed to list assets");
 
@@ -3992,7 +7265,7 @@ async function loadAssetList() {
     btn.addEventListener("click", () => {
       pendingAssetPath = a.path;
       buildPreviewFor(pendingAssetPath);
-      setStatus(`Selected asset: ${a.label} — click on ground to place`);
+      setStatus(`Selected asset: ${a.label} Ã¢â‚¬â€ click on ground to place`);
     });
 
     assetListEl.appendChild(btn);
@@ -4042,7 +7315,7 @@ async function spawnAssetAt(assetPath, point, opts = {}) {
         overlayRoot.add(root);
 
         if (recordHistory) {
-          undoStack.push({ type: "add", obj: root, parent: overlayRoot });
+          pushUndo({ type: "add", obj: root, parent: overlayRoot });
           redoStack = [];
         }
 
@@ -4109,6 +7382,7 @@ let isDraggingObject = false;
 let dragOffset = new THREE.Vector3();
 let dragBeforeTRS = null;
 let dragLastSafePos = new THREE.Vector3();
+let dragConnected = null; // { roads: THREE.Object3D[], before: Map<road, TRS> }
 
 renderer.domElement.addEventListener("pointerdown", async (e) => {
   if (e.button !== 0) return;
@@ -4133,16 +7407,25 @@ renderer.domElement.addEventListener("pointerdown", async (e) => {
     if (activeTouchPointerIds.size >= 2) return;
 
     const h = pickRoadHandle(e);
-    if (h && selected && isRoadObject(selected)) {
-      if (roadDragMode === "move") {
-        if (beginRoadHandleDrag(selected, h.index, e.pointerId)) {
+    if (h) {
+      const roadObj = getRoadById(h.roadId) || selected;
+      if (roadObj && isRoadObject(roadObj)) {
+        if (selected !== roadObj) selectObject(roadObj);
+        if (!canEditObject(roadObj)) {
+          setStatus("Road locked Ã¢â‚¬â€ press Unlock");
           e.preventDefault();
           return;
         }
-      } else {
-        if (beginRoadSegmentDrag(selected, h.index, e.pointerId, e.clientX, e.clientY)) {
-          e.preventDefault();
-          return;
+        if (roadDragMode === "move") {
+          if (beginRoadHandleDrag(roadObj, h.index, e.pointerId)) {
+            e.preventDefault();
+            return;
+          }
+        } else {
+          if (beginRoadSegmentDrag(roadObj, h.index, e.pointerId, e.clientX, e.clientY)) {
+            e.preventDefault();
+            return;
+          }
         }
       }
     }
@@ -4165,10 +7448,21 @@ renderer.domElement.addEventListener("pointerdown", async (e) => {
       isDraggingObject = true;
 
       dragBeforeTRS = cloneTRS(selected);
+      dragConnected = null;
+      if (selected && isRoadObject(selected)) {
+        const connected = getConnectedRoadsForTransform();
+        if (connected.length) {
+          const before = new Map();
+          for (const r of connected) {
+            before.set(r, cloneTRS(r));
+          }
+          dragConnected = { roads: connected, before };
+        }
+      }
       dragOffset.copy(selected.position).sub(pt);
       dragLastSafePos.copy(selected.position);
 
-      setStatus("Dragging… release to drop");
+      setStatus("DraggingÃ¢â‚¬Â¦ release to drop");
       e.preventDefault();
       return;
     }
@@ -4207,8 +7501,10 @@ renderer.domElement.addEventListener("pointermove", (e) => {
     let z = pt.z;
     let snap = null;
     if (roadBuildingSnapEnabled) {
+      const roadData = roadObj?.userData?.road;
+      const exceptPid = Array.isArray(roadData?.pointIds) ? roadData.pointIds[pointIndex] : null;
       const liveSources = buildLiveRoadSnapSources();
-      snap = snapRoadEndToBuildingSide(anchorW, x, z, width, liveSources);
+      snap = snapRoadEndToBuildingSide(anchorW, x, z, width, { ...liveSources, exceptPointId: exceptPid });
       if (snap) {
         x = snap.x;
         z = snap.z;
@@ -4224,12 +7520,19 @@ renderer.domElement.addEventListener("pointermove", (e) => {
       try {
         const roadData = roadObj?.userData?.road;
         if (roadData && Array.isArray(roadData.pointIds) && Array.isArray(roadData.pointMeta)) {
+          const pid = roadData.pointIds[pointIndex];
+          const existing = roadData.pointMeta[pointIndex];
+          const keepKiosk = isKioskMeta(existing);
           if (snap?.buildingName && snap?.side) {
-            const pid = roadData.pointIds[pointIndex];
-            roadData.pointMeta[pointIndex] = makeBuildingLinkMeta(snap.buildingName, snap.side, pid);
+            roadData.pointMeta[pointIndex] = keepKiosk
+              ? normalizeKioskMeta(existing, pid)
+              : makeBuildingLinkMeta(snap.buildingName, snap.side, pid);
           } else {
-            const meta = roadData.pointMeta[pointIndex];
-            if (meta && typeof meta === "object" && meta.building) roadData.pointMeta[pointIndex] = null;
+            if (keepKiosk) {
+              roadData.pointMeta[pointIndex] = normalizeKioskMeta(existing, pid);
+            } else if (existing && typeof existing === "object" && existing.building) {
+              roadData.pointMeta[pointIndex] = null;
+            }
           }
         }
       } catch (_) {}
@@ -4242,16 +7545,25 @@ renderer.domElement.addEventListener("pointermove", (e) => {
   const pt = getGroundPointFromEvent(e);
   if (!pt) return;
 
+  if (dragConnected && dragConnected.roads && dragConnected.roads.length) {
+    const baseBefore = dragConnected.before.get(selected) || dragBeforeTRS;
+    const newPos = pt.clone().add(dragOffset);
+    const delta = newPos.clone().sub(baseBefore.position);
+    for (const r of dragConnected.roads) {
+      const before = dragConnected.before.get(r);
+      if (!before) continue;
+      r.position.copy(before.position.clone().add(delta));
+      r.updateMatrixWorld();
+    }
+    return;
+  }
+
   selected.position.copy(pt.add(dragOffset));
   selected.updateMatrixWorld();
-
-  if (autoAlignEnabled) applyAutoAlign(selected);
-  else clearAlignGuides();
 
   if (isColliding(selected)) {
     selected.position.copy(dragLastSafePos);
     selected.updateMatrixWorld();
-    clearAlignGuides();
   } else {
     dragLastSafePos.copy(selected.position);
   }
@@ -4277,19 +7589,17 @@ window.addEventListener("pointerup", (e) => {
 
     if (!tap.hadMultiTouch) {
       if (!isEventOnStage(e)) return;
-      const picked = roadPickBuildingMode ? pickObject(e) : pickRoadObject(e);
-
-      // Pick-building mode (for connecting road points to a building)
-      if (roadPickBuildingMode) {
-        if (picked && isConnectableBuilding(picked)) {
-          setRoadConnectTarget(picked);
-        } else {
-          setStatus("Pick Building: tap a building object");
-        }
+      if (roadKioskPlaceMode) {
+        const pt = getRoadSurfacePointFromEvent(e);
+        if (pt) placeKioskStartAt(pt);
+        roadKioskPlaceMode = false;
+        updateRoadControls();
         hideRoadHoverPreview();
         e.preventDefault();
         return;
       }
+
+      const picked = pickRoadObject(e);
 
       if (picked && isRoadObject(picked)) {
         selectObject(picked);
@@ -4307,17 +7617,33 @@ window.addEventListener("pointerup", (e) => {
   isDraggingObject = false;
   controls.enabled = true;
 
+  if (dragConnected && dragConnected.roads && dragConnected.roads.length) {
+    const items = [];
+    for (const r of dragConnected.roads) {
+      const before = dragConnected.before.get(r);
+      if (!before) continue;
+      items.push({ obj: r, before, after: cloneTRS(r) });
+    }
+    if (items.length) {
+      pushUndo({ type: "transform_group", items });
+      redoStack = [];
+    }
+    dragConnected = null;
+    dragBeforeTRS = null;
+    setStatus("Dropped Ã¢Å“â€œ (undo available)");
+    return;
+  }
+
   const after = cloneTRS(selected);
   const before = dragBeforeTRS;
   dragBeforeTRS = null;
 
   if (before) {
-    undoStack.push({ type: "transform", obj: selected, before, after });
+    pushUndo({ type: "transform", obj: selected, before, after });
     redoStack = [];
   }
 
-  clearAlignGuides();
-  setStatus("Dropped ✓ (undo available)");
+  setStatus("Dropped Ã¢Å“â€œ (undo available)");
 });
 
 window.addEventListener("pointercancel", (e) => {
@@ -4365,23 +7691,65 @@ function serializeOverlay() {
     });
   });
 
-  return { version: 2, items };
+  return { version: 2, items, routes: savedRoutes };
 }
 
-async function saveOverlay() {
+function serializeRoadnet() {
+  const roads = [];
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    ensureRoadPointMetaArrays(obj);
+    const road = obj.userData?.road || {};
+    roads.push({
+      type: "road",
+      id: obj.userData?.id || null,
+      name: obj.userData?.nameLabel || "road",
+      position: [obj.position.x, obj.position.y, obj.position.z],
+      rotation: [obj.rotation.x, obj.rotation.y, obj.rotation.z],
+      scale: [obj.scale.x, obj.scale.y, obj.scale.z],
+      locked: !!obj.userData?.locked,
+      width: Number(road.width || ROAD_DEFAULT_WIDTH),
+      points: Array.isArray(road.points) ? clonePointsArray(road.points) : [],
+      pointIds: Array.isArray(road.pointIds) ? road.pointIds.slice() : [],
+      pointMeta: Array.isArray(road.pointMeta) ? cloneRoadPointMeta(road.pointMeta) : []
+    });
+  }
+  return roads;
+}
+
+async function saveOverlay(opts = {}) {
+  const { silent = false } = opts;
+  if (!isOverlaySaveAllowed()) {
+    throw new Error("Save Overlay is only available for the original map.");
+  }
+  const routes = computeSavedRoutes();
+  const roads = serializeRoadnet();
+  setSavedRoutes(routes);
   const payload = serializeOverlay();
-  const res = await fetch("mapEditor.php?action=save_overlay", {
+  const res = await apiFetch("mapEditor.php?action=save_overlay", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "Save failed");
-  setStatus("Saved overlay ✓");
+  await saveRoadDataForModel(currentModelName, { roads, routes });
+  captureDirtyBaselines({ overlay: true, base: false });
+  if (silent) return;
+  setStatus("Saved overlay + roads");
 }
 
 toolSave?.addEventListener("click", () => {
-  saveOverlay().catch(err => showError("SAVE ERROR", err));
+  if (isOverlaySaveAllowed()) {
+    saveOverlay().catch(err => showError("SAVE ERROR", err));
+    return;
+  }
+  saveRoadDataForModel(currentModelName)
+    .then(() => {
+      captureDirtyBaselines({ overlay: true, base: false });
+      setStatus(`Saved roads (${currentModelName})`);
+    })
+    .catch(err => showError("SAVE ROAD ERROR", err));
 });
 
 function buildExportDefaultName() {
@@ -4405,7 +7773,7 @@ function exportSceneAsGlb() {
   campusRoot.updateMatrixWorld(true);
   overlayRoot.updateMatrixWorld(true);
 
-  setStatus("Exporting GLB…");
+  setStatus("Exporting GLBÃ¢â‚¬Â¦");
 
   return new Promise((resolve, reject) => {
     const exportNodes = [
@@ -4416,13 +7784,18 @@ function exportSceneAsGlb() {
       exportNodes,
       async (glb) => {
         try {
-          const res = await fetch(`mapEditor.php?action=export_glb&name=${encodeURIComponent(fileName)}`, {
+          const res = await apiFetch(`mapEditor.php?action=export_glb&name=${encodeURIComponent(fileName)}&sourceModel=${encodeURIComponent(currentModelName || "")}`, {
             method: "POST",
             headers: { "Content-Type": "model/gltf-binary" },
             body: glb
           });
           const data = await res.json();
           if (!data.ok) throw new Error(data.error || "Export failed");
+          await syncModelEntitiesToDatabase(data.file, campusRoot);
+          const roads = serializeRoadnet();
+          const routes = computeSavedRoutes();
+          await saveRoadDataForModel(data.file, { roads, routes });
+          captureDirtyBaselines({ overlay: false, base: true });
           setStatus(`Exported: ${data.file}`);
           if (baseModelSelect) {
             await loadModelList();
@@ -4443,8 +7816,154 @@ toolExport?.addEventListener("click", () => {
   exportSceneAsGlb().catch(err => showError("EXPORT ERROR", err));
 });
 
+async function publishCurrentMap() {
+  if (!currentModelName) throw new Error("No current model selected");
+
+  const state = getUnsavedChangeState();
+  if (state.base) {
+    const ok = confirm("You have unsaved base-model edits. Publish uses saved model files only.\n\nUse Export GLB first to include base edits.\n\nContinue publishing anyway?");
+    if (!ok) return false;
+  }
+  if (state.overlay) {
+    if (isOverlaySaveAllowed()) {
+      const saveNow = confirm("You have unsaved overlay edits. Save Overlay before publish?");
+      if (saveNow) await saveOverlay({ silent: true });
+    } else {
+      const saveNow = confirm("You have unsaved road edits on this model.\n\nSave roads before publish?");
+      if (saveNow) {
+        await saveRoadDataForModel(currentModelName);
+        captureDirtyBaselines({ overlay: true, base: false });
+      } else {
+        const ok = confirm("Continue publishing without saving road edits?");
+        if (!ok) return false;
+      }
+    }
+  }
+
+  if (hasLiveRoadData()) {
+    const roads = serializeRoadnet();
+    const routes = computeSavedRoutes();
+    await saveRoadDataForModel(currentModelName, { roads, routes });
+  }
+
+   await syncModelEntitiesToDatabase(currentModelName, state.base ? null : campusRoot);
+
+  const res = await apiFetch("mapEditor.php?action=publish_map", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file: currentModelName })
+  });
+  const data = await res.json();
+  if (!data?.ok) throw new Error(data?.error || "Publish failed");
+
+  await loadModelList().catch(() => {});
+  if (baseModelSelect) baseModelSelect.value = currentModelName;
+  setStatus(`Published live: ${data?.published?.modelFile || currentModelName}`);
+  return true;
+}
+
+toolPublish?.addEventListener("click", () => {
+  publishCurrentMap().catch(err => showError("PUBLISH ERROR", err));
+});
+
+function clearRoadObjectsFromOverlay() {
+  if (!overlayRoot) return;
+  clearRoadHandles();
+  roadEditRoot.visible = false;
+  hideRoadHoverPreview();
+  let clearedSelectedRoad = false;
+  let clearedHoveredRoad = false;
+
+  for (let i = overlayRoot.children.length - 1; i >= 0; i--) {
+    const obj = overlayRoot.children[i];
+    if (!isRoadObject(obj)) continue;
+    if (selected === obj) {
+      clearSelected(selected);
+      selected = null;
+      clearedSelectedRoad = true;
+    }
+    if (hovered === obj) {
+      clearHover(hovered);
+      hovered = null;
+      clearedHoveredRoad = true;
+    }
+    removeAndDisposeObject(obj);
+  }
+
+  if (clearedSelectedRoad || clearedHoveredRoad) {
+    transform.detach();
+    transformHelper.visible = false;
+    hideAngleReadout();
+    updateBuildingSelected(null);
+    updateCommitButtons();
+  }
+}
+
+function spawnSerializedRoadObject(it) {
+  if (!(it && (it.type === "road" || Array.isArray(it.points)))) return null;
+
+  const group = new THREE.Group();
+  group.name = "road";
+
+  const width = Number(it.width || ROAD_DEFAULT_WIDTH);
+  const pointsArr = Array.isArray(it.points) ? it.points : [];
+  const safePoints = pointsArr.map((p) => Array.isArray(p) ? [
+    Number(p[0] || 0),
+    Number(p[1] || 0),
+    Number(p[2] || 0),
+  ] : [0, 0, 0]);
+
+  group.userData.road = {
+    width,
+    points: safePoints,
+    pointIds: Array.isArray(it.pointIds) ? it.pointIds.slice() : undefined,
+    pointMeta: Array.isArray(it.pointMeta) ? cloneRoadPointMeta(it.pointMeta) : undefined,
+  };
+  ensureRoadPointMetaArrays(group);
+
+  const ptsLocal = safePoints.map(vec3FromArray);
+  ensureRoadMeshFor(group, ptsLocal, width, { preview: false });
+
+  markPlaced(group, {
+    id: it.id || ("road_" + Date.now()),
+    asset: null,
+    name: it.name || "road",
+    locked: !!it.locked,
+    type: "road"
+  });
+
+  if (Array.isArray(it.position) && it.position.length >= 3) {
+    group.position.set(Number(it.position[0] || 0), Number(it.position[1] || 0), Number(it.position[2] || 0));
+  }
+  if (Array.isArray(it.rotation) && it.rotation.length >= 3) {
+    group.rotation.set(Number(it.rotation[0] || 0), Number(it.rotation[1] || 0), Number(it.rotation[2] || 0));
+  }
+  if (Array.isArray(it.scale) && it.scale.length >= 3) {
+    group.scale.set(Number(it.scale[0] || 1), Number(it.scale[1] || 1), Number(it.scale[2] || 1));
+  }
+
+  group.userData.locked = !!it.locked;
+  overlayRoot.add(group);
+  group.updateMatrixWorld(true);
+  return group;
+}
+
+function toFiniteNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function readVec3(value, fallback = [0, 0, 0]) {
+  if (!Array.isArray(value)) return [fallback[0], fallback[1], fallback[2]];
+  return [
+    toFiniteNumber(value[0], fallback[0]),
+    toFiniteNumber(value[1], fallback[1]),
+    toFiniteNumber(value[2], fallback[2])
+  ];
+}
+
 async function loadOverlay() {
-  const res = await fetch("mapEditor.php?action=load_overlay");
+  const res = await apiFetch("mapEditor.php?action=load_overlay");
   let data = null;
   try {
     data = await res.json();
@@ -4454,64 +7973,55 @@ async function loadOverlay() {
     return;
   }
 
+  setSavedRoutes((data && typeof data.routes === "object") ? data.routes : {});
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
+  clearRouteLine();
+  setRouteBanner("");
 
-  while (overlayRoot.children.length) overlayRoot.remove(overlayRoot.children[0]);
+  clearOverlayObjects();
 
   const items = Array.isArray(data?.items) ? data.items : [];
-  for (const it of items) {
+  for (const [idx, it] of items.entries()) {
+    if (!it || typeof it !== "object") continue;
+
     if (it && (it.type === "road" || Array.isArray(it.points))) {
-      const group = new THREE.Group();
-      group.name = "road";
-
-      const width = Number(it.width || ROAD_DEFAULT_WIDTH);
-      const pointsArr = Array.isArray(it.points) ? it.points : [];
-      group.userData.road = {
-        width,
-        points: pointsArr,
-        pointIds: Array.isArray(it.pointIds) ? it.pointIds.slice() : undefined,
-        pointMeta: Array.isArray(it.pointMeta) ? cloneRoadPointMeta(it.pointMeta) : undefined,
-      };
-      ensureRoadPointMetaArrays(group);
-
-      const ptsLocal = pointsArr.map(vec3FromArray);
-      ensureRoadMeshFor(group, ptsLocal, width, { preview: false });
-
-      markPlaced(group, {
-        id: it.id || ("road_" + Date.now()),
-        asset: null,
-        name: it.name || "road",
-        locked: !!it.locked,
-        type: "road"
-      });
-
-      if (Array.isArray(it.position)) group.position.set(it.position[0], it.position[1], it.position[2]);
-      if (Array.isArray(it.rotation)) group.rotation.set(it.rotation[0], it.rotation[1], it.rotation[2]);
-      if (Array.isArray(it.scale)) group.scale.set(it.scale[0], it.scale[1], it.scale[2]);
-
-      group.userData.locked = !!it.locked;
-      overlayRoot.add(group);
-      group.updateMatrixWorld(true);
+      spawnSerializedRoadObject(it);
       continue;
     }
 
-    const obj = await spawnAssetAt(
-      it.asset,
-      new THREE.Vector3(it.position[0], it.position[1], it.position[2]),
-      {
-        recordHistory: false,
-        autoSelect: false,
-        snapToGround: false,
-        forcedId: it.id,
-        forcedLocked: !!it.locked,
-        forcedName: it.name
-      }
-    );
+    if (typeof it.asset !== "string" || !it.asset.trim()) {
+      console.warn("Skipping overlay item with invalid asset at index", idx, it);
+      continue;
+    }
 
-    obj.rotation.set(it.rotation[0], it.rotation[1], it.rotation[2]);
-    obj.scale.set(it.scale[0], it.scale[1], it.scale[2]);
+    const position = readVec3(it.position, [0, 0, 0]);
+    const rotation = readVec3(it.rotation, [0, 0, 0]);
+    const scale = readVec3(it.scale, [1, 1, 1]).map((v) => Math.max(0.0001, v));
+
+    let obj = null;
+    try {
+      obj = await spawnAssetAt(
+        it.asset,
+        new THREE.Vector3(position[0], position[1], position[2]),
+        {
+          recordHistory: false,
+          autoSelect: false,
+          snapToGround: false,
+          forcedId: it.id,
+          forcedLocked: !!it.locked,
+          forcedName: it.name
+        }
+      );
+    } catch (err) {
+      console.warn("Skipping overlay item that failed to spawn at index", idx, err);
+      continue;
+    }
+    if (!obj) continue;
+
+    obj.rotation.set(rotation[0], rotation[1], rotation[2]);
+    obj.scale.set(scale[0], scale[1], scale[2]);
     obj.userData.locked = !!it.locked;
     obj.updateMatrixWorld(true);
   }
@@ -4526,22 +8036,25 @@ async function loadOverlay() {
   undoStack = [];
   redoStack = [];
 
-  setStatus("Overlay loaded ✓");
+  setStatus("Overlay loaded Ã¢Å“â€œ");
+  updateSpecialPointsPanel();
 }
 
 function updateBaseModelNote(name) {
   if (!baseModelNote) return;
   if (name === ORIGINAL_MODEL_NAME) {
-    baseModelNote.textContent = "Original map. Overlay JSON will load.";
+    baseModelNote.textContent = "Original map. Overlay assets load from map_overlay.json; roads load from per-model roadnet.";
   } else if (name) {
-    baseModelNote.textContent = "Exported map. Overlay JSON will NOT load to avoid duplicates.";
+    baseModelNote.textContent = "Exported map. Overlay assets are skipped; roads load from per-model roadnet and can be saved/edited.";
   } else {
     baseModelNote.textContent = "No base models found.";
   }
 }
 
 function clearOverlayObjects() {
-  while (overlayRoot.children.length) overlayRoot.remove(overlayRoot.children[0]);
+  while (overlayRoot.children.length) {
+    removeAndDisposeObject(overlayRoot.children[0]);
+  }
 }
 
 function resetEditorState() {
@@ -4552,27 +8065,49 @@ function resetEditorState() {
   roadSnapBuildingCache = [];
   roadSnapObstacleCache = [];
   roadGroundTargets = [];
-  clearAlignGuides();
   if (hovered) { clearHover(hovered); hovered = null; }
   if (selected) { clearSelected(selected); selected = null; }
   updateBuildingSelected(null);
   transform.detach();
   transformHelper.visible = false;
   hideAngleReadout();
+  clearRouteLine();
+  setRouteBanner("");
+  setSavedRoutes({});
   updateCommitButtons();
   updateRoadControls();
   undoStack = [];
   redoStack = [];
+  updateSpecialPointsPanel();
 }
 
 function disposeObject3D(root) {
   if (!root) return;
+  const disposedGeometries = new Set();
+  const disposedMaterials = new Set();
+  const disposedTextures = new Set();
+
   root.traverse((n) => {
-    if (n.isMesh) {
-      if (n.geometry && n.geometry.dispose) n.geometry.dispose();
-      if (n.material) {
-        const mats = Array.isArray(n.material) ? n.material : [n.material];
-        mats.forEach((m) => m && m.dispose && m.dispose());
+    if (n.isMesh || n.isLine || n.isPoints) {
+      if (n.geometry && n.geometry.dispose && !disposedGeometries.has(n.geometry)) {
+        disposedGeometries.add(n.geometry);
+        n.geometry.dispose();
+      }
+
+      const mats = getMaterialsArray(n.material);
+      for (const m of mats) {
+        if (!m || disposedMaterials.has(m)) continue;
+        disposedMaterials.add(m);
+
+        for (const key of Object.keys(m)) {
+          const tex = m[key];
+          if (tex && tex.isTexture && tex.dispose && !disposedTextures.has(tex)) {
+            disposedTextures.add(tex);
+            tex.dispose();
+          }
+        }
+
+        if (m.dispose) m.dispose();
       }
     }
   });
@@ -4581,7 +8116,7 @@ function disposeObject3D(root) {
 async function loadModelList() {
   if (!baseModelSelect) return [];
 
-  const res = await fetch("mapEditor.php?action=list_models");
+  const res = await apiFetch("mapEditor.php?action=list_models");
   const data = await res.json();
   if (!data.ok) throw new Error("Failed to list models");
 
@@ -4595,6 +8130,7 @@ async function loadModelList() {
     baseModelSelect.appendChild(opt);
     baseModelSelect.disabled = true;
     updateBaseModelNote("");
+    updateOverlaySaveAvailability();
     return models;
   }
 
@@ -4614,19 +8150,20 @@ async function loadModelList() {
   }
   baseModelSelect.value = currentModelName;
   updateBaseModelNote(currentModelName);
+  updateOverlaySaveAvailability();
 
   return models;
 }
 
 async function getDefaultModelName() {
-  const res = await fetch("mapEditor.php?action=get_default_model");
+  const res = await apiFetch("mapEditor.php?action=get_default_model");
   const data = await res.json();
   if (data && data.ok && data.file) return data.file;
   return ORIGINAL_MODEL_NAME;
 }
 
 async function setDefaultModelName(name) {
-  const res = await fetch("mapEditor.php?action=set_default_model", {
+  const res = await apiFetch("mapEditor.php?action=set_default_model", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ file: name })
@@ -4640,10 +8177,13 @@ async function switchBaseModel(nextName) {
   if (isModelSwitching) return;
   if (!nextName || nextName === currentModelName) return;
 
-  const ok = confirm("Switching the base model may discard unsaved overlay edits. Continue?");
-  if (!ok) {
-    if (baseModelSelect) baseModelSelect.value = currentModelName;
-    return;
+  const warning = getUnsavedSwitchWarning();
+  if (warning) {
+    const ok = confirm(warning);
+    if (!ok) {
+      if (baseModelSelect) baseModelSelect.value = currentModelName;
+      return;
+    }
   }
 
   isModelSwitching = true;
@@ -4662,7 +8202,7 @@ async function loadBaseModel(modelName, opts = {}) {
   const shouldLoadOverlay = opts.loadOverlay !== false;
   const modelUrl = `${MODEL_DIR}${modelName}`;
 
-  setStatus("Loading base model…");
+  setStatus("Loading base modelÃ¢â‚¬Â¦");
   resetEditorState();
 
   if (!shouldLoadOverlay) {
@@ -4716,10 +8256,21 @@ async function loadBaseModel(modelName, opts = {}) {
           assetsLoaded = true;
         }
 
+        let roadnetInfo = { exists: false, loaded: 0 };
         if (shouldLoadOverlay) {
           await loadOverlay();
+          await loadRoutesForModel(modelName);
+          roadnetInfo = await loadRoadnetForModel(modelName, {
+            replaceExisting: true,
+            keepExistingWhenMissing: true
+          });
         } else {
           resetEditorState();
+          await loadRoutesForModel(modelName);
+          roadnetInfo = await loadRoadnetForModel(modelName, {
+            replaceExisting: true,
+            keepExistingWhenMissing: false
+          });
         }
 
         currentTool = "none";
@@ -4730,16 +8281,21 @@ async function loadBaseModel(modelName, opts = {}) {
         updateBaseModelNote(currentModelName);
         if (baseModelSelect) baseModelSelect.value = currentModelName;
 
-        setStatus(shouldLoadOverlay
-          ? "Ready ✓ (hover + click select; press Move/Rotate/Scale to edit)"
-          : "Ready ✓ (overlay not loaded)"
-        );
+        let readyStatus = "Ready âœ“ (hover + click select; press Move/Rotate/Scale to edit)";
+        if (!shouldLoadOverlay) {
+          readyStatus = roadnetInfo.exists
+            ? "Ready âœ“ (overlay assets not loaded; editable roads loaded)"
+            : "Ready âœ“ (overlay assets not loaded; no editable roadnet file yet)";
+        }
+        setStatus(readyStatus);
 
+        updateOverlaySaveAvailability();
+        captureDirtyBaselines({ overlay: true, base: true });
         resolve();
       },
       undefined,
       (err) => {
-        showError(`GLB LOAD ERROR — (check ${modelName})`, err);
+        showError(`GLB LOAD ERROR Ã¢â‚¬â€ (check ${modelName})`, err);
         reject(err);
       }
     );
@@ -4763,6 +8319,12 @@ baseModelDefaultBtn?.addEventListener("click", async () => {
   } catch (err) {
     showError("DEFAULT MODEL ERROR", err);
   }
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (!getUnsavedChangeState().any) return;
+  e.preventDefault();
+  e.returnValue = "";
 });
 
 // -------------------- View controls --------------------
@@ -4831,6 +8393,7 @@ btnReset?.addEventListener("click", () => {
     console.warn("Model list failed:", err);
     updateBaseModelNote(currentModelName);
   }
+  updateOverlaySaveAvailability();
 
   const shouldLoadOverlay = currentModelName === ORIGINAL_MODEL_NAME;
   loadBaseModel(currentModelName, { loadOverlay: shouldLoadOverlay })
@@ -4859,3 +8422,7 @@ animate();
 </script>
 
 <?php admin_layout_end(); ?>
+
+
+
+
