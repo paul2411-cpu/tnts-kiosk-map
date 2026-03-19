@@ -31,12 +31,22 @@ if (!$modelFile) {
 
 $routesFile = $state["routesFile"];
 $routesPath = $state["routesPath"];
+$guidesFile = $state["guidesFile"];
+$guidesPath = $state["guidesPath"];
 
 $routes = new stdClass();
 if ($routesPath && file_exists($routesPath)) {
   $routeJson = json_decode(file_get_contents($routesPath), true);
   if (is_array($routeJson) && isset($routeJson["routes"]) && is_array($routeJson["routes"])) {
     $routes = count($routeJson["routes"]) ? $routeJson["routes"] : new stdClass();
+  }
+}
+
+$guides = new stdClass();
+if ($guidesPath && file_exists($guidesPath)) {
+  $guideJson = json_decode(file_get_contents($guidesPath), true);
+  if (is_array($guideJson) && isset($guideJson["entries"]) && is_array($guideJson["entries"])) {
+    $guides = count($guideJson["entries"]) ? $guideJson["entries"] : new stdClass();
   }
 }
 
@@ -50,6 +60,8 @@ $stateVersion = substr(sha1(implode("|", [
   map_sync_file_signature($modelPath),
   (string)($routesFile ?? ""),
   map_sync_file_signature($routesPath),
+  (string)($guidesFile ?? ""),
+  map_sync_file_signature($guidesPath),
   map_sync_file_signature($LIVE_MAP_PATH)
 ])), 0, 12);
 $version = $baseVersion . ":" . $stateVersion;
@@ -57,6 +69,7 @@ $version = $baseVersion . ":" . $stateVersion;
 $webRoot = build_web_root();
 $modelUrl = $webRoot . "/models/" . rawurlencode($modelFile);
 $routesUrl = $routesFile ? ($webRoot . "/admin/overlays/" . rawurlencode($routesFile)) : null;
+$guidesUrl = $guidesFile ? ($webRoot . "/admin/overlays/" . rawurlencode($guidesFile)) : null;
 
 echo json_encode([
   "ok" => true,
@@ -65,7 +78,10 @@ echo json_encode([
   "modelUrl" => $modelUrl,
   "routesFile" => $routesFile,
   "routesUrl" => $routesUrl,
+  "guidesFile" => $guidesFile,
+  "guidesUrl" => $guidesUrl,
   "version" => $version,
   "publishedAt" => $publishedAt,
-  "routes" => $routes
+  "routes" => $routes,
+  "guides" => $guides
 ], JSON_PRETTY_PRINT);

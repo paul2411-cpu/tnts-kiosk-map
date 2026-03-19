@@ -2,6 +2,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { buildGuideKey, buildGuideStepsFromPoints } from "./guide-utils.js";
 
 const mapStage = document.getElementById("map-stage");
 if (!mapStage) throw new Error("Missing #map-stage");
@@ -15,6 +16,16 @@ const cardRoomsList = document.getElementById("card-rooms-list");
 const closeBtn = document.getElementById("close-btn");
 const directionsBtn = document.getElementById("directions-btn");
 const clearRouteBtn = document.getElementById("clear-route-btn");
+const directionsPanel = document.getElementById("directions-panel");
+const directionsTitle = document.getElementById("directions-title");
+const directionsSummary = document.getElementById("directions-summary");
+const directionsStatus = document.getElementById("directions-status");
+const directionsSteps = document.getElementById("directions-steps");
+const directionsCloseBtn = document.getElementById("directions-close-btn");
+const mapView3dBtn = document.getElementById("map-view-3d-btn");
+const mapView2dBtn = document.getElementById("map-view-2d-btn");
+const mapZoomSlider = document.getElementById("map-zoom-slider");
+const mapZoomValue = document.getElementById("map-zoom-value");
 
 
 // ==========================
@@ -424,13 +435,52 @@ dirLight.position.set(5, 10, 7);
 scene.add(dirLight);
 
 // --- Camera
-const camera = new THREE.PerspectiveCamera(
-  55,
-  1,      // temporary, fixed on resize
-  0.001,  // near
-  100000  // far
+const VIEW_MODE_3D = "3d";
+const VIEW_MODE_2D = "2d";
+const DEFAULT_PERSPECTIVE_FOV = 55;
+const PERSPECTIVE_FOV_MIN = 18;
+const PERSPECTIVE_FOV_MAX = 75;
+const ORTHO_ZOOM_MIN = 0.85;
+const ORTHO_ZOOM_MAX = 12;
+const ORTHO_PLAN_PADDING = 1.12;
+const ORTHO_CAMERA_HEIGHT_FACTOR = 1.5;
+const HORIZON_POLAR_EPSILON = 0.02;
+const STARTUP_CAMERA_CLOSENESS = 0.5;
+const DEFAULT_VIEW_DIRECTION = new THREE.Vector3(1, 0.8, 1).normalize();
+
+const perspectiveCamera = new THREE.PerspectiveCamera(
+  DEFAULT_PERSPECTIVE_FOV,
+  1,
+  0.001,
+  100000
 );
-camera.position.set(0, 5, 10);
+perspectiveCamera.position.set(0, 5, 10);
+
+const orthographicCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.001, 100000);
+orthographicCamera.up.set(0, 0, -1);
+
+let camera = perspectiveCamera;
+let controls = null;
+let currentViewMode = VIEW_MODE_3D;
+
+const mapBounds = new THREE.Box3();
+const mapWorldSize = new THREE.Vector3(1, 1, 1);
+const mapWorldCenter = new THREE.Vector3();
+let mapWorldDiagonal = 1;
+let orthoFitHeight = 1;
+
+const perspectiveViewState = {
+  initialized: false,
+  position: new THREE.Vector3(),
+  target: new THREE.Vector3(),
+  fov: DEFAULT_PERSPECTIVE_FOV
+};
+
+const orthographicViewState = {
+  initialized: false,
+  target: new THREE.Vector3(),
+  zoom: 1
+};
 
 // --- Renderer (attach to mapStage, not body)
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -610,51 +660,283 @@ function ensureKioskMarker() {
 }
 
 // --- Controls
-const controls = new OrbitControls(camera, canvas);
+function getOrthoCameraHeightOffset() {
+  return Math.max(mapWorldDiagonal * ORTHO_CAMERA_HEIGHT_FACTOR, mapWorldSize.y * 4, 20);
+}
 
-controls.enableDamping = true;
-controls.dampingFactor = 0.1;
+function syncViewModeUi() {
+  const is3d = currentViewMode === VIEW_MODE_3D;
+  mapView3dBtn?.classList.toggle("is-active", is3d);
+  mapView2dBtn?.classList.toggle("is-active", !is3d);
+  mapView3dBtn?.setAttribute("aria-pressed", is3d ? "true" : "false");
+  mapView2dBtn?.setAttribute("aria-pressed", !is3d ? "true" : "false");
+}
 
-controls.enableRotate = true;
-controls.enablePan = true;
-controls.screenSpacePanning = true;
+function getPerspectiveZoomPercent(fov = perspectiveCamera.fov) {
+  const normalized = (PERSPECTIVE_FOV_MAX - fov) / (PERSPECTIVE_FOV_MAX - PERSPECTIVE_FOV_MIN);
+  return clamp(normalized * 100, 0, 100);
+}
 
-// ✅ FOV-ONLY ZOOM: Disable OrbitControls dolly/zoom completely
-controls.enableZoom = false;
-controls.zoomToCursor = false;
+function getPerspectiveFovFromPercent(percent) {
+  const normalized = clamp(percent, 0, 100) / 100;
+  return PERSPECTIVE_FOV_MAX - (normalized * (PERSPECTIVE_FOV_MAX - PERSPECTIVE_FOV_MIN));
+}
 
-// Speeds (rotate/pan only now)
-controls.rotateSpeed = 0.5;
-controls.panSpeed = 0.5;
+function getOrthoZoomPercent(zoom = orthographicCamera.zoom) {
+  const normalized = (zoom - ORTHO_ZOOM_MIN) / (ORTHO_ZOOM_MAX - ORTHO_ZOOM_MIN);
+  return clamp(normalized * 100, 0, 100);
+}
 
-// Prevent middle mouse from dollying (since zoom is disabled anyway)
-controls.mouseButtons = {
-  LEFT: THREE.MOUSE.ROTATE,
-  MIDDLE: THREE.MOUSE.PAN,
-  RIGHT: THREE.MOUSE.PAN,
-};
+function getOrthoZoomFromPercent(percent) {
+  const normalized = clamp(percent, 0, 100) / 100;
+  return ORTHO_ZOOM_MIN + (normalized * (ORTHO_ZOOM_MAX - ORTHO_ZOOM_MIN));
+}
 
-// Optional: remove touch pinch-dolly, keep rotate + pan
-controls.touches = {
-  ONE: THREE.TOUCH.ROTATE,
-  TWO: THREE.TOUCH.PAN,
-};
+function getCurrentZoomPercent() {
+  return currentViewMode === VIEW_MODE_2D
+    ? getOrthoZoomPercent()
+    : getPerspectiveZoomPercent();
+}
+
+function syncZoomUi() {
+  const percent = Math.round(getCurrentZoomPercent());
+  if (mapZoomSlider && document.activeElement !== mapZoomSlider) {
+    mapZoomSlider.value = String(percent);
+  }
+  if (mapZoomValue) {
+    mapZoomValue.textContent = `${percent}%`;
+  }
+}
+
+function applyActiveZoomPercent(percent) {
+  const safePercent = clamp(Number(percent) || 0, 0, 100);
+  if (currentViewMode === VIEW_MODE_2D) {
+    orthographicCamera.zoom = getOrthoZoomFromPercent(safePercent);
+    orthographicCamera.updateProjectionMatrix();
+    orthographicViewState.zoom = orthographicCamera.zoom;
+  } else {
+    perspectiveCamera.fov = getPerspectiveFovFromPercent(safePercent);
+    perspectiveCamera.updateProjectionMatrix();
+    perspectiveViewState.fov = perspectiveCamera.fov;
+  }
+  syncZoomUi();
+}
+
+function nudgeActiveZoomPercent(deltaPercent) {
+  applyActiveZoomPercent(getCurrentZoomPercent() + deltaPercent);
+}
+
+function updatePerspectiveProjection(rect) {
+  const width = Math.max(1, rect.width || 1);
+  const height = Math.max(1, rect.height || 1);
+  perspectiveCamera.aspect = width / height;
+  perspectiveCamera.updateProjectionMatrix();
+}
+
+function updateOrthographicProjection(rect) {
+  const width = Math.max(1, rect.width || 1);
+  const height = Math.max(1, rect.height || 1);
+  const aspect = width / height;
+
+  orthoFitHeight = Math.max(
+    1,
+    mapWorldSize.z * ORTHO_PLAN_PADDING,
+    (mapWorldSize.x * ORTHO_PLAN_PADDING) / aspect
+  );
+
+  const halfHeight = orthoFitHeight / 2;
+  const halfWidth = halfHeight * aspect;
+
+  orthographicCamera.left = -halfWidth;
+  orthographicCamera.right = halfWidth;
+  orthographicCamera.top = halfHeight;
+  orthographicCamera.bottom = -halfHeight;
+  orthographicCamera.near = 0.01;
+  orthographicCamera.far = Math.max(getOrthoCameraHeightOffset() + (mapWorldDiagonal * 20), 1000);
+  orthographicCamera.updateProjectionMatrix();
+}
+
+function buildControlsForMode(cameraObject, mode) {
+  const nextControls = new OrbitControls(cameraObject, canvas);
+
+  nextControls.enableDamping = true;
+  nextControls.dampingFactor = 0.1;
+  nextControls.enablePan = true;
+  nextControls.screenSpacePanning = true;
+  nextControls.enableZoom = false;
+  nextControls.zoomToCursor = false;
+  nextControls.panSpeed = mode === VIEW_MODE_2D ? 0.8 : 0.5;
+
+  if (mode === VIEW_MODE_2D) {
+    nextControls.enableRotate = false;
+    nextControls.rotateSpeed = 0;
+    nextControls.mouseButtons = {
+      LEFT: THREE.MOUSE.PAN,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+    nextControls.touches = {
+      ONE: THREE.TOUCH.PAN,
+      TWO: THREE.TOUCH.PAN,
+    };
+  } else {
+    nextControls.enableRotate = true;
+    nextControls.rotateSpeed = 0.5;
+    nextControls.minPolarAngle = 0;
+    nextControls.maxPolarAngle = Math.PI / 2 - HORIZON_POLAR_EPSILON;
+    nextControls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+    nextControls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.PAN,
+    };
+    nextControls.minDistance = 0;
+    nextControls.maxDistance = mapWorldDiagonal * 5;
+  }
+
+  return nextControls;
+}
+
+function replaceControls(nextCamera, nextMode, target) {
+  controls?.dispose?.();
+  camera = nextCamera;
+  controls = buildControlsForMode(camera, nextMode);
+  controls.target.copy(target || mapWorldCenter);
+  controls.update();
+  syncViewModeUi();
+  syncZoomUi();
+}
+
+function captureViewState(mode = currentViewMode) {
+  if (!controls) return;
+
+  if (mode === VIEW_MODE_2D) {
+    orthographicViewState.target.copy(controls.target);
+    orthographicViewState.zoom = orthographicCamera.zoom;
+    orthographicViewState.initialized = true;
+    return;
+  }
+
+  perspectiveViewState.target.copy(controls.target);
+  perspectiveViewState.position.copy(perspectiveCamera.position);
+  perspectiveViewState.fov = perspectiveCamera.fov;
+  perspectiveViewState.initialized = true;
+}
+
+function initializePerspectiveViewState(target = mapWorldCenter) {
+  perspectiveViewState.target.copy(target);
+  perspectiveViewState.position
+    .copy(target)
+    .add(DEFAULT_VIEW_DIRECTION.clone().multiplyScalar(mapWorldDiagonal * STARTUP_CAMERA_CLOSENESS));
+  perspectiveViewState.fov = DEFAULT_PERSPECTIVE_FOV;
+  perspectiveViewState.initialized = true;
+}
+
+function initializeOrthographicViewState(target = mapWorldCenter) {
+  orthographicViewState.target.copy(target);
+  orthographicViewState.zoom = 1;
+  orthographicViewState.initialized = true;
+}
+
+function activatePerspectiveView({ target = null, reset = false } = {}) {
+  const focusTarget = target ? target.clone() : perspectiveViewState.target.clone();
+  if (reset || !perspectiveViewState.initialized) {
+    initializePerspectiveViewState(focusTarget);
+  } else if (target) {
+    const delta = focusTarget.clone().sub(perspectiveViewState.target);
+    perspectiveViewState.target.copy(focusTarget);
+    perspectiveViewState.position.add(delta);
+  }
+
+  currentViewMode = VIEW_MODE_3D;
+  perspectiveCamera.position.copy(perspectiveViewState.position);
+  perspectiveCamera.fov = clamp(perspectiveViewState.fov, PERSPECTIVE_FOV_MIN, PERSPECTIVE_FOV_MAX);
+  perspectiveCamera.near = Math.max(0.01, mapWorldDiagonal / 1000);
+  perspectiveCamera.far = Math.max(mapWorldDiagonal * 100, 1000);
+  updatePerspectiveProjection(mapStage.getBoundingClientRect());
+  replaceControls(perspectiveCamera, currentViewMode, perspectiveViewState.target.clone());
+  controls.minDistance = 0;
+  controls.maxDistance = mapWorldDiagonal * 5;
+  controls.update();
+}
+
+function activateOrthographicView({ target = null, reset = false } = {}) {
+  const focusTarget = target ? target.clone() : orthographicViewState.target.clone();
+  if (reset || !orthographicViewState.initialized) {
+    initializeOrthographicViewState(focusTarget);
+  } else if (target) {
+    orthographicViewState.target.copy(focusTarget);
+  }
+
+  currentViewMode = VIEW_MODE_2D;
+  orthographicCamera.zoom = clamp(orthographicViewState.zoom, ORTHO_ZOOM_MIN, ORTHO_ZOOM_MAX);
+  updateOrthographicProjection(mapStage.getBoundingClientRect());
+  orthographicCamera.position.set(
+    orthographicViewState.target.x,
+    orthographicViewState.target.y + getOrthoCameraHeightOffset(),
+    orthographicViewState.target.z
+  );
+  replaceControls(orthographicCamera, currentViewMode, orthographicViewState.target.clone());
+  controls.update();
+}
+
+function setViewMode(nextMode, { reset = false } = {}) {
+  const normalizedMode = nextMode === VIEW_MODE_2D ? VIEW_MODE_2D : VIEW_MODE_3D;
+  if (normalizedMode === currentViewMode && !reset) {
+    syncViewModeUi();
+    syncZoomUi();
+    return;
+  }
+
+  const nextTarget = controls?.target?.clone() || mapWorldCenter.clone();
+  captureViewState(currentViewMode);
+
+  if (normalizedMode === VIEW_MODE_2D) {
+    activateOrthographicView({ target: nextTarget, reset: reset || !orthographicViewState.initialized });
+  } else {
+    activatePerspectiveView({ target: nextTarget, reset: reset || !perspectiveViewState.initialized });
+  }
+}
 
 // --- Resize to container
 function resizeToContainer() {
   const rect = mapStage.getBoundingClientRect();
-  const w = Math.floor(rect.width);
-  const h = Math.floor(rect.height);
+  const w = Math.max(1, Math.floor(rect.width));
+  const h = Math.max(1, Math.floor(rect.height));
 
   renderer.setSize(w, h, false);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
+  updatePerspectiveProjection(rect);
+  updateOrthographicProjection(rect);
+  syncZoomUi();
 }
+
+controls = buildControlsForMode(camera, currentViewMode);
+controls.target.copy(mapWorldCenter);
+controls.update();
+syncViewModeUi();
+syncZoomUi();
 resizeToContainer();
 
 const ro = new ResizeObserver(() => resizeToContainer());
 ro.observe(mapStage);
 window.addEventListener("resize", () => resizeToContainer());
+
+mapView3dBtn?.addEventListener("click", () => {
+  setViewMode(VIEW_MODE_3D);
+  logCameraState("VIEW_3D");
+});
+
+mapView2dBtn?.addEventListener("click", () => {
+  setViewMode(VIEW_MODE_2D);
+  logCameraState("VIEW_2D");
+});
+
+mapZoomSlider?.addEventListener("input", (event) => {
+  applyActiveZoomPercent(event.target.value);
+});
 
 // --- Mouse coords relative to canvas rect
 const raycaster = new THREE.Raycaster();
@@ -684,36 +966,26 @@ canvas.addEventListener("pointerleave", () => {
 });
 
 // ==========================
-// ✅ FOV-ONLY WHEEL ZOOM
+// Custom wheel / pinch zoom
 // ==========================
-const FOV_MIN = 18;   // smaller = more zoom in
-const FOV_MAX = 75;   // larger = more zoom out
-const FOV_STEP = 0.03; // wheel sensitivity (trackpad friendly)
+const WHEEL_ZOOM_FACTOR = 0.06;
 const TOUCH_TAP_SLOP_PX = 12;
 const TOUCH_CLICK_SUPPRESS_MS = 450;
 const TOUCH_PINCH_SLOP_PX = 2;
-const TOUCH_FOV_STEP = 0.08;
+const TOUCH_ZOOM_FACTOR = 0.18;
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
-function onWheelFovZoom(e) {
-  // IMPORTANT: stop OrbitControls / page scroll from handling it
+function onWheelZoom(e) {
   e.preventDefault();
   e.stopPropagation();
-
-  // deltaY > 0 = scroll down = zoom out => increase FOV
-  // deltaY < 0 = scroll up   = zoom in  => decrease FOV
-  const nextFov = camera.fov + e.deltaY * FOV_STEP;
-  camera.fov = clamp(nextFov, FOV_MIN, FOV_MAX);
-  camera.updateProjectionMatrix();
-
-  logCameraState("WHEEL_FOV");
+  nudgeActiveZoomPercent(-e.deltaY * WHEEL_ZOOM_FACTOR);
+  logCameraState("WHEEL_ZOOM");
 }
 
-// passive:false is REQUIRED so preventDefault() works
-renderer.domElement.addEventListener("wheel", onWheelFovZoom, { passive: false });
+renderer.domElement.addEventListener("wheel", onWheelZoom, { passive: false });
 
 function isTouchLikePointer(event) {
   return event.pointerType === "touch" || event.pointerType === "pen";
@@ -736,7 +1008,7 @@ function getTouchDistance() {
   return Math.hypot(b.x - a.x, b.y - a.y);
 }
 
-function updateTouchFovZoom() {
+function updateTouchZoom() {
   if (activeTouchPointers.size < 2) {
     pinchDistance = 0;
     return;
@@ -749,11 +1021,7 @@ function updateTouchFovZoom() {
   }
   const delta = distance - pinchDistance;
   if (Math.abs(delta) < TOUCH_PINCH_SLOP_PX) return;
-  const nextFov = clamp(camera.fov - delta * TOUCH_FOV_STEP, FOV_MIN, FOV_MAX);
-  if (Math.abs(nextFov - camera.fov) > 0.001) {
-    camera.fov = nextFov;
-    camera.updateProjectionMatrix();
-  }
+  nudgeActiveZoomPercent(delta * TOUCH_ZOOM_FACTOR);
   pinchDistance = distance;
 }
 
@@ -774,6 +1042,7 @@ const FALLBACK_MODEL_URL = "../models/tnts_navigation.glb";
 const LIVE_POLL_INTERVAL_MS = 30000;
 
 let activeRoutesByKey = new Map(); // normalized name -> { name, mode, names|points, distance? }
+let activeGuidesByKey = new Map(); // guide key -> published guide entry
 let routeNamesForSearch = [];      // display names
 let dbBuildingNamesForSearch = []; // DB building names
 let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
@@ -786,6 +1055,7 @@ let cardDetailsRequestSeq = 0;
 let cardRoomsCache = new Map();
 let publishedKioskPoint = null;
 let publishedKioskPointAligned = null;
+let selectedGuideTarget = null;
 
 const kioskMarkerScreen = new THREE.Vector3();
 
@@ -863,6 +1133,201 @@ function setPublishedRoutes(routesObj) {
   rebuildRouteCatalog(entries);
   setPublishedKioskPoint(inferPublishedKioskPoint(entries));
   return true;
+}
+
+function setPublishedGuides(guidesObj) {
+  activeGuidesByKey = new Map();
+  if (!guidesObj || typeof guidesObj !== "object") return false;
+
+  for (const [rawKey, rawEntry] of Object.entries(guidesObj)) {
+    if (!rawEntry || typeof rawEntry !== "object") continue;
+    const destinationType = String(rawEntry.destinationType || rawEntry.type || (String(rawKey).startsWith("room::") ? "room" : "building")).trim() || "building";
+    const buildingName = String(rawEntry.buildingName || rawEntry.name || rawEntry.routeName || rawEntry.destinationName || "").trim();
+    const roomName = String(rawEntry.roomName || "").trim();
+    const key = String(rawEntry.key || rawKey || buildGuideKey(destinationType, { buildingName, roomName })).trim();
+    if (!key || !buildingName) continue;
+
+    activeGuidesByKey.set(key, {
+      key,
+      destinationType,
+      buildingName,
+      roomName,
+      destinationName: String(rawEntry.destinationName || "").trim(),
+      routeName: String(rawEntry.routeName || buildingName).trim(),
+      status: String(rawEntry.status || "").trim(),
+      guideMode: String(rawEntry.guideMode || "").trim(),
+      manualText: String(rawEntry.manualText || "").trim(),
+      notes: Array.isArray(rawEntry.notes) ? rawEntry.notes.map((note) => String(note || "").trim()).filter(Boolean) : [],
+      finalSteps: Array.isArray(rawEntry.finalSteps) ? rawEntry.finalSteps : [],
+      autoSteps: Array.isArray(rawEntry.autoSteps) ? rawEntry.autoSteps : [],
+      distance: Number(rawEntry.distance)
+    });
+  }
+
+  return activeGuidesByKey.size > 0;
+}
+
+function setSelectedGuideTarget(target) {
+  if (!target || !String(target.buildingName || "").trim()) {
+    selectedGuideTarget = null;
+    return;
+  }
+  selectedGuideTarget = {
+    type: String(target.type || "building").trim() || "building",
+    buildingName: String(target.buildingName || "").trim(),
+    roomName: String(target.roomName || "").trim()
+  };
+}
+
+function getGuideEntryForTarget(target) {
+  if (!target || !target.buildingName) return null;
+  const buildingCandidates = [
+    String(target.buildingName || "").trim(),
+    String(getDisplayBuildingName(target.buildingName) || "").trim()
+  ].filter(Boolean);
+
+  for (const candidate of buildingCandidates) {
+    const exactKey = buildGuideKey(target.type || "building", {
+      buildingName: candidate,
+      roomName: target.roomName || ""
+    });
+    const exact = activeGuidesByKey.get(exactKey);
+    if (exact) return exact;
+  }
+
+  for (const candidate of buildingCandidates) {
+    const buildingKey = buildGuideKey("building", { buildingName: candidate });
+    const buildingGuide = activeGuidesByKey.get(buildingKey);
+    if (buildingGuide) return buildingGuide;
+  }
+
+  return null;
+}
+
+function buildDirectionsTarget() {
+  if (selectedGuideTarget?.buildingName) return selectedGuideTarget;
+  if (selectedBuildingName) {
+    return {
+      type: "building",
+      buildingName: selectedBuildingName,
+      roomName: ""
+    };
+  }
+  return null;
+}
+
+function formatGuideDistanceText(distance) {
+  const safe = Number(distance);
+  if (!Number.isFinite(safe) || safe <= 0) return "Distance unavailable";
+  return `${Math.round(safe)} units`;
+}
+
+function hideDirectionsPanel() {
+  directionsPanel?.classList.add("hidden");
+  if (directionsSummary) directionsSummary.textContent = "Select a destination to view directions.";
+  if (directionsTitle) directionsTitle.textContent = "Directions";
+  if (directionsStatus) {
+    directionsStatus.classList.add("hidden");
+    directionsStatus.textContent = "";
+  }
+  directionsSteps?.replaceChildren?.();
+}
+
+function renderDirectionsSteps(steps) {
+  if (!directionsSteps) return;
+  directionsSteps.replaceChildren();
+  const safeSteps = Array.isArray(steps) ? steps.filter((step) => String(step?.text || "").trim()) : [];
+  if (!safeSteps.length) {
+    const empty = document.createElement("div");
+    empty.className = "directions-panel-summary";
+    empty.textContent = "Step-by-step guidance is unavailable for this route.";
+    directionsSteps.appendChild(empty);
+    return;
+  }
+
+  safeSteps.forEach((step, index) => {
+    const row = document.createElement("div");
+    row.className = "directions-step";
+
+    const num = document.createElement("div");
+    num.className = "directions-step-num";
+    num.textContent = String(index + 1);
+
+    const text = document.createElement("div");
+    text.className = "directions-step-text";
+    text.textContent = String(step?.text || "").trim();
+
+    row.appendChild(num);
+    row.appendChild(text);
+    directionsSteps.appendChild(row);
+  });
+}
+
+function buildPublicGuideLandmarks() {
+  const landmarks = [];
+  for (const entry of buildingLabels) {
+    const point = entry?.worldPosition;
+    if (!point) continue;
+    landmarks.push({
+      type: "building",
+      name: getDisplayBuildingName(entry.name) || entry.name,
+      x: point.x,
+      y: point.y,
+      z: point.z
+    });
+  }
+  return landmarks;
+}
+
+function showDirectionsPanelForSelection(target, routeEntry, alignedPoints, routeDistance) {
+  if (!directionsPanel || !target?.buildingName) return;
+
+  const displayBuildingName = getDisplayBuildingName(target.buildingName) || target.buildingName;
+  const title = target.type === "room" && target.roomName
+    ? `${target.roomName}`
+    : displayBuildingName;
+  const summary = target.type === "room" && target.roomName
+    ? `Route via ${displayBuildingName} • ${formatGuideDistanceText(routeDistance)}`
+    : `${displayBuildingName} • ${formatGuideDistanceText(routeDistance)}`;
+
+  const guideEntry = getGuideEntryForTarget(target);
+  const usablePublishedGuide = guideEntry
+    && guideEntry.status !== "orphaned"
+    && guideEntry.status !== "missing_route"
+    && Array.isArray(guideEntry.finalSteps)
+    && guideEntry.finalSteps.length > 0;
+
+  const steps = usablePublishedGuide
+    ? guideEntry.finalSteps
+    : buildGuideStepsFromPoints(
+        alignedPoints.map((point) => [point.x, point.y, point.z]),
+        {
+          destinationName: target.roomName || displayBuildingName,
+          arrivalText: target.type === "room" && target.roomName
+            ? `Arrive at ${displayBuildingName}. Proceed to ${target.roomName}.`
+            : `Arrive at ${displayBuildingName}.`,
+          landmarks: buildPublicGuideLandmarks()
+        }
+      );
+
+  if (directionsTitle) directionsTitle.textContent = title;
+  if (directionsSummary) directionsSummary.textContent = summary;
+  if (directionsStatus) {
+    const notes = usablePublishedGuide ? guideEntry.notes : [];
+    if (!usablePublishedGuide) {
+      directionsStatus.textContent = "Using an auto-generated fallback because no published text guide is available yet.";
+      directionsStatus.classList.remove("hidden");
+    } else if (Array.isArray(notes) && notes.length) {
+      directionsStatus.textContent = notes[0];
+      directionsStatus.classList.remove("hidden");
+    } else {
+      directionsStatus.classList.add("hidden");
+      directionsStatus.textContent = "";
+    }
+  }
+
+  renderDirectionsSteps(steps);
+  directionsPanel.classList.remove("hidden");
 }
 
 function getRouteEntry(name) {
@@ -1114,7 +1579,11 @@ function selectBuildingByName(buildingName) {
   const meshForOutline = entry?.meshForOutline || findOutlineMeshForObject(anchor);
   if (!meshForOutline) return false;
 
+  const previousSelectedBuilding = selectedBuildingName;
   selectedBuildingName = entry?.name || anchor.name || candidateName;
+  if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {
+    hideDirectionsPanel();
+  }
 
   // Clear previous selection visuals
   clearHoverTint();
@@ -1159,6 +1628,12 @@ function handleSearchSelect(rawValue, opts = {}) {
   if (!selected) return;
 
   if (selected.type === "room" && selected.roomName) {
+    setSelectedGuideTarget({
+      type: "room",
+      buildingName: selected.buildingName,
+      roomName: selected.roomName
+    });
+    hideDirectionsPanel();
     const routeReady = !!getRouteEntryForBuilding(selected.buildingName);
     cardInfo.textContent = routeReady
       ? `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. Select "Get Directions" to show the route.`
@@ -1640,6 +2115,13 @@ async function loadCardBuildingDetails(buildingName) {
 }
 
 function showCard(buildingName) {
+  if (!selectedGuideTarget || normalizeQuery(selectedGuideTarget.buildingName) !== normalizeQuery(buildingName)) {
+    setSelectedGuideTarget({
+      type: "building",
+      buildingName,
+      roomName: ""
+    });
+  }
   const displayName = getDisplayBuildingName(buildingName) || buildingName;
   const meta = getDbBuildingMeta(buildingName);
   const description = String(meta?.description || "").trim();
@@ -1667,16 +2149,22 @@ function hideCardAndClear() {
   infoCard.classList.add("hidden");
   selectedBuildingName = null;
   hoveredBuildingName = null;
+  setSelectedGuideTarget(null);
   directionsBtn.disabled = true;
   clearRouteBtn.disabled = true;
   cardDetailsRequestSeq++;
 
   clearRouteOnly();
+  hideDirectionsPanel();
   clearClickOutline();
   resetCardRoomsPanel();
 }
 
-closeBtn.addEventListener("click", () => hideCardAndClear());
+closeBtn.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  hideCardAndClear();
+});
 
 function activateDirectionsForSelectedBuilding() {
   if (!loadedModel || !selectedBuildingName) return;
@@ -1684,6 +2172,7 @@ function activateDirectionsForSelectedBuilding() {
   const routeEntry = getRouteEntryForBuilding(selectedBuildingName);
   if (!routeEntry) {
     console.warn("No route configured for:", selectedBuildingName);
+    hideDirectionsPanel();
     showCard(selectedBuildingName);
     return;
   }
@@ -1700,6 +2189,7 @@ function activateDirectionsForSelectedBuilding() {
   if (points.length < 2) {
     console.warn("Route points < 2. Check console ROUTE DEBUG MISSING list.");
     cardInfo.textContent = "Route data is incomplete for this building.";
+    hideDirectionsPanel();
     return;
   }
 
@@ -1708,8 +2198,10 @@ function activateDirectionsForSelectedBuilding() {
   const started = startAnimatedRoute(alignedPoints, routeDistance);
   if (!started) {
     cardInfo.textContent = "Route data is incomplete for this building.";
+    hideDirectionsPanel();
     return;
   }
+  showDirectionsPanelForSelection(buildDirectionsTarget(), routeEntry, alignedPoints, routeDistance);
   clearRouteBtn.disabled = false;
 }
 
@@ -1719,6 +2211,15 @@ directionsBtn.addEventListener("click", () => {
 
 clearRouteBtn.addEventListener("click", () => {
   clearRouteOnly();
+  hideDirectionsPanel();
+  clearRouteBtn.disabled = true;
+});
+
+directionsCloseBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearRouteOnly();
+  hideDirectionsPanel();
   clearRouteBtn.disabled = true;
 });
 
@@ -2213,7 +2714,9 @@ function applyLoadedModel(newModel) {
   clearBuildingLabels();
   selectedBuildingName = null;
   hoveredBuildingName = null;
+  setSelectedGuideTarget(null);
   infoCard?.classList?.add("hidden");
+  hideDirectionsPanel();
   clearRouteBtn.disabled = true;
 
   if (previousModel) {
@@ -2227,38 +2730,26 @@ function applyLoadedModel(newModel) {
   publishedKioskPointAligned = publishedKioskPoint ? alignPointToModelSurface(publishedKioskPoint) : null;
 
   // 1. Calculate Bounding Box
-  const box = new THREE.Box3().setFromObject(loadedModel);
-  const size = box.getSize(new THREE.Vector3()).length();
-  const center = box.getCenter(new THREE.Vector3());
+  mapBounds.setFromObject(loadedModel);
+  mapBounds.getSize(mapWorldSize);
+  mapBounds.getCenter(mapWorldCenter);
+  mapWorldDiagonal = Math.max(mapWorldSize.length(), 1);
 
-  // 2. Center Controls
-  controls.target.copy(center);
+  // 2. Reset both view states against the current model bounds
+  initializePerspectiveViewState(mapWorldCenter);
+  initializeOrthographicViewState(mapWorldCenter);
+  resizeToContainer();
+  setViewMode(currentViewMode, { reset: true });
 
-  // 3. Fix Camera Position
-  const STARTUP_CAMERA_CLOSENESS = 0.5;
-  const direction = new THREE.Vector3(1, 0.8, 1).normalize();
-  camera.position.copy(center).add(direction.multiplyScalar(size * STARTUP_CAMERA_CLOSENESS));
-
-  // 4. Update Planes
-  camera.near = Math.max(0.01, size / 1000);
-  camera.far = size * 100;
-  camera.updateProjectionMatrix();
-
-  // 5. OrbitControls limits
-  controls.minDistance = 0.0;
-  controls.maxDistance = size * 5.0;
-
-  // 6. Update controls
-  controls.update();
   directionsBtn.disabled = true;
   clearRouteBtn.disabled = true;
-  rebuildBuildingLabels(loadedModel, size);
+  rebuildBuildingLabels(loadedModel, mapWorldDiagonal);
 
   if (typeof pendingSearchQuery !== "undefined" && pendingSearchQuery.trim()) {
     handleSearchSelect(pendingSearchQuery);
   }
 
-  console.log("GLB loaded. Size:", size, "Center:", center);
+  console.log("GLB loaded. Size:", mapWorldDiagonal, "Center:", mapWorldCenter);
 }
 
 function loadModel(modelUrl) {
@@ -2286,6 +2777,7 @@ async function fetchLiveMapPayload() {
 
 function applyPublishedRoutes(payload) {
   const ok = setPublishedRoutes(payload?.routes || null);
+  setPublishedGuides(payload?.guides || null);
   if (!ok) {
     rebuildRouteCatalog([]);
     setPublishedKioskPoint(null);
@@ -2320,6 +2812,7 @@ async function bootLiveMap() {
   } catch (err) {
     console.warn("Live map unavailable, using fallback:", err);
     rebuildRouteCatalog([]);
+    setPublishedGuides(null);
     setPublishedKioskPoint(null);
     currentLiveModelFile = "";
     await loadModel(addCacheBuster(FALLBACK_MODEL_URL, Date.now()));
@@ -2369,9 +2862,13 @@ function pickSceneSelection(event) {
   return { hit, buildingEntry };
 }
 
+function isInteractiveOverlayClick(event) {
+  return !!event.target?.closest?.("#info-card, #directions-panel, #map-view-controls, .topbar, .bottom-nav");
+}
+
 function handleSceneSelection(event) {
-  if (event.target?.closest?.("#info-card")) return;
-  if (!loadedModel) return;
+  if (isInteractiveOverlayClick(event)) return;
+  if (!loadedModel || !isEventOnCanvas(event)) return;
 
   const selection = pickSceneSelection(event);
   if (!selection) {
@@ -2380,7 +2877,16 @@ function handleSceneSelection(event) {
   }
 
   const { hit, buildingEntry } = selection;
+  const previousSelectedBuilding = selectedBuildingName;
   selectedBuildingName = buildingEntry.name;
+  setSelectedGuideTarget({
+    type: "building",
+    buildingName: buildingEntry.name,
+    roomName: ""
+  });
+  if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {
+    hideDirectionsPanel();
+  }
 
   const outlineTarget = buildingEntry.object || hit;
   if (outlineTarget) setClickOutline(outlineTarget);
@@ -2414,7 +2920,7 @@ canvas.addEventListener("pointermove", (event) => {
     if (dx > TOUCH_TAP_SLOP_PX || dy > TOUCH_TAP_SLOP_PX) touchSceneTap.moved = true;
   }
   if (touchSceneTap && activeTouchPointers.size > 1) touchSceneTap.hadMultiTouch = true;
-  updateTouchFovZoom();
+  updateTouchZoom();
 }, true);
 
 window.addEventListener("pointerup", (event) => {
@@ -2487,12 +2993,21 @@ function animate() {
 }
 
 // --- CAMERA DEBUG (DEVTOOLS)
-window.__camDebug = { camera, controls };
+window.__camDebug = {
+  get camera() { return camera; },
+  get controls() { return controls; },
+  perspectiveCamera,
+  orthographicCamera
+};
 
 function logCameraState(tag = "") {
   const camPos = camera.position;
   const target = controls.target;
   const distance = camPos.distanceTo(target);
+  const isOrtho = !!camera.isOrthographicCamera;
+  const zoomValue = isOrtho
+    ? Number(camera.zoom || 1).toFixed(2)
+    : Number(camera.fov || DEFAULT_PERSPECTIVE_FOV).toFixed(2);
 
   console.log(
     `%c[CAMERA ${tag}]`,
@@ -2501,7 +3016,8 @@ function logCameraState(tag = "") {
       pos: { x: camPos.x.toFixed(3), y: camPos.y.toFixed(3), z: camPos.z.toFixed(3) },
       target: { x: target.x.toFixed(3), y: target.y.toFixed(3), z: target.z.toFixed(3) },
       distance: distance.toFixed(3),
-      fov: camera.fov.toFixed(2),
+      mode: currentViewMode,
+      zoom: zoomValue,
       minDistance: controls.minDistance,
       maxDistance: controls.maxDistance,
     }

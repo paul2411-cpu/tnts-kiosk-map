@@ -40,6 +40,10 @@ function admin_layout_start(string $title, string $active = "") { ?>
           <span class="ico">📣</span><span>Announcements</span>
         </a>
 
+        <a class="nav-item <?= $active==='feedback'?'active':'' ?>" href="feedback.php">
+          <span class="ico">FB</span><span>Feedback</span>
+        </a>
+
         <div class="nav-sep"></div>
 
         <a class="nav-item <?= $active==='mapeditor'?'active':'' ?>" href="mapEditor.php">

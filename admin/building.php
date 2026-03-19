@@ -275,8 +275,11 @@ if (isset($_GET["action"])) {
     if (!bld_atomic_write($modelPath, $incoming)) bld_fail(500, "Failed to save model");
 
     $projectRoot = dirname(__DIR__);
-    $routesPath = map_sync_paths($projectRoot)["overlayDir"] . "/routes_" . $modelFile . ".json";
+    $overlayDir = map_sync_paths($projectRoot)["overlayDir"];
+    $routesPath = $overlayDir . "/routes_" . $modelFile . ".json";
+    $guidesPath = $overlayDir . "/guides_" . $modelFile . ".json";
     $routesBackup = file_exists($routesPath) ? @file_get_contents($routesPath) : null;
+    $guidesBackup = file_exists($guidesPath) ? @file_get_contents($guidesPath) : null;
 
     try {
       bld_ensure_schema($conn);
@@ -340,6 +343,9 @@ if (isset($_GET["action"])) {
       if ($oldName !== $newName && !map_sync_rename_route_entry($projectRoot, $modelFile, $oldName, $newName)) {
         throw new RuntimeException("Failed to sync published routes for renamed building");
       }
+      if ($oldName !== $newName && !map_sync_rename_guide_entries($projectRoot, $modelFile, $oldName, $newName)) {
+        throw new RuntimeException("Failed to sync published text guides for renamed building");
+      }
 
       $meta = $conn->prepare("SELECT DATE_FORMAT(last_edited_at, '%Y-%m-%d %H:%i:%s') AS edited_at FROM buildings WHERE building_id = ? LIMIT 1");
       if (!$meta) throw new RuntimeException("Failed to prepare metadata query");
@@ -370,6 +376,12 @@ if (isset($_GET["action"])) {
         $decodedRoutes = json_decode($routesBackup, true);
         if (is_array($decodedRoutes)) {
           map_sync_atomic_write_json($routesPath, $decodedRoutes);
+        }
+      }
+      if (is_string($guidesBackup)) {
+        $decodedGuides = json_decode($guidesBackup, true);
+        if (is_array($decodedGuides)) {
+          map_sync_atomic_write_json($guidesPath, $decodedGuides);
         }
       }
       bld_fail(500, "Save failed: " . $e->getMessage());

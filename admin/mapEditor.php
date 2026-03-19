@@ -213,6 +213,141 @@ function validate_roadnet_payload($data, ?string &$error = null): bool {
   return true;
 }
 
+function validate_routes_payload($data, ?string &$error = null): bool {
+  if (!is_array($data) || !isset($data["routes"]) || !is_array($data["routes"])) {
+    $error = "Routes payload must include routes{}";
+    return false;
+  }
+  foreach ($data["routes"] as $routeKey => $routeEntry) {
+    if (!is_array($routeEntry)) {
+      $error = "routes[{$routeKey}] must be an object";
+      return false;
+    }
+    $routeName = trim((string)($routeEntry["name"] ?? $routeKey));
+    if ($routeName === "") {
+      $error = "routes[{$routeKey}] requires a destination name";
+      return false;
+    }
+    if (!isset($routeEntry["points"]) || !is_array($routeEntry["points"]) || count($routeEntry["points"]) < 2) {
+      $error = "routes[{$routeKey}] must include at least two points";
+      return false;
+    }
+    foreach ($routeEntry["points"] as $idx => $pt) {
+      if (!is_numeric_vec3($pt)) {
+        $error = "routes[{$routeKey}].points[{$idx}] must be numeric [x,y,z]";
+        return false;
+      }
+    }
+    if (array_key_exists("distance", $routeEntry) && $routeEntry["distance"] !== null && !is_numeric($routeEntry["distance"])) {
+      $error = "routes[{$routeKey}].distance must be numeric";
+      return false;
+    }
+  }
+  return true;
+}
+
+function validate_guide_steps_payload($steps, string $label, ?string &$error = null): bool {
+  if (!is_array($steps)) {
+    $error = "{$label} must be an array";
+    return false;
+  }
+  foreach ($steps as $idx => $step) {
+    if (!is_array($step)) {
+      $error = "{$label}[{$idx}] must be an object";
+      return false;
+    }
+    $text = trim((string)($step["text"] ?? ""));
+    if ($text === "") {
+      $error = "{$label}[{$idx}] requires text";
+      return false;
+    }
+    if (isset($step["kind"]) && !is_string($step["kind"])) {
+      $error = "{$label}[{$idx}].kind must be a string";
+      return false;
+    }
+  }
+  return true;
+}
+
+function validate_guides_payload($data, ?string &$error = null): bool {
+  if (!is_array($data) || !isset($data["entries"]) || !is_array($data["entries"])) {
+    $error = "Guides payload must include entries{}";
+    return false;
+  }
+
+  foreach ($data["entries"] as $guideKey => $guideEntry) {
+    if (!is_array($guideEntry)) {
+      $error = "entries[{$guideKey}] must be an object";
+      return false;
+    }
+
+    $destinationType = trim((string)($guideEntry["destinationType"] ?? $guideEntry["type"] ?? "building"));
+    if ($destinationType === "") {
+      $error = "entries[{$guideKey}] requires destinationType";
+      return false;
+    }
+
+    $guideMode = trim((string)($guideEntry["guideMode"] ?? "auto"));
+    if ($guideMode !== "" && !in_array($guideMode, ["auto", "manual", "mixed"], true)) {
+      $error = "entries[{$guideKey}].guideMode must be auto, manual, or mixed";
+      return false;
+    }
+
+    $buildingName = trim((string)($guideEntry["buildingName"] ?? $guideEntry["name"] ?? ""));
+    if ($buildingName === "" && $destinationType !== "landmark") {
+      $error = "entries[{$guideKey}] requires buildingName";
+      return false;
+    }
+
+    if (isset($guideEntry["roomName"]) && !is_string($guideEntry["roomName"])) {
+      $error = "entries[{$guideKey}].roomName must be a string";
+      return false;
+    }
+    if (isset($guideEntry["manualText"]) && !is_string($guideEntry["manualText"])) {
+      $error = "entries[{$guideKey}].manualText must be a string";
+      return false;
+    }
+    if (isset($guideEntry["routeSignature"]) && !is_string($guideEntry["routeSignature"])) {
+      $error = "entries[{$guideKey}].routeSignature must be a string";
+      return false;
+    }
+    if (isset($guideEntry["sourceRouteSignature"]) && !is_string($guideEntry["sourceRouteSignature"])) {
+      $error = "entries[{$guideKey}].sourceRouteSignature must be a string";
+      return false;
+    }
+    if (isset($guideEntry["status"]) && !is_string($guideEntry["status"])) {
+      $error = "entries[{$guideKey}].status must be a string";
+      return false;
+    }
+    if (array_key_exists("distance", $guideEntry) && $guideEntry["distance"] !== null && !is_numeric($guideEntry["distance"])) {
+      $error = "entries[{$guideKey}].distance must be numeric";
+      return false;
+    }
+
+    if (isset($guideEntry["autoSteps"]) && !validate_guide_steps_payload($guideEntry["autoSteps"], "entries[{$guideKey}].autoSteps", $error)) {
+      return false;
+    }
+    if (isset($guideEntry["finalSteps"]) && !validate_guide_steps_payload($guideEntry["finalSteps"], "entries[{$guideKey}].finalSteps", $error)) {
+      return false;
+    }
+
+    if (isset($guideEntry["notes"])) {
+      if (!is_array($guideEntry["notes"])) {
+        $error = "entries[{$guideKey}].notes must be an array";
+        return false;
+      }
+      foreach ($guideEntry["notes"] as $noteIdx => $note) {
+        if (!is_string($note)) {
+          $error = "entries[{$guideKey}].notes[{$noteIdx}] must be a string";
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
 function is_valid_glb_binary(string $raw): bool {
   if (strlen($raw) < 12) return false;
   $hdr = unpack("a4magic/Vversion/Vlength", substr($raw, 0, 12));
@@ -438,7 +573,7 @@ if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
   $action = (string)$_GET["action"];
 
-  if (in_array($action, ["save_routes", "save_roadnet", "set_default_model", "publish_map", "save_overlay", "export_glb"], true)) {
+  if (in_array($action, ["save_routes", "save_roadnet", "save_guides", "save_navigation_bundle", "set_default_model", "publish_map", "save_overlay", "export_glb"], true)) {
     verify_csrf_or_origin();
   }
 
@@ -594,6 +729,168 @@ if (isset($_GET["action"])) {
     exit;
   }
 
+  if ($action === "load_guides") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      echo json_encode([
+        "ok" => true,
+        "exists" => false,
+        "entries" => new stdClass()
+      ], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $path = __DIR__ . "/overlays/guides_" . $safe . ".json";
+    if (!file_exists($path)) {
+      echo json_encode([
+        "ok" => true,
+        "model" => $safe,
+        "exists" => false,
+        "entries" => new stdClass()
+      ], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $raw = file_get_contents($path);
+    $json = json_decode($raw, true);
+    $entries = (is_array($json) && isset($json["entries"]) && is_array($json["entries"])) ? $json["entries"] : new stdClass();
+    $updated = (is_array($json) && isset($json["updated"])) ? $json["updated"] : null;
+
+    echo json_encode([
+      "ok" => true,
+      "model" => $safe,
+      "exists" => true,
+      "updated" => $updated,
+      "entries" => $entries
+    ], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "save_guides") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid name"]);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    if (!validate_guides_payload($data, $payloadError)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => $payloadError ?: "Invalid JSON"], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $overlayDir = __DIR__ . "/overlays";
+    if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
+
+    $path = $overlayDir . "/guides_" . $safe . ".json";
+    $payload = $data;
+    $payload["ok"] = true;
+    $payload["model"] = $safe;
+    $payload["updated"] = time();
+    if (!safe_atomic_write_json($path, $payload)) {
+      json_error_and_exit(500, "Failed to save guides file");
+    }
+    echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "save_navigation_bundle") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => "Invalid name"]);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    $roadsPayload = ["roads" => is_array($data) ? ($data["roads"] ?? null) : null];
+    $routesPayload = ["routes" => is_array($data) ? ($data["routes"] ?? null) : null];
+    $guidesPayload = is_array($data) && isset($data["guides"]) && is_array($data["guides"])
+      ? $data["guides"]
+      : ["entries" => null];
+
+    if (!validate_roadnet_payload($roadsPayload, $payloadError)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => $payloadError ?: "Invalid roadnet payload"], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!validate_routes_payload($routesPayload, $payloadError)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => $payloadError ?: "Invalid routes payload"], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!validate_guides_payload($guidesPayload, $payloadError)) {
+      http_response_code(400);
+      echo json_encode(["ok" => false, "error" => $payloadError ?: "Invalid guides payload"], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $overlayDir = __DIR__ . "/overlays";
+    if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
+
+    $updated = time();
+    $roadnetPath = $overlayDir . "/roadnet_" . $safe . ".json";
+    $routesPath = $overlayDir . "/routes_" . $safe . ".json";
+    $guidesPath = $overlayDir . "/guides_" . $safe . ".json";
+
+    $roadnetBackup = file_exists($roadnetPath) ? file_get_contents($roadnetPath) : null;
+    $routesBackup = file_exists($routesPath) ? file_get_contents($routesPath) : null;
+    $guidesBackup = file_exists($guidesPath) ? file_get_contents($guidesPath) : null;
+
+    $roadnetOut = [
+      "ok" => true,
+      "model" => $safe,
+      "updated" => $updated,
+      "roads" => $roadsPayload["roads"]
+    ];
+    $routesOut = [
+      "ok" => true,
+      "model" => $safe,
+      "updated" => $updated,
+      "routes" => $routesPayload["routes"]
+    ];
+    $guidesOut = $guidesPayload;
+    $guidesOut["ok"] = true;
+    $guidesOut["model"] = $safe;
+    $guidesOut["updated"] = $updated;
+
+    try {
+      if (!safe_atomic_write_json($roadnetPath, $roadnetOut)) {
+        throw new RuntimeException("Failed to save roadnet file");
+      }
+      if (!safe_atomic_write_json($routesPath, $routesOut)) {
+        throw new RuntimeException("Failed to save routes file");
+      }
+      if (!safe_atomic_write_json($guidesPath, $guidesOut)) {
+        throw new RuntimeException("Failed to save guides file");
+      }
+    } catch (Throwable $e) {
+      restore_file_from_backup($roadnetPath, $roadnetBackup);
+      restore_file_from_backup($routesPath, $routesBackup);
+      restore_file_from_backup($guidesPath, $guidesBackup);
+      json_error_and_exit(500, "Failed to save navigation bundle: " . $e->getMessage());
+    }
+
+    echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
+    exit;
+  }
+
   if ($action === "list_models") {
     $defaultModel = $ORIGINAL_MODEL_NAME;
     if (file_exists($DEFAULT_MODEL_PATH)) {
@@ -694,6 +991,8 @@ if (isset($_GET["action"])) {
 
     $routesFile = "routes_" . $file . ".json";
     $routesPath = $overlayDir . "/" . $routesFile;
+    $guidesFile = "guides_" . $file . ".json";
+    $guidesPath = $overlayDir . "/" . $guidesFile;
     $liveBackup = file_exists($LIVE_MAP_PATH) ? file_get_contents($LIVE_MAP_PATH) : null;
     $defaultBackup = file_exists($DEFAULT_MODEL_PATH) ? file_get_contents($DEFAULT_MODEL_PATH) : null;
     $releasesBackup = file_exists($RELEASES_PATH) ? file_get_contents($RELEASES_PATH) : null;
@@ -704,6 +1003,7 @@ if (isset($_GET["action"])) {
       "ok" => true,
       "modelFile" => $file,
       "routesFile" => $routesFile,
+      "guidesFile" => $guidesFile,
       "version" => $version,
       "publishedAt" => $publishedAt
     ];
@@ -717,6 +1017,18 @@ if (isset($_GET["action"])) {
         ];
         if (!safe_atomic_write_json($routesPath, $emptyRoutes)) {
           throw new RuntimeException("Failed to initialize routes file");
+        }
+      }
+
+      if (!file_exists($guidesPath)) {
+        $emptyGuides = [
+          "ok" => true,
+          "model" => $file,
+          "updated" => time(),
+          "entries" => new stdClass()
+        ];
+        if (!safe_atomic_write_json($guidesPath, $emptyGuides)) {
+          throw new RuntimeException("Failed to initialize guides file");
         }
       }
 
@@ -737,6 +1049,7 @@ if (isset($_GET["action"])) {
       array_unshift($history, [
         "file" => $file,
         "routesFile" => $routesFile,
+        "guidesFile" => $guidesFile,
         "version" => $version,
         "publishedAt" => $publishedAt
       ]);
@@ -1107,6 +1420,102 @@ admin_layout_start("Map Editor", "mapeditor");
     display: none;
     pointer-events: none;
   }
+  .me-guide-box {
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    background: #f8fafc;
+    padding: 10px;
+    display: grid;
+    gap: 10px;
+  }
+  .me-guide-meta {
+    display: grid;
+    gap: 4px;
+    font-size: 12px;
+    font-weight: 800;
+    color: #374151;
+  }
+  .me-guide-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 24px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: #e5e7eb;
+    color: #111827;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .me-guide-status[data-state="ok"] {
+    background: #dcfce7;
+    color: #166534;
+  }
+  .me-guide-status[data-state="stale"] {
+    background: #fef3c7;
+    color: #92400e;
+  }
+  .me-guide-status[data-state="missing_route"],
+  .me-guide-status[data-state="orphaned"] {
+    background: #fee2e2;
+    color: #991b1b;
+  }
+  .me-guide-preview,
+  .me-guide-editor {
+    border: 1px solid #dbe3ec;
+    border-radius: 10px;
+    background: #fff;
+    padding: 10px;
+  }
+  .me-guide-preview {
+    max-height: 180px;
+    overflow: auto;
+  }
+  .me-guide-steps {
+    display: grid;
+    gap: 8px;
+  }
+  .me-guide-step {
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    gap: 8px;
+    align-items: start;
+    color: #111827;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.45;
+  }
+  .me-guide-step-num {
+    width: 24px;
+    height: 24px;
+    border-radius: 999px;
+    background: #111827;
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 900;
+  }
+  .me-guide-editor textarea {
+    width: 100%;
+    min-height: 140px;
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.45;
+    resize: vertical;
+    background: #fff;
+  }
+  .me-guide-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
   .me-modal {
     position: absolute;
     inset: 0;
@@ -1148,6 +1557,8 @@ admin_layout_start("Map Editor", "mapeditor");
     color: #6b7280;
     font-weight: 700;
     margin-bottom: 12px;
+    white-space: pre-line;
+    text-align: left;
   }
   .me-modal-actions {
     display: flex;
@@ -1253,6 +1664,38 @@ admin_layout_start("Map Editor", "mapeditor");
 
       <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
 
+      <div class="me-section-title">Text Guides</div>
+      <div class="me-subtext" style="margin-bottom:8px;">
+        Auto-generate turn text from the current road network, then review or override it manually per destination.
+      </div>
+      <div class="me-guide-box">
+        <select id="guide-target-select" style="width:100%;"></select>
+        <div class="me-guide-meta">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <span>Guide Status</span>
+            <span id="guide-status-badge" class="me-guide-status" data-state="ok">OK</span>
+          </div>
+          <div id="guide-status-text" class="me-subtext" style="margin:0;">No destination selected.</div>
+          <div id="guide-route-summary" class="me-subtext" style="margin:0;">Route summary unavailable.</div>
+        </div>
+        <label class="me-subtext" style="font-weight:900; color:#111827;">Auto-generated preview</label>
+        <div id="guide-auto-preview" class="me-guide-preview">
+          <div class="me-subtext">No guide available yet.</div>
+        </div>
+        <div class="me-guide-editor">
+          <div class="me-subtext" style="font-weight:900; color:#111827; margin-bottom:8px;">Manual override</div>
+          <textarea id="guide-manual-text" placeholder="One instruction per line. Example:&#10;Start at the kiosk.&#10;Go straight.&#10;Turn right near Admin Building.&#10;Arrive at AP LRC."></textarea>
+        </div>
+        <div class="me-guide-actions">
+          <button id="guide-use-auto" class="btn" type="button">Use Auto</button>
+          <button id="guide-fill-auto" class="btn" type="button">Copy Auto To Editor</button>
+          <button id="guide-save-manual" class="btn" type="button">Apply Manual Text</button>
+          <button id="guide-clear-manual" class="btn" type="button">Clear Manual</button>
+        </div>
+      </div>
+
+      <hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">
+
       <div class="me-section-title">Assets</div>
       <div id="asset-list" style="display:flex; flex-direction:column; gap:8px;"></div>
 
@@ -1321,6 +1764,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+import { buildGuideKey, buildGuideStepsFromPoints, buildRouteSignature } from "../js/guide-utils.js";
 
 const CSRF_TOKEN = <?= json_encode($MAP_EDITOR_CSRF) ?>;
 const MAP_IMPORT_CSRF_TOKEN = <?= json_encode($MAP_IMPORT_CSRF) ?>;
@@ -1383,6 +1827,16 @@ const baseModelDefaultBtn = document.getElementById("base-model-default");
 const buildingListEl = document.getElementById("building-list");
 const buildingFilterEl = document.getElementById("building-filter");
 const buildingSelectedEl = document.getElementById("building-selected");
+const guideTargetSelectEl = document.getElementById("guide-target-select");
+const guideStatusBadgeEl = document.getElementById("guide-status-badge");
+const guideStatusTextEl = document.getElementById("guide-status-text");
+const guideRouteSummaryEl = document.getElementById("guide-route-summary");
+const guideAutoPreviewEl = document.getElementById("guide-auto-preview");
+const guideManualTextEl = document.getElementById("guide-manual-text");
+const guideUseAutoBtn = document.getElementById("guide-use-auto");
+const guideFillAutoBtn = document.getElementById("guide-fill-auto");
+const guideSaveManualBtn = document.getElementById("guide-save-manual");
+const guideClearManualBtn = document.getElementById("guide-clear-manual");
 
 const toolMove = document.getElementById("tool-move");
 const toolRotate = document.getElementById("tool-rotate");
@@ -1413,6 +1867,7 @@ const specialPointsPanel = document.getElementById("special-points-panel");
 const specialPointsListEl = document.getElementById("special-points-list");
 const routeBannerEl = document.getElementById("route-banner");
 const deleteConfirmEl = document.getElementById("delete-confirm");
+const deleteConfirmTitleEl = document.getElementById("delete-confirm-title");
 const deleteConfirmTextEl = document.getElementById("delete-confirm-text");
 const deleteConfirmYesBtn = document.getElementById("delete-confirm-yes");
 const deleteConfirmNoBtn = document.getElementById("delete-confirm-no");
@@ -1902,6 +2357,332 @@ function hasLiveRoadData() {
   return !!overlayRoot?.children?.some?.(obj => isRoadObject(obj));
 }
 
+function getGuideWorkingEntryForSelection(routes = null) {
+  if (!guideSelectionKey) return null;
+  const working = buildGuideWorkingEntries({
+    routes: routes && typeof routes === "object"
+      ? routes
+      : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes)
+  });
+  return working[guideSelectionKey] || null;
+}
+
+function ensureGuideRawEntryForSelection(entry = null) {
+  const workingEntry = entry || getGuideWorkingEntryForSelection();
+  if (!workingEntry || !workingEntry.key) return null;
+  const rawEntries = getLoadedGuideRawEntries();
+  if (!rawEntries[workingEntry.key]) {
+    rawEntries[workingEntry.key] = normalizeLoadedGuideEntry(workingEntry.key, workingEntry);
+  }
+  rawEntries[workingEntry.key].destinationType = workingEntry.destinationType;
+  rawEntries[workingEntry.key].buildingName = workingEntry.buildingName;
+  rawEntries[workingEntry.key].roomName = workingEntry.roomName;
+  return rawEntries[workingEntry.key];
+}
+
+guideTargetSelectEl?.addEventListener("change", () => {
+  guideSelectionKey = String(guideTargetSelectEl.value || "").trim();
+  renderGuideEditorPanel();
+});
+
+guideManualTextEl?.addEventListener("input", () => {
+  const entry = getGuideWorkingEntryForSelection();
+  const raw = ensureGuideRawEntryForSelection(entry);
+  if (!raw) return;
+  raw.manualText = String(guideManualTextEl.value || "").replace(/\r\n/g, "\n");
+  scheduleDirtyRefresh();
+});
+
+guideUseAutoBtn?.addEventListener("click", () => {
+  const raw = ensureGuideRawEntryForSelection();
+  if (!raw) return;
+  raw.manualText = "";
+  raw.sourceRouteSignature = "";
+  if (guideManualTextEl) guideManualTextEl.value = "";
+  renderGuideEditorPanel();
+  scheduleDirtyRefresh();
+  setStatus("Guide reset to auto-generated text");
+});
+
+guideFillAutoBtn?.addEventListener("click", () => {
+  const entry = getGuideWorkingEntryForSelection();
+  const raw = ensureGuideRawEntryForSelection(entry);
+  if (!entry || !raw) return;
+  const nextText = guideStepsToText(entry.autoSteps);
+  raw.manualText = nextText;
+  raw.sourceRouteSignature = String(entry.routeSignature || "");
+  if (guideManualTextEl) guideManualTextEl.value = nextText;
+  renderGuideEditorPanel({ preserveEditorText: true });
+  scheduleDirtyRefresh();
+  setStatus("Copied auto guide text into the manual editor");
+});
+
+guideSaveManualBtn?.addEventListener("click", () => {
+  const entry = getGuideWorkingEntryForSelection();
+  const raw = ensureGuideRawEntryForSelection(entry);
+  if (!entry || !raw) return;
+  raw.manualText = String(guideManualTextEl?.value || "").replace(/\r\n/g, "\n");
+  raw.sourceRouteSignature = String(entry.routeSignature || "");
+  renderGuideEditorPanel();
+  scheduleDirtyRefresh();
+  setStatus(raw.manualText.trim() ? "Manual guide applied" : "Guide reset to auto-generated text");
+});
+
+guideClearManualBtn?.addEventListener("click", () => {
+  const raw = ensureGuideRawEntryForSelection();
+  if (!raw) return;
+  raw.manualText = "";
+  raw.sourceRouteSignature = "";
+  if (guideManualTextEl) guideManualTextEl.value = "";
+  renderGuideEditorPanel();
+  scheduleDirtyRefresh();
+  setStatus("Manual guide text cleared");
+});
+
+function normalizeObjectSet(value) {
+  if (value instanceof Set) return value;
+  if (Array.isArray(value)) return new Set(value.filter(Boolean));
+  return value ? new Set([value]) : new Set();
+}
+
+function getRoadObjects(opts = {}) {
+  const excludeObjects = normalizeObjectSet(opts.excludeObjects);
+  const roads = [];
+  for (const obj of (overlayRoot?.children || [])) {
+    if (!isRoadObject(obj)) continue;
+    if (excludeObjects.has(obj)) continue;
+    roads.push(obj);
+  }
+  return roads;
+}
+
+function sortedUniqueStrings(values) {
+  return Array.from(new Set((Array.isArray(values) ? values : [])
+    .map(v => String(v || "").trim())
+    .filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function formatNameList(names, limit = 5) {
+  const items = sortedUniqueStrings(names);
+  if (!items.length) return "";
+  if (items.length <= limit) return items.join(", ");
+  return `${items.slice(0, limit).join(", ")}, +${items.length - limit} more`;
+}
+
+function pluralize(count, singular, plural = `${singular}s`) {
+  return Number(count) === 1 ? singular : plural;
+}
+
+function getSceneBuildingNameMap(opts = {}) {
+  const names = new Map();
+  const excludeObjects = normalizeObjectSet(opts.excludeObjects);
+  if (!campusRoot) return names;
+
+  campusRoot.traverse((obj) => {
+    if (!obj) return;
+    if (obj.userData?.isPlaced) return;
+    if (isGroundLikeName(obj.name)) return;
+    const root = getTopLevelNamedAncestor(obj);
+    if (!root || !root.name) return;
+    if (excludeObjects.has(obj) || excludeObjects.has(root)) return;
+    const key = normalizeBuildingName(root.name);
+    if (!key || names.has(key)) return;
+    names.set(key, root.name);
+  });
+
+  return names;
+}
+
+function collectRouteNameMap(routes) {
+  const out = new Map();
+  if (!routes || typeof routes !== "object") return out;
+
+  for (const [fallbackKey, entry] of Object.entries(routes)) {
+    const raw = String(entry?.name || fallbackKey || "").trim();
+    const key = routeKey(raw || fallbackKey);
+    if (!key || out.has(key)) continue;
+    out.set(key, raw || fallbackKey);
+  }
+
+  return out;
+}
+
+function diffRouteNameMaps(beforeMap, afterMap) {
+  const lost = [];
+  for (const [key, name] of (beforeMap || new Map()).entries()) {
+    if (!afterMap?.has?.(key)) lost.push(name);
+  }
+  return sortedUniqueStrings(lost);
+}
+
+function getBaseObjectBuildingNames(obj) {
+  if (!obj || obj.userData?.isPlaced) return [];
+  const names = [];
+  const rootLabel = normalizeExportBuildingName(getBuildingLabelForObject(obj) || obj.name || "");
+  if (rootLabel) names.push(rootLabel);
+  return sortedUniqueStrings(names);
+}
+
+function buildRoutingDiagnostics(opts = {}) {
+  const routes = (opts.routes && typeof opts.routes === "object") ? opts.routes : computeSavedRoutes(opts);
+  const routeMap = collectRouteNameMap(routes);
+  const entranceNames = getEntranceBuildingNames(opts);
+  const kioskPoints = findKioskStartPoints(opts);
+  const entranceMap = new Map();
+  for (const name of entranceNames) {
+    const key = routeKey(name);
+    if (key && !entranceMap.has(key)) entranceMap.set(key, name);
+  }
+
+  const sceneBuildingMap = getSceneBuildingNameMap(opts);
+  const orphanedNames = [];
+  const unreachableNames = [];
+
+  for (const [key, name] of entranceMap.entries()) {
+    if (!sceneBuildingMap.has(key)) orphanedNames.push(name);
+    if (!routeMap.has(key)) unreachableNames.push(name);
+  }
+
+  return {
+    routes,
+    routeMap,
+    routeNames: Array.from(routeMap.values()),
+    routeCount: routeMap.size,
+    entranceNames: Array.from(entranceMap.values()),
+    entranceMap,
+    anchorCount: entranceMap.size,
+    orphanedNames: sortedUniqueStrings(orphanedNames),
+    unreachableNames: sortedUniqueStrings(unreachableNames),
+    hasKiosk: kioskPoints.length > 0,
+    kioskCount: kioskPoints.length,
+    roadCount: getRoadObjects(opts).length
+  };
+}
+
+function buildRoutingPersistReport(actionLabel, opts = {}) {
+  const diagnostics = buildRoutingDiagnostics(opts);
+  const currentRouteMap = diagnostics.routeMap;
+  const savedRouteMap = collectRouteNameMap(savedRoutes);
+  const orphanedKeySet = new Set(diagnostics.orphanedNames.map(name => routeKey(name)));
+  const unreachableNames = diagnostics.unreachableNames.filter(name => !orphanedKeySet.has(routeKey(name)));
+  const lostFromSavedNames = diffRouteNameMaps(savedRouteMap, currentRouteMap);
+  const lines = [];
+  let severity = "ok";
+
+  const bumpSeverity = (next) => {
+    const rank = next === "critical" ? 2 : (next === "warning" ? 1 : 0);
+    const current = severity === "critical" ? 2 : (severity === "warning" ? 1 : 0);
+    if (rank > current) severity = next;
+  };
+
+  if (diagnostics.anchorCount > 0 && !diagnostics.hasKiosk) {
+    bumpSeverity("critical");
+    lines.push(`No kiosk start is linked to the road network. ${actionLabel} would leave ${diagnostics.anchorCount} linked ${pluralize(diagnostics.anchorCount, "destination")} without generated routes.`);
+  }
+
+  if (diagnostics.orphanedNames.length) {
+    bumpSeverity("critical");
+    lines.push(`Road links point to missing ${pluralize(diagnostics.orphanedNames.length, "building")}: ${formatNameList(diagnostics.orphanedNames)}.`);
+  }
+
+  if (unreachableNames.length) {
+    bumpSeverity("warning");
+    lines.push(`Unreachable ${pluralize(unreachableNames.length, "destination")}: ${formatNameList(unreachableNames)}.`);
+  }
+
+  if (lostFromSavedNames.length) {
+    bumpSeverity("warning");
+    lines.push(`Compared with the currently saved routes, ${pluralize(lostFromSavedNames.length, "destination")} would be removed: ${formatNameList(lostFromSavedNames)}.`);
+  }
+
+  if (lines.length && (diagnostics.orphanedNames.length || unreachableNames.length || lostFromSavedNames.length)) {
+    lines.push("Any generated text guides for the affected destinations would also need regeneration.");
+  }
+
+  return {
+    diagnostics,
+    severity,
+    lines,
+    lostFromSavedNames,
+    hasIssues: lines.length > 0
+  };
+}
+
+function reviewRoutingPersist(actionLabel, opts = {}) {
+  const mode = opts.mode === "strict" ? "strict" : "warn";
+  const report = buildRoutingPersistReport(actionLabel, opts);
+  if (!report.hasIssues) return { proceed: true, report };
+
+  const summary = [
+    `${actionLabel} routing check`,
+    "",
+    ...report.lines
+  ].join("\n");
+
+  if (mode === "strict" && report.severity === "critical") {
+    return { proceed: false, blocked: true, message: summary, report };
+  }
+
+  const ok = confirm(`${summary}\n\nContinue ${actionLabel.toLowerCase()} anyway?`);
+  return {
+    proceed: !!ok,
+    blocked: false,
+    message: summary,
+    report
+  };
+}
+
+function analyzeDeleteImpact(obj) {
+  const impact = {
+    severity: "normal",
+    lines: []
+  };
+
+  if (!obj) return impact;
+
+  if (isRoadObject(obj)) {
+    const before = buildRoutingDiagnostics();
+    const after = buildRoutingDiagnostics({ excludeObjects: [obj] });
+    const lostDestinations = diffRouteNameMaps(before.routeMap, after.routeMap);
+    const kioskRemoved = before.hasKiosk && !after.hasKiosk;
+
+    if (kioskRemoved) {
+      impact.severity = "critical";
+      impact.lines.push("This road carries the kiosk start. Deleting it now would remove the navigation starting point.");
+    }
+    if (lostDestinations.length) {
+      impact.severity = impact.severity === "critical" ? "critical" : "warning";
+      impact.lines.push(`Generated routes would be removed for: ${formatNameList(lostDestinations)}.`);
+    }
+    if (!kioskRemoved && !lostDestinations.length && before.routeCount !== after.routeCount) {
+      impact.severity = "warning";
+      impact.lines.push(`Route count would change from ${before.routeCount} to ${after.routeCount}.`);
+    }
+    if (lostDestinations.length) {
+      impact.lines.push("Any generated text guides for those destinations would also become invalid until routes are rebuilt.");
+    }
+    return impact;
+  }
+
+  if (!obj.userData?.isPlaced) {
+    const deletedBuildingNames = getBaseObjectBuildingNames(obj);
+    if (!deletedBuildingNames.length) return impact;
+
+    const deletedKeys = new Set(deletedBuildingNames.map(name => routeKey(name)));
+    const linkedRouteNames = getEntranceBuildingNames().filter(name => deletedKeys.has(routeKey(name)));
+
+    if (linkedRouteNames.length) {
+      impact.severity = "warning";
+      impact.lines.push(`This building still has linked road ${pluralize(linkedRouteNames.length, "anchor")}: ${formatNameList(linkedRouteNames)}.`);
+      impact.lines.push("Deleting the base object now would leave orphaned routing data until you remove or reassign those linked road points.");
+      impact.lines.push("Any generated text guides for those destinations would also become invalid.");
+    }
+  }
+
+  return impact;
+}
+
 function drawRouteFromWorldPoints(pointsWorld) {
   clearRouteLine();
   if (!Array.isArray(pointsWorld) || pointsWorld.length < 2) return false;
@@ -1924,12 +2705,29 @@ function showDeleteConfirm(obj) {
   if (!deleteConfirmEl) return false;
   const label = obj?.userData?.nameLabel || obj?.name || "item";
   const isBaseObject = !obj?.userData?.isPlaced;
-  if (deleteConfirmTextEl) {
-    if (isBaseObject) {
-      deleteConfirmTextEl.textContent = `Delete base object "${label}"? You can Undo/Redo this. Export GLB to persist base edits.`;
+  const impact = analyzeDeleteImpact(obj);
+  if (deleteConfirmTitleEl) {
+    if (impact.severity === "critical") {
+      deleteConfirmTitleEl.textContent = "Delete item with routing impact?";
+    } else if (impact.severity === "warning") {
+      deleteConfirmTitleEl.textContent = "Delete item with linked routing data?";
     } else {
-      deleteConfirmTextEl.textContent = `Delete "${label}"?`;
+      deleteConfirmTitleEl.textContent = "Delete item?";
     }
+  }
+  if (deleteConfirmTextEl) {
+    const lines = [];
+    if (isBaseObject) {
+      lines.push(`Delete base object "${label}"?`);
+      lines.push("You can Undo/Redo this. Export GLB to persist base edits.");
+    } else {
+      lines.push(`Delete "${label}"?`);
+    }
+    if (impact.lines.length) {
+      lines.push("");
+      lines.push(...impact.lines);
+    }
+    deleteConfirmTextEl.textContent = lines.join("\n");
   }
   pendingDeleteObj = obj || null;
   deleteConfirmEl.classList.add("active");
@@ -2167,7 +2965,501 @@ async function syncModelEntitiesToDatabase(modelFile, sceneRoot = campusRoot) {
   return data.summary || {};
 }
 
-function buildRoadGraph() {
+function normalizeLoadedGuideEntry(rawKey, rawEntry = {}) {
+  const destinationType = String(
+    rawEntry?.destinationType ||
+    rawEntry?.type ||
+    (String(rawKey || "").startsWith("room::") ? "room" : "building")
+  ).trim() || "building";
+  const buildingName = String(
+    rawEntry?.buildingName ||
+    rawEntry?.name ||
+    rawEntry?.routeName ||
+    rawEntry?.destinationName ||
+    ""
+  ).trim();
+  const roomName = String(rawEntry?.roomName || "").trim();
+  const guideMode = String(rawEntry?.guideMode || "").trim().toLowerCase();
+  let manualText = String(rawEntry?.manualText || "").replace(/\r\n/g, "\n").trim();
+  if (!manualText && (guideMode === "manual" || guideMode === "mixed") && Array.isArray(rawEntry?.finalSteps)) {
+    manualText = guideStepsToText(rawEntry.finalSteps);
+  }
+  return {
+    key: String(rawEntry?.key || rawKey || buildGuideKey(destinationType, { buildingName, roomName })),
+    destinationType,
+    buildingName,
+    roomName,
+    manualText,
+    sourceRouteSignature: String(rawEntry?.sourceRouteSignature || "").trim()
+  };
+}
+
+function setLoadedGuidesPayload(payload = {}) {
+  const rawEntries = (payload && typeof payload.entries === "object" && payload.entries) ? payload.entries : {};
+  const normalizedEntries = {};
+  for (const [rawKey, rawEntry] of Object.entries(rawEntries)) {
+    const entry = normalizeLoadedGuideEntry(rawKey, rawEntry);
+    if (!entry.key) continue;
+    normalizedEntries[entry.key] = entry;
+  }
+  loadedGuidePayload = {
+    model: String(payload?.model || currentModelName || "").trim(),
+    entries: normalizedEntries
+  };
+}
+
+function getLoadedGuideRawEntries() {
+  return (loadedGuidePayload && typeof loadedGuidePayload.entries === "object" && loadedGuidePayload.entries)
+    ? loadedGuidePayload.entries
+    : {};
+}
+
+function buildGuideRawSnapshotValue() {
+  const entries = Object.values(getLoadedGuideRawEntries())
+    .map((entry) => ({
+      key: String(entry?.key || "").trim(),
+      destinationType: String(entry?.destinationType || "building").trim() || "building",
+      buildingName: String(entry?.buildingName || "").trim(),
+      roomName: String(entry?.roomName || "").trim(),
+      manualText: String(entry?.manualText || "").replace(/\r\n/g, "\n").trim(),
+      sourceRouteSignature: String(entry?.sourceRouteSignature || "").trim()
+    }))
+    .filter((entry) => entry.key && (entry.manualText || entry.sourceRouteSignature))
+    .sort((a, b) => a.key.localeCompare(b.key));
+  return {
+    model: String(currentModelName || "").trim(),
+    entries
+  };
+}
+
+function normalizeGuideLineText(line) {
+  let text = String(line || "").trim();
+  if (!text) return "";
+  text = text.replace(/^(?:[-*]\s+|\d+[.)]\s+)/, "").trim();
+  if (!text) return "";
+  if (!/[.!?]$/.test(text)) text += ".";
+  return text;
+}
+
+function parseManualGuideText(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map(normalizeGuideLineText)
+    .filter(Boolean)
+    .map((line) => ({ kind: "manual", text: line }));
+}
+
+function guideStepsToText(steps) {
+  return (Array.isArray(steps) ? steps : [])
+    .map((step) => String(step?.text || "").trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatGuideDistance(distance) {
+  const safe = Number(distance);
+  if (!Number.isFinite(safe) || safe <= 0) return "Distance unavailable";
+  return `${Math.round(safe)} units`;
+}
+
+function getGuideRouteEntry(routes, buildingName) {
+  const key = routeKey(buildingName);
+  if (routes?.[key]) return routes[key];
+  if (routes?.[buildingName]) return routes[buildingName];
+  for (const [rawKey, rawEntry] of Object.entries(routes || {})) {
+    const name = String(rawEntry?.name || rawKey || "").trim();
+    if (routeKey(name) === key) return rawEntry;
+  }
+  return null;
+}
+
+function buildGuideDestinationCatalog(routes = savedRoutes) {
+  const byBuilding = new Map();
+  const extraction = buildExportEntityExtraction(campusRoot);
+  for (const building of (Array.isArray(extraction) ? extraction : [])) {
+    const buildingName = String(building?.name || "").trim();
+    if (!buildingName) continue;
+    const key = routeKey(buildingName);
+    if (!key) continue;
+    if (!byBuilding.has(key)) {
+      byBuilding.set(key, {
+        buildingName,
+        classification: String(building?.classification || "building").trim() || "building",
+        rooms: []
+      });
+    }
+    const entry = byBuilding.get(key);
+    const roomNames = (Array.isArray(building?.rooms) ? building.rooms : [])
+      .map((room) => String(room?.name || "").trim())
+      .filter(Boolean);
+    entry.rooms = sortedUniqueStrings([...entry.rooms, ...roomNames]);
+  }
+
+  for (const routeName of Array.from(collectRouteNameMap(routes).values())) {
+    const buildingName = String(routeName || "").trim();
+    if (!buildingName) continue;
+    const key = routeKey(buildingName);
+    if (!key) continue;
+    if (!byBuilding.has(key)) {
+      byBuilding.set(key, {
+        buildingName,
+        classification: "building",
+        rooms: []
+      });
+    }
+  }
+
+  const destinations = [];
+  const buildings = Array.from(byBuilding.values()).sort((a, b) => a.buildingName.localeCompare(b.buildingName));
+  for (const building of buildings) {
+    const destinationType = building.classification === "unclassified" ? "site" : "building";
+    destinations.push({
+      destinationType,
+      buildingName: building.buildingName,
+      roomName: "",
+      destinationName: building.buildingName,
+      usesBuildingRoute: false
+    });
+    for (const roomName of sortedUniqueStrings(building.rooms)) {
+      destinations.push({
+        destinationType: "room",
+        buildingName: building.buildingName,
+        roomName,
+        destinationName: `${building.buildingName} / ${roomName}`,
+        usesBuildingRoute: true
+      });
+    }
+  }
+
+  return destinations;
+}
+
+function buildGuideLandmarks() {
+  const landmarks = [];
+  const seenBuildings = new Set();
+  if (campusRoot) {
+    campusRoot.traverse((obj) => {
+      if (!obj) return;
+      const root = getTopLevelNamedAncestorForScene(obj, campusRoot);
+      if (!root || !root.name) return;
+      const buildingName = normalizeExportBuildingName(root.name);
+      if (!buildingName || seenBuildings.has(buildingName)) return;
+      seenBuildings.add(buildingName);
+      const box = new THREE.Box3().setFromObject(root);
+      if (box.isEmpty()) return;
+      const center = box.getCenter(new THREE.Vector3());
+      landmarks.push({
+        type: "building",
+        name: buildingName,
+        x: center.x,
+        y: center.y,
+        z: center.z
+      });
+    });
+  }
+
+  for (const roadObj of getRoadObjects()) {
+    ensureRoadPointMetaArrays(roadObj);
+    const points = Array.isArray(roadObj.userData?.road?.points) ? roadObj.userData.road.points : [];
+    const metaArr = Array.isArray(roadObj.userData?.road?.pointMeta) ? roadObj.userData.road.pointMeta : [];
+    for (let i = 0; i < metaArr.length; i++) {
+      const meta = metaArr[i];
+      const label = String(meta?.label || "").trim();
+      if (!label || isKioskMeta(meta)) continue;
+      const point = Array.isArray(points[i]) ? vec3FromArray(points[i]) : null;
+      if (!point) continue;
+      const worldPoint = roadObj.localToWorld(point.clone());
+      landmarks.push({
+        type: "landmark",
+        name: label,
+        x: worldPoint.x,
+        y: worldPoint.y,
+        z: worldPoint.z
+      });
+    }
+  }
+
+  return landmarks;
+}
+
+function buildGuideStatusText(entry) {
+  if (!entry) return "No destination selected.";
+  if (entry.status === "orphaned") {
+    return "This saved guide no longer matches a destination in the current model.";
+  }
+  if (entry.status === "missing_route") {
+    return "This destination exists, but it does not have a generated route yet.";
+  }
+  if (entry.status === "stale") {
+    return "The manual text is still present, but the route changed. Review it before publishing.";
+  }
+  if (entry.guideMode === "manual") {
+    return "Using manual guide text for this destination.";
+  }
+  return "Using the current auto-generated guide text.";
+}
+
+function buildGuideRouteSummary(entry) {
+  if (!entry) return "Route summary unavailable.";
+  const source = entry.usesBuildingRoute && entry.roomName
+    ? `Room fallback via ${entry.buildingName}`
+    : `Route source: ${entry.routeName || entry.buildingName || "Unavailable"}`;
+  return `${source} • ${formatGuideDistance(entry.distance)}`;
+}
+
+function buildGuideWorkingEntries(opts = {}) {
+  const routes = (opts.routes && typeof opts.routes === "object")
+    ? opts.routes
+    : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+  const rawEntries = getLoadedGuideRawEntries();
+  const destinations = buildGuideDestinationCatalog(routes);
+  const landmarks = buildGuideLandmarks();
+  const working = {};
+  const seenKeys = new Set();
+
+  for (const destination of destinations) {
+    const key = buildGuideKey(destination.destinationType, {
+      buildingName: destination.buildingName,
+      roomName: destination.roomName
+    });
+    const raw = normalizeLoadedGuideEntry(key, rawEntries[key] || destination);
+    const routeEntry = getGuideRouteEntry(routes, destination.buildingName);
+    const routeSignature = routeEntry ? buildRouteSignature(routeEntry.points, routeEntry.distance) : "";
+    const autoSteps = routeEntry
+      ? buildGuideStepsFromPoints(routeEntry.points, {
+          destinationName: destination.roomName || destination.buildingName,
+          arrivalText: destination.roomName
+            ? `Arrive at ${destination.buildingName}. Proceed to ${destination.roomName}.`
+            : `Arrive at ${destination.buildingName}.`,
+          landmarks
+        })
+      : [];
+    const manualText = String(raw.manualText || "").replace(/\r\n/g, "\n").trim();
+    const finalSteps = manualText ? parseManualGuideText(manualText) : autoSteps;
+    const isStale = !!manualText && !!raw.sourceRouteSignature && !!routeSignature && raw.sourceRouteSignature !== routeSignature;
+    const notes = [];
+    if (destination.roomName) notes.push("Room guidance currently follows the parent building route.");
+    if (!routeEntry) notes.push("No route is currently available for this destination.");
+    if (isStale) notes.push("Manual text should be reviewed because the route changed.");
+
+    working[key] = {
+      key,
+      destinationType: destination.destinationType,
+      buildingName: destination.buildingName,
+      roomName: destination.roomName,
+      destinationName: destination.destinationName,
+      routeName: String(routeEntry?.name || destination.buildingName || "").trim(),
+      routeSignature,
+      sourceRouteSignature: String(raw.sourceRouteSignature || "").trim(),
+      distance: routeEntry && Number.isFinite(Number(routeEntry.distance)) ? Number(routeEntry.distance) : null,
+      autoSteps,
+      finalSteps,
+      manualText,
+      guideMode: manualText ? "manual" : "auto",
+      status: routeEntry ? (isStale ? "stale" : "ok") : "missing_route",
+      routeAvailable: !!routeEntry,
+      usesBuildingRoute: !!destination.usesBuildingRoute,
+      notes
+    };
+    seenKeys.add(key);
+  }
+
+  for (const [rawKey, rawValue] of Object.entries(rawEntries)) {
+    if (seenKeys.has(rawKey)) continue;
+    const raw = normalizeLoadedGuideEntry(rawKey, rawValue);
+    const manualText = String(raw.manualText || "").replace(/\r\n/g, "\n").trim();
+    working[rawKey] = {
+      key: rawKey,
+      destinationType: raw.destinationType,
+      buildingName: raw.buildingName,
+      roomName: raw.roomName,
+      destinationName: raw.roomName ? `${raw.buildingName} / ${raw.roomName}` : raw.buildingName,
+      routeName: raw.buildingName,
+      routeSignature: "",
+      sourceRouteSignature: String(raw.sourceRouteSignature || "").trim(),
+      distance: null,
+      autoSteps: [],
+      finalSteps: manualText ? parseManualGuideText(manualText) : [],
+      manualText,
+      guideMode: manualText ? "manual" : "auto",
+      status: "orphaned",
+      routeAvailable: false,
+      usesBuildingRoute: raw.destinationType === "room",
+      notes: ["This guide no longer matches a destination in the current model."]
+    };
+  }
+
+  return working;
+}
+
+function sortGuideEntries(entries) {
+  return (Array.isArray(entries) ? entries : []).slice().sort((a, b) => {
+    const rank = (entry) => entry?.destinationType === "room" ? 1 : 0;
+    const rankDiff = rank(a) - rank(b);
+    if (rankDiff) return rankDiff;
+    const buildingDiff = String(a?.buildingName || "").localeCompare(String(b?.buildingName || ""));
+    if (buildingDiff) return buildingDiff;
+    return String(a?.roomName || "").localeCompare(String(b?.roomName || ""));
+  });
+}
+
+function renderGuideSteps(container, steps, emptyText) {
+  if (!container) return;
+  container.replaceChildren();
+  const list = Array.isArray(steps) ? steps.filter((step) => String(step?.text || "").trim()) : [];
+  if (!list.length) {
+    const empty = document.createElement("div");
+    empty.className = "me-subtext";
+    empty.textContent = emptyText;
+    container.appendChild(empty);
+    return;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "me-guide-steps";
+  list.forEach((step, index) => {
+    const row = document.createElement("div");
+    row.className = "me-guide-step";
+
+    const num = document.createElement("div");
+    num.className = "me-guide-step-num";
+    num.textContent = String(index + 1);
+
+    const text = document.createElement("div");
+    text.textContent = String(step?.text || "").trim();
+
+    row.appendChild(num);
+    row.appendChild(text);
+    wrap.appendChild(row);
+  });
+  container.appendChild(wrap);
+}
+
+function syncGuideSelection(entries) {
+  const entryMap = new Map((Array.isArray(entries) ? entries : []).map((entry) => [entry.key, entry]));
+  if (guideSelectionKey && entryMap.has(guideSelectionKey)) return;
+
+  let preferred = "";
+  if (selected && !selected.userData?.isPlaced) {
+    const selectedName = normalizeExportBuildingName(getBuildingLabelForObject(selected) || selected.name || "");
+    if (selectedName) {
+      preferred = buildGuideKey("building", { buildingName: selectedName });
+    }
+  }
+  if (preferred && entryMap.has(preferred)) {
+    guideSelectionKey = preferred;
+    return;
+  }
+
+  guideSelectionKey = entries.length ? entries[0].key : "";
+}
+
+function renderGuideEditorPanel(opts = {}) {
+  const routes = (opts.routes && typeof opts.routes === "object")
+    ? opts.routes
+    : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+  const entriesMap = buildGuideWorkingEntries({ routes });
+  const entries = sortGuideEntries(Object.values(entriesMap));
+  syncGuideSelection(entries);
+
+  if (guideTargetSelectEl) {
+    const previousValue = guideSelectionKey;
+    guideTargetSelectEl.replaceChildren();
+    if (!entries.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No guide destinations yet";
+      guideTargetSelectEl.appendChild(opt);
+      guideTargetSelectEl.disabled = true;
+    } else {
+      guideTargetSelectEl.disabled = false;
+      entries.forEach((entry) => {
+        const opt = document.createElement("option");
+        opt.value = entry.key;
+        const prefix = entry.destinationType === "room"
+          ? "Room"
+          : entry.destinationType === "site"
+            ? "Site"
+            : "Building";
+        const label = entry.roomName
+          ? `${entry.buildingName} / ${entry.roomName}`
+          : entry.buildingName;
+        const suffix = entry.status === "stale"
+          ? " • stale"
+          : entry.status === "missing_route"
+            ? " • no route"
+            : entry.status === "orphaned"
+              ? " • orphaned"
+              : "";
+        opt.textContent = `${prefix}: ${label}${suffix}`;
+        guideTargetSelectEl.appendChild(opt);
+      });
+    }
+    guideTargetSelectEl.value = entriesMap[previousValue] ? previousValue : guideSelectionKey;
+  }
+
+  const entry = guideSelectionKey ? entriesMap[guideSelectionKey] : null;
+
+  if (guideStatusBadgeEl) {
+    const state = entry?.status || "ok";
+    guideStatusBadgeEl.dataset.state = state;
+    guideStatusBadgeEl.textContent = state.replace(/_/g, " ");
+  }
+  if (guideStatusTextEl) {
+    guideStatusTextEl.textContent = buildGuideStatusText(entry);
+  }
+  if (guideRouteSummaryEl) {
+    guideRouteSummaryEl.textContent = buildGuideRouteSummary(entry);
+  }
+  renderGuideSteps(guideAutoPreviewEl, entry?.autoSteps || [], "No auto-generated guide available yet.");
+
+  if (guideManualTextEl && !opts.preserveEditorText) {
+    guideManualTextEl.value = entry?.manualText || "";
+    guideManualTextEl.disabled = !entry;
+  }
+  if (guideUseAutoBtn) guideUseAutoBtn.disabled = !entry || !entry.manualText;
+  if (guideFillAutoBtn) guideFillAutoBtn.disabled = !entry || !(entry.autoSteps || []).length;
+  if (guideSaveManualBtn) guideSaveManualBtn.disabled = !entry;
+  if (guideClearManualBtn) guideClearManualBtn.disabled = !entry || !String(entry.manualText || "").trim();
+}
+
+function buildGuidesPayloadForModel(modelName, opts = {}) {
+  const routes = (opts.routes && typeof opts.routes === "object")
+    ? opts.routes
+    : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+  const workingEntries = buildGuideWorkingEntries({ routes });
+  const payloadEntries = {};
+
+  for (const entry of sortGuideEntries(Object.values(workingEntries))) {
+    const manualText = String(entry.manualText || "").replace(/\r\n/g, "\n").trim();
+    const finalSteps = manualText ? parseManualGuideText(manualText) : (Array.isArray(entry.autoSteps) ? entry.autoSteps : []);
+    payloadEntries[entry.key] = {
+      key: entry.key,
+      destinationType: entry.destinationType,
+      buildingName: entry.buildingName,
+      roomName: entry.roomName,
+      destinationName: entry.destinationName,
+      routeName: entry.routeName,
+      distance: entry.distance,
+      routeSignature: entry.routeSignature,
+      sourceRouteSignature: manualText ? entry.routeSignature : "",
+      guideMode: manualText ? "manual" : "auto",
+      status: entry.status,
+      usesBuildingRoute: !!entry.usesBuildingRoute,
+      manualText,
+      notes: Array.isArray(entry.notes) ? entry.notes : [],
+      autoSteps: Array.isArray(entry.autoSteps) ? entry.autoSteps : [],
+      finalSteps
+    };
+  }
+
+  return {
+    generatedAt: Date.now(),
+    entries: payloadEntries
+  };
+}
+
+function buildRoadGraph(opts = {}) {
   const nodes = new Map(); // graphNodeId -> Vector3 (world)
   const edges = new Map(); // graphNodeId -> [{ to, w }]
   const idAliases = new Map(); // raw pointId -> graphNodeId
@@ -2328,8 +3620,7 @@ function buildRoadGraph() {
   };
 
   const segments = [];
-  for (const obj of (overlayRoot?.children || [])) {
-    if (!isRoadObject(obj)) continue;
+  for (const obj of getRoadObjects(opts)) {
     ensureRoadPointMetaArrays(obj);
     const ptsLocal = getRoadLocalPoints(obj);
     const ids = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
@@ -2457,10 +3748,9 @@ function resolveCandidateNodeIds(graph, candidates) {
   return Array.from(ids);
 }
 
-function findKioskStartPoints() {
+function findKioskStartPoints(opts = {}) {
   const points = [];
-  for (const obj of (overlayRoot?.children || [])) {
-    if (!isRoadObject(obj)) continue;
+  for (const obj of getRoadObjects(opts)) {
     ensureRoadPointMetaArrays(obj);
     const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
     const idArr = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
@@ -2486,13 +3776,12 @@ function findKioskStartPointId() {
   return points[0]?.id || null;
 }
 
-function findBuildingEntrancePoints(buildingName) {
+function findBuildingEntrancePoints(buildingName, opts = {}) {
   const target = normalizeBuildingName(buildingName);
   if (!target) return [];
   const points = [];
 
-  for (const obj of (overlayRoot?.children || [])) {
-    if (!isRoadObject(obj)) continue;
+  for (const obj of getRoadObjects(opts)) {
     ensureRoadPointMetaArrays(obj);
     const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
     const idArr = Array.isArray(obj.userData?.road?.pointIds) ? obj.userData.road.pointIds : [];
@@ -2522,10 +3811,9 @@ function findBuildingEntrancePointIds(buildingName) {
   return Array.from(ids);
 }
 
-function getEntranceBuildingNames() {
+function getEntranceBuildingNames(opts = {}) {
   const names = new Map(); // normalized -> original
-  for (const obj of (overlayRoot?.children || [])) {
-    if (!isRoadObject(obj)) continue;
+  for (const obj of getRoadObjects(opts)) {
     ensureRoadPointMetaArrays(obj);
     const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
     for (const meta of metaArr) {
@@ -2539,10 +3827,10 @@ function getEntranceBuildingNames() {
   return Array.from(names.values());
 }
 
-function computeSavedRoutes() {
-  const graph = buildRoadGraph();
+function computeSavedRoutes(opts = {}) {
+  const graph = buildRoadGraph(opts);
   const { nodes, edges } = graph;
-  const kioskPoints = findKioskStartPoints();
+  const kioskPoints = findKioskStartPoints(opts);
   const kioskNodeIds = resolveCandidateNodeIds(graph, kioskPoints);
   if (!kioskNodeIds.length) return {};
 
@@ -2552,11 +3840,11 @@ function computeSavedRoutes() {
   });
 
   const routes = {};
-  const buildingNames = getEntranceBuildingNames();
+  const buildingNames = getEntranceBuildingNames(opts);
 
   for (const name of buildingNames) {
     const key = routeKey(name);
-    const targetPoints = findBuildingEntrancePoints(name);
+    const targetPoints = findBuildingEntrancePoints(name, opts);
     const targetNodeIds = resolveCandidateNodeIds(graph, targetPoints);
     if (!targetNodeIds.length) continue;
 
@@ -2607,6 +3895,7 @@ async function loadRoutesForModel(modelName) {
   } catch (_) {
     setSavedRoutes({});
   }
+  renderGuideEditorPanel();
 }
 
 async function saveRoutesForModel(modelName, routes) {
@@ -2674,23 +3963,63 @@ async function saveRoadnetForModel(modelName, roads) {
   }
 }
 
+async function loadGuidesForModel(modelName) {
+  if (!modelName) {
+    setLoadedGuidesPayload({ model: "", entries: {} });
+    renderGuideEditorPanel();
+    return;
+  }
+  try {
+    const res = await apiFetch(`mapEditor.php?action=load_guides&name=${encodeURIComponent(modelName)}`);
+    const data = await res.json();
+    setLoadedGuidesPayload({
+      model: modelName,
+      entries: (data && typeof data.entries === "object") ? data.entries : {}
+    });
+  } catch (_) {
+    setLoadedGuidesPayload({ model: modelName, entries: {} });
+  }
+  renderGuideEditorPanel();
+}
+
+async function saveNavigationBundleForModel(modelName, payload) {
+  if (!modelName) return false;
+  try {
+    const res = await apiFetch(`mapEditor.php?action=save_navigation_bundle&name=${encodeURIComponent(modelName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {})
+    });
+    const data = await res.json();
+    return !!data?.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function saveRoadDataForModel(modelName, opts = {}) {
   if (!modelName) throw new Error("No model selected");
 
   const roads = Array.isArray(opts.roads) ? opts.roads : serializeRoadnet();
   const routes = (opts.routes && typeof opts.routes === "object") ? opts.routes : computeSavedRoutes();
-  setSavedRoutes(routes);
+  const guides = (opts.guides && typeof opts.guides === "object") ? opts.guides : buildGuidesPayloadForModel(modelName, { routes });
+  const shouldUpdateLocalState = opts.updateLocalState !== false && modelName === currentModelName;
+  const bundleOk = await saveNavigationBundleForModel(modelName, {
+    roads,
+    routes,
+    guides
+  });
 
-  const [roadnetOk, routesOk] = await Promise.all([
-    saveRoadnetForModel(modelName, roads),
-    saveRoutesForModel(modelName, routes)
-  ]);
-
-  if (!roadnetOk || !routesOk) {
-    throw new Error("Failed to save road data");
+  if (!bundleOk) {
+    throw new Error("Failed to save roadnet + routes + guides data");
   }
 
-  return { roads, routes };
+  if (shouldUpdateLocalState) {
+    setSavedRoutes(routes);
+    setLoadedGuidesPayload({ model: modelName, entries: guides.entries || {} });
+    renderGuideEditorPanel({ routes });
+  }
+  return { roads, routes, guides };
 }
 
 function dijkstra(nodes, edges, startId) {
@@ -2751,6 +4080,7 @@ function routeToBuilding(buildingName) {
   const name = String(buildingName || "").trim();
   if (!name) return;
   const key = routeKey(name);
+  setGuideSelectionForBuilding(name);
 
   if (!hasLiveRoadData()) {
     const saved = getSavedRouteEntry(name);
@@ -2991,6 +4321,8 @@ overlayReady = true;
 let overlayBaselineSnapshot = null;
 let baseBaselineSnapshot = null;
 let dirtyRefreshTimer = null;
+let loadedGuidePayload = { model: "", entries: {} };
+let guideSelectionKey = "";
 
 function roundSnapshotNumber(n) {
   const v = Number(n);
@@ -3042,7 +4374,10 @@ function buildOverlaySnapshot() {
     }
     out.push(entry);
   }
-  return JSON.stringify(out);
+  return JSON.stringify({
+    items: out,
+    guides: buildGuideRawSnapshotValue()
+  });
 }
 function buildBaseSnapshot() {
   if (!campusRoot) return "";
@@ -6570,6 +7905,14 @@ function updateBuildingSelected(obj) {
   else buildingSelectedEl.textContent = "Selected: None";
 }
 
+function setGuideSelectionForBuilding(buildingName, roomName = "") {
+  const cleanBuilding = String(buildingName || "").trim();
+  if (!cleanBuilding) return;
+  const type = roomName ? "room" : "building";
+  guideSelectionKey = buildGuideKey(type, { buildingName: cleanBuilding, roomName });
+  renderGuideEditorPanel();
+}
+
 function refreshBuildingList() {
   if (!buildingListEl) return;
   buildingListEl.innerHTML = "";
@@ -6614,6 +7957,7 @@ function refreshBuildingList() {
 
     btn.addEventListener("click", () => {
       selectObject(obj);
+      setGuideSelectionForBuilding(name);
     });
 
     buildingListEl.appendChild(btn);
@@ -6897,7 +8241,7 @@ function commitSelected() {
 function persistLockStateChangeFor(obj) {
   if (!obj?.userData?.isPlaced) return;
   if (currentModelName !== ORIGINAL_MODEL_NAME) return;
-  saveOverlay({ silent: true }).catch((err) => {
+  saveOverlay({ silent: true, skipRoutingReview: true }).catch((err) => {
     console.warn("LOCK SAVE ERROR", err);
   });
 }
@@ -7718,13 +9062,25 @@ function serializeRoadnet() {
 }
 
 async function saveOverlay(opts = {}) {
-  const { silent = false } = opts;
+  const {
+    silent = false,
+    skipRoutingReview = false,
+    routes: providedRoutes = null,
+    roads: providedRoads = null
+  } = opts;
   if (!isOverlaySaveAllowed()) {
     throw new Error("Save Overlay is only available for the original map.");
   }
-  const routes = computeSavedRoutes();
-  const roads = serializeRoadnet();
-  setSavedRoutes(routes);
+  const routes = (providedRoutes && typeof providedRoutes === "object") ? providedRoutes : computeSavedRoutes();
+  const roads = Array.isArray(providedRoads) ? providedRoads : serializeRoadnet();
+  if (!skipRoutingReview) {
+    const review = reviewRoutingPersist("Save", { routes, mode: "warn" });
+    if (!review.proceed) {
+      if (review.blocked) throw new Error(review.message);
+      setStatus("Save canceled");
+      return false;
+    }
+  }
   const payload = serializeOverlay();
   const res = await apiFetch("mapEditor.php?action=save_overlay", {
     method: "POST",
@@ -7735,21 +9091,32 @@ async function saveOverlay(opts = {}) {
   if (!data.ok) throw new Error(data.error || "Save failed");
   await saveRoadDataForModel(currentModelName, { roads, routes });
   captureDirtyBaselines({ overlay: true, base: false });
-  if (silent) return;
+  if (silent) return true;
   setStatus("Saved overlay + roads");
+  return true;
 }
 
-toolSave?.addEventListener("click", () => {
-  if (isOverlaySaveAllowed()) {
-    saveOverlay().catch(err => showError("SAVE ERROR", err));
-    return;
+toolSave?.addEventListener("click", async () => {
+  try {
+    if (isOverlaySaveAllowed()) {
+      await saveOverlay();
+      return;
+    }
+
+    const routes = computeSavedRoutes();
+    const review = reviewRoutingPersist("Save", { routes, mode: "warn" });
+    if (!review.proceed) {
+      if (review.blocked) throw new Error(review.message);
+      setStatus("Save canceled");
+      return;
+    }
+
+    await saveRoadDataForModel(currentModelName, { routes });
+    captureDirtyBaselines({ overlay: true, base: false });
+    setStatus(`Saved roads (${currentModelName})`);
+  } catch (err) {
+    showError("SAVE ERROR", err);
   }
-  saveRoadDataForModel(currentModelName)
-    .then(() => {
-      captureDirtyBaselines({ overlay: true, base: false });
-      setStatus(`Saved roads (${currentModelName})`);
-    })
-    .catch(err => showError("SAVE ROAD ERROR", err));
 });
 
 function buildExportDefaultName() {
@@ -7767,6 +9134,14 @@ function exportSceneAsGlb() {
   if (!nameInput) return Promise.resolve(false);
   const fileName = nameInput.trim();
   if (!fileName) return Promise.resolve(false);
+
+  const routes = computeSavedRoutes();
+  const review = reviewRoutingPersist("Export", { routes, mode: "warn" });
+  if (!review.proceed) {
+    if (review.blocked) return Promise.reject(new Error(review.message));
+    setStatus("Export canceled");
+    return Promise.resolve(false);
+  }
 
   const exporter = new GLTFExporter();
 
@@ -7793,7 +9168,6 @@ function exportSceneAsGlb() {
           if (!data.ok) throw new Error(data.error || "Export failed");
           await syncModelEntitiesToDatabase(data.file, campusRoot);
           const roads = serializeRoadnet();
-          const routes = computeSavedRoutes();
           await saveRoadDataForModel(data.file, { roads, routes });
           captureDirtyBaselines({ overlay: false, base: true });
           setStatus(`Exported: ${data.file}`);
@@ -7820,6 +9194,14 @@ async function publishCurrentMap() {
   if (!currentModelName) throw new Error("No current model selected");
 
   const state = getUnsavedChangeState();
+  const hasRoadData = hasLiveRoadData();
+  const publishRoads = hasRoadData ? serializeRoadnet() : [];
+  const publishRoutes = hasRoadData ? computeSavedRoutes() : {};
+  let shouldPersistRoadDataForPublish = hasRoadData;
+  let shouldSaveOverlayBeforePublish = false;
+  let shouldSaveRoadsBeforePublish = false;
+  let roadDataAlreadySaved = false;
+
   if (state.base) {
     const ok = confirm("You have unsaved base-model edits. Publish uses saved model files only.\n\nUse Export GLB first to include base edits.\n\nContinue publishing anyway?");
     if (!ok) return false;
@@ -7827,23 +9209,51 @@ async function publishCurrentMap() {
   if (state.overlay) {
     if (isOverlaySaveAllowed()) {
       const saveNow = confirm("You have unsaved overlay edits. Save Overlay before publish?");
-      if (saveNow) await saveOverlay({ silent: true });
+      if (saveNow) {
+        shouldSaveOverlayBeforePublish = true;
+      } else {
+        shouldPersistRoadDataForPublish = false;
+      }
     } else {
       const saveNow = confirm("You have unsaved road edits on this model.\n\nSave roads before publish?");
       if (saveNow) {
-        await saveRoadDataForModel(currentModelName);
-        captureDirtyBaselines({ overlay: true, base: false });
+        shouldSaveRoadsBeforePublish = true;
       } else {
         const ok = confirm("Continue publishing without saving road edits?");
         if (!ok) return false;
+        shouldPersistRoadDataForPublish = false;
       }
     }
   }
 
-  if (hasLiveRoadData()) {
-    const roads = serializeRoadnet();
-    const routes = computeSavedRoutes();
-    await saveRoadDataForModel(currentModelName, { roads, routes });
+  if (shouldPersistRoadDataForPublish) {
+    const review = reviewRoutingPersist("Publish", { routes: publishRoutes, mode: "strict" });
+    if (!review.proceed) {
+      if (review.blocked) throw new Error(review.message);
+      setStatus("Publish canceled");
+      return false;
+    }
+  }
+
+  if (shouldSaveOverlayBeforePublish) {
+    const saved = await saveOverlay({
+      silent: true,
+      skipRoutingReview: true,
+      routes: publishRoutes,
+      roads: publishRoads
+    });
+    if (!saved) return false;
+    roadDataAlreadySaved = true;
+  }
+
+  if (shouldSaveRoadsBeforePublish) {
+    await saveRoadDataForModel(currentModelName, { roads: publishRoads, routes: publishRoutes });
+    captureDirtyBaselines({ overlay: true, base: false });
+    roadDataAlreadySaved = true;
+  }
+
+  if (shouldPersistRoadDataForPublish && !roadDataAlreadySaved) {
+    await saveRoadDataForModel(currentModelName, { roads: publishRoads, routes: publishRoutes });
   }
 
    await syncModelEntitiesToDatabase(currentModelName, state.base ? null : campusRoot);
@@ -8074,11 +9484,14 @@ function resetEditorState() {
   clearRouteLine();
   setRouteBanner("");
   setSavedRoutes({});
+  setLoadedGuidesPayload({ model: "", entries: {} });
+  guideSelectionKey = "";
   updateCommitButtons();
   updateRoadControls();
   undoStack = [];
   redoStack = [];
   updateSpecialPointsPanel();
+  renderGuideEditorPanel();
 }
 
 function disposeObject3D(root) {
@@ -8264,6 +9677,7 @@ async function loadBaseModel(modelName, opts = {}) {
             replaceExisting: true,
             keepExistingWhenMissing: true
           });
+          await loadGuidesForModel(modelName);
         } else {
           resetEditorState();
           await loadRoutesForModel(modelName);
@@ -8271,6 +9685,7 @@ async function loadBaseModel(modelName, opts = {}) {
             replaceExisting: true,
             keepExistingWhenMissing: false
           });
+          await loadGuidesForModel(modelName);
         }
 
         currentTool = "none";
@@ -8290,6 +9705,7 @@ async function loadBaseModel(modelName, opts = {}) {
         setStatus(readyStatus);
 
         updateOverlaySaveAvailability();
+        renderGuideEditorPanel();
         captureDirtyBaselines({ overlay: true, base: true });
         resolve();
       },
