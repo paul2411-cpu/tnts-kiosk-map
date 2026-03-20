@@ -124,6 +124,30 @@ function map_sync_resolve_public_model(string $root): array {
   ];
 }
 
+function map_sync_resolve_editor_model(string $root): ?string {
+  $paths = map_sync_paths($root);
+  $modelDir = $paths["modelDir"];
+
+  $defaultJson = map_sync_read_json_file($paths["defaultModelPath"]);
+  $defaultModel = map_sync_sanitize_glb_name($defaultJson["file"] ?? "");
+  if ($defaultModel && file_exists($modelDir . "/" . $defaultModel)) {
+    return $defaultModel;
+  }
+
+  $publicState = map_sync_resolve_public_model($root);
+  $publicModel = map_sync_sanitize_glb_name($publicState["modelFile"] ?? "");
+  if ($publicModel && file_exists($modelDir . "/" . $publicModel)) {
+    return $publicModel;
+  }
+
+  $originalModel = $paths["originalModelName"] ?? "";
+  if ($originalModel !== "" && file_exists($modelDir . "/" . $originalModel)) {
+    return $originalModel;
+  }
+
+  return map_sync_first_glb_file($modelDir);
+}
+
 function map_sync_file_signature(?string $path): string {
   if (!is_string($path) || $path === "" || !file_exists($path)) return "missing";
   clearstatcache(true, $path);
@@ -271,6 +295,94 @@ function map_sync_rename_guide_entries(string $root, string $modelFile, string $
         && map_sync_route_key((string)$entry["name"]) === $oldRouteKey) {
         $entry["name"] = $newName;
       }
+      $changed = true;
+    }
+
+    $targetKey = map_sync_build_guide_key($destinationType, $buildingName, $roomName);
+    $entry["key"] = $targetKey;
+    $updatedEntries[$targetKey !== "" ? $targetKey : (string)$rawKey] = $entry;
+  }
+
+  if (!$changed) return true;
+
+  $payload["model"] = $safeModel;
+  $payload["updated"] = time();
+  $payload["entries"] = $updatedEntries;
+  return map_sync_atomic_write_json($guidesPath, $payload);
+}
+
+function map_sync_retarget_room_guide_entries(
+  string $root,
+  string $modelFile,
+  string $oldBuildingName,
+  string $oldRoomName,
+  string $newBuildingName,
+  string $newRoomName
+): bool {
+  $safeModel = map_sync_sanitize_glb_name($modelFile);
+  if ($safeModel === null) return false;
+
+  $oldBuildingName = trim($oldBuildingName);
+  $oldRoomName = trim($oldRoomName);
+  $newBuildingName = trim($newBuildingName);
+  $newRoomName = trim($newRoomName);
+  if ($oldRoomName === "" || $newRoomName === "") return false;
+  if ($oldBuildingName === "" || $newBuildingName === "") return true;
+
+  $oldBuildingKey = map_sync_guide_token($oldBuildingName);
+  $oldRoomKey = map_sync_guide_token($oldRoomName);
+  $newBuildingKey = map_sync_guide_token($newBuildingName);
+  $newRoomKey = map_sync_guide_token($newRoomName);
+  if ($oldBuildingKey === $newBuildingKey && $oldRoomKey === $newRoomKey) return true;
+
+  $paths = map_sync_paths($root);
+  $guidesPath = $paths["overlayDir"] . "/guides_" . $safeModel . ".json";
+  if (!file_exists($guidesPath)) return true;
+
+  $payload = map_sync_read_json_file($guidesPath);
+  if (!is_array($payload)) return false;
+  $entries = isset($payload["entries"]) && is_array($payload["entries"]) ? $payload["entries"] : [];
+  if (!$entries) return true;
+
+  $updatedEntries = [];
+  $changed = false;
+
+  foreach ($entries as $rawKey => $rawEntry) {
+    $entry = is_array($rawEntry) ? $rawEntry : [];
+    $destinationType = trim((string)($entry["destinationType"] ?? $entry["type"] ?? "building"));
+    if ($destinationType === "") $destinationType = "building";
+    $buildingName = trim((string)($entry["buildingName"] ?? $entry["name"] ?? ""));
+    $roomName = trim((string)($entry["roomName"] ?? ""));
+
+    $matchesRoom = (
+      $destinationType === "room"
+      && $buildingName !== ""
+      && $roomName !== ""
+      && map_sync_guide_token($buildingName) === $oldBuildingKey
+      && map_sync_guide_token($roomName) === $oldRoomKey
+    );
+
+    if ($matchesRoom) {
+      $buildingName = $newBuildingName;
+      $roomName = $newRoomName;
+      $entry["buildingName"] = $newBuildingName;
+      $entry["roomName"] = $newRoomName;
+      $entry["routeName"] = $newBuildingName;
+      $entry["destinationName"] = $newBuildingName . " / " . $newRoomName;
+      $entry["manualText"] = "";
+      $entry["autoSteps"] = [];
+      $entry["finalSteps"] = [];
+      $entry["routeSignature"] = "";
+      $entry["sourceRouteSignature"] = "";
+      $entry["guideMode"] = "auto";
+      $entry["status"] = "stale";
+      $existingNotes = is_array($entry["notes"]) ? $entry["notes"] : [];
+      $resetNote = "Room guide text was cleared after the room name or building changed. Review before publishing.";
+      $filteredNotes = array_values(array_filter(array_map("strval", $existingNotes), static function($note) use ($resetNote) {
+        return trim($note) !== "" && trim($note) !== $resetNote;
+      }));
+      array_unshift($filteredNotes, $resetNote);
+      $entry["notes"] = $filteredNotes;
       $changed = true;
     }
 

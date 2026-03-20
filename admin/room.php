@@ -2,6 +2,7 @@
 require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
+require_once __DIR__ . "/inc/map_sync.php";
 
 $MODEL_DIR = __DIR__ . "/../models";
 $ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
@@ -46,8 +47,15 @@ function rm_room_name_variants(string $name): array {
   $spaced = trim((string)preg_replace('/\s+/', ' ', (string)$spaced));
   if ($spaced !== "" && strcasecmp($spaced, $base) !== 0) $out[] = $spaced;
 
-  if (preg_match('/^room[_\s-]*([0-9]+)$/i', $base, $m)) {
-    $num = (string)$m[1];
+  $canonicalNumbers = [];
+  if (preg_match('/^room[\s._-]*([0-9]+)$/i', $base, $m)) {
+    $canonicalNumbers[] = (string)$m[1];
+  }
+  if (preg_match('/^room[\s._-]*([0-9]+)[._-](\d{1,3})$/i', $base, $m)) {
+    $canonicalNumbers[] = (string)$m[1];
+  }
+
+  foreach ($canonicalNumbers as $num) {
     $out[] = "ROOM " . $num;
     $out[] = "ROOM_" . $num;
     $out[] = "ROOM" . $num;
@@ -60,6 +68,43 @@ function rm_room_name_variants(string $name): array {
     $uniq[$k] = trim((string)$v);
   }
   return array_values($uniq);
+}
+
+function rm_name_lookup_tokens(string $value): array {
+  $raw = trim($value);
+  if ($raw === "") return [];
+
+  $candidates = [$raw];
+  $deSuffixed = preg_replace('/([._-]\d+)+$/', '', $raw);
+  $deSuffixed = trim((string)$deSuffixed);
+  if ($deSuffixed !== "" && strcasecmp($deSuffixed, $raw) !== 0) $candidates[] = $deSuffixed;
+
+  $tokens = [];
+  foreach ($candidates as $candidate) {
+    $token = mb_strtolower((string)preg_replace('/[^a-z0-9]+/i', '', $candidate));
+    if ($token === "" || isset($tokens[$token])) continue;
+    $tokens[$token] = $token;
+  }
+  return array_values($tokens);
+}
+
+function rm_parse_string_list($raw): array {
+  if (is_array($raw)) {
+    $items = $raw;
+  } else {
+    $decoded = json_decode((string)$raw, true);
+    $items = is_array($decoded) ? $decoded : [];
+  }
+
+  $out = [];
+  foreach ($items as $item) {
+    $value = trim((string)$item);
+    if ($value === "") continue;
+    $key = mb_strtolower($value);
+    if (isset($out[$key])) continue;
+    $out[$key] = $value;
+  }
+  return array_values($out);
 }
 
 function rm_col(mysqli $conn, string $table, string $col): bool {
@@ -122,6 +167,7 @@ function rm_ensure_schema(mysqli $conn): void {
       floor_number VARCHAR(50) NULL,
       building_name VARCHAR(255) NULL,
       description TEXT NULL,
+      indoor_guide_text TEXT NULL,
       image_path VARCHAR(255) NULL,
       source_model_file VARCHAR(255) NULL,
       first_seen_version_id INT NULL,
@@ -138,7 +184,8 @@ function rm_ensure_schema(mysqli $conn): void {
   if (!rm_col($conn, "rooms", "floor_number")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN floor_number VARCHAR(50) NULL AFTER room_type");
   if (!rm_col($conn, "rooms", "building_name")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN building_name VARCHAR(255) NULL AFTER floor_number");
   if (!rm_col($conn, "rooms", "description")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN description TEXT NULL AFTER building_name");
-  if (!rm_col($conn, "rooms", "image_path")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN image_path VARCHAR(255) NULL AFTER description");
+  if (!rm_col($conn, "rooms", "indoor_guide_text")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN indoor_guide_text TEXT NULL AFTER description");
+  if (!rm_col($conn, "rooms", "image_path")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN image_path VARCHAR(255) NULL AFTER indoor_guide_text");
   if (!rm_col($conn, "rooms", "source_model_file")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN source_model_file VARCHAR(255) NULL AFTER image_path");
   if (!rm_col($conn, "rooms", "first_seen_version_id")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
   if (!rm_col($conn, "rooms", "last_seen_version_id")) rm_sql($conn, "ALTER TABLE rooms ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
@@ -251,20 +298,141 @@ function rm_ensure_building_for_model(mysqli $conn, string $modelFile, int $vers
   ];
 }
 
+function rm_room_meta_sql_cols(mysqli $conn): array {
+  $hasSource = rm_col($conn, "rooms", "source_model_file");
+  $hasBuildingId = rm_col($conn, "rooms", "building_id");
+  $hasBuildingName = rm_col($conn, "rooms", "building_name");
+  $hasIndoorGuideText = rm_col($conn, "rooms", "indoor_guide_text");
+  $buildingExpr = $hasBuildingId
+    ? "COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ") AS building_name"
+    : (($hasBuildingName ? "r.building_name" : "NULL") . " AS building_name");
+
+  $sqlCols = "r.room_id, "
+    . ($hasBuildingId ? "r.building_id, " : "NULL AS building_id, ")
+    . "r.room_name, r.room_number, r.room_type, r.floor_number, {$buildingExpr}, r.description, "
+    . ($hasIndoorGuideText ? "r.indoor_guide_text" : "NULL AS indoor_guide_text")
+    . ", r.image_path, "
+    . (rm_col($conn, "rooms", "last_seen_version_id") ? "r.last_seen_version_id" : "NULL AS last_seen_version_id")
+    . ", " . (rm_col($conn, "rooms", "last_edited_at") ? "r.last_edited_at" : "NULL AS last_edited_at")
+    . ", " . ($hasSource ? "r.source_model_file" : "NULL AS source_model_file");
+
+  return [$sqlCols, $hasSource, $hasBuildingId];
+}
+
+function rm_fetch_room_meta_candidates(mysqli $conn, string $sqlCols, bool $hasSource, bool $hasBuildingId, array $roomNames, string $model): array {
+  $roomNames = array_values(array_filter(array_map("trim", $roomNames), static function($value) {
+    return $value !== "";
+  }));
+  if (!$roomNames) return [];
+
+  $hasPresent = rm_col($conn, "rooms", "is_present_in_latest");
+  $hasBuildingPresent = rm_col($conn, "buildings", "is_present_in_latest");
+
+  $placeholders = implode(", ", array_fill(0, count($roomNames), "?"));
+  $sql = "SELECT {$sqlCols} FROM rooms r "
+    . ($hasBuildingId ? "LEFT JOIN buildings b ON b.building_id = r.building_id " : "")
+    . "WHERE r.room_name IN ({$placeholders})";
+  if ($hasPresent) $sql .= " AND (r.is_present_in_latest = 1 OR r.is_present_in_latest IS NULL)";
+  if ($hasBuildingId && $hasBuildingPresent) $sql .= " AND (b.building_id IS NULL OR b.is_present_in_latest = 1 OR b.is_present_in_latest IS NULL)";
+
+  $types = str_repeat("s", count($roomNames));
+  $params = $roomNames;
+  if ($model !== "" && $hasSource) {
+    $sql .= " AND r.source_model_file = ?";
+    $types .= "s";
+    $params[] = $model;
+  }
+
+  $sql .= " ORDER BY r.room_id DESC";
+  $stmt = $conn->prepare($sql);
+  if (!$stmt) throw new RuntimeException("Failed to prepare room metadata lookup");
+  $stmt->bind_param($types, ...$params);
+  if (!$stmt->execute()) throw new RuntimeException("Failed to load room metadata");
+  $res = $stmt->get_result();
+  $rows = [];
+  if ($res instanceof mysqli_result) {
+    while ($row = $res->fetch_assoc()) $rows[] = $row;
+  }
+  $stmt->close();
+
+  $deduped = [];
+  foreach ($rows as $row) {
+    $key = isset($row["room_id"]) ? "id:" . (int)$row["room_id"] : mb_strtolower(trim((string)($row["room_name"] ?? "")) . "|" . trim((string)($row["building_name"] ?? "")));
+    if (isset($deduped[$key])) continue;
+    $deduped[$key] = $row;
+  }
+  return array_values($deduped);
+}
+
+function rm_pick_room_meta_candidate(array $rows, array $buildingHints): array {
+  if (!$rows) return ["room" => null, "rows" => []];
+  if (count($rows) === 1) return ["room" => $rows[0], "rows" => $rows];
+
+  $hintTokens = [];
+  foreach ($buildingHints as $hint) {
+    foreach (rm_name_lookup_tokens((string)$hint) as $token) {
+      $hintTokens[$token] = true;
+    }
+  }
+
+  if ($hintTokens) {
+    $scored = [];
+    foreach ($rows as $row) {
+      $score = 0;
+      foreach (rm_name_lookup_tokens((string)($row["building_name"] ?? "")) as $token) {
+        if (isset($hintTokens[$token])) $score++;
+      }
+      if ($score > 0) {
+        $scored[] = ["score" => $score, "row" => $row];
+      }
+    }
+
+    usort($scored, static function($a, $b) {
+      if ($b["score"] !== $a["score"]) return $b["score"] <=> $a["score"];
+      return ((int)($b["row"]["room_id"] ?? 0)) <=> ((int)($a["row"]["room_id"] ?? 0));
+    });
+
+    if (count($scored) === 1 || ($scored && $scored[0]["score"] > ($scored[1]["score"] ?? 0))) {
+      return ["room" => $scored[0]["row"], "rows" => $rows];
+    }
+  }
+
+  return ["room" => null, "rows" => $rows];
+}
+
+function rm_editor_model_file(): ?string {
+  return map_sync_resolve_editor_model(dirname(__DIR__));
+}
+
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
   $action = (string)$_GET["action"];
 
   if ($action === "list_models") {
+    $editorModel = rm_editor_model_file();
+    $publicState = map_sync_resolve_public_model(dirname(__DIR__));
+    $publicModel = trim((string)($publicState["modelFile"] ?? ""));
     $rows = [];
     if (is_dir($MODEL_DIR)) {
       foreach (scandir($MODEL_DIR) as $f) {
         if ($f === "." || $f === "..") continue;
         if (!preg_match('/\\.glb$/i', $f)) continue;
-        $rows[] = ["file" => $f, "isOriginal" => strcasecmp($f, $ORIGINAL_MODEL_NAME) === 0];
+        $rows[] = [
+          "file" => $f,
+          "isOriginal" => strcasecmp($f, $ORIGINAL_MODEL_NAME) === 0,
+          "isDefault" => ($editorModel !== null && strcasecmp($f, $editorModel) === 0),
+          "isLive" => ($publicModel !== "" && strcasecmp($f, $publicModel) === 0),
+          "isEditable" => ($editorModel !== null && strcasecmp($f, $editorModel) === 0)
+        ];
       }
     }
-    usort($rows, fn($a, $b) => strnatcasecmp($a["file"], $b["file"]));
+    usort($rows, static function(array $a, array $b): int {
+      $editableCmp = ((int)!empty($a["isEditable"])) <=> ((int)!empty($b["isEditable"]));
+      if ($editableCmp !== 0) return -$editableCmp;
+      $liveCmp = ((int)!empty($a["isLive"])) <=> ((int)!empty($b["isLive"]));
+      if ($liveCmp !== 0) return -$liveCmp;
+      return strnatcasecmp((string)$a["file"], (string)$b["file"]);
+    });
     echo json_encode(["ok" => true, "models" => $rows], JSON_PRETTY_PRINT);
     exit;
   }
@@ -322,47 +490,85 @@ if (isset($_GET["action"])) {
   if ($action === "get_room_meta") {
     rm_ensure_schema($conn);
     $name = trim((string)($_GET["name"] ?? ""));
-    if ($name === "") rm_fail(400, "Missing room name");
+    $roomId = isset($_GET["roomId"]) && is_numeric($_GET["roomId"]) ? (int)$_GET["roomId"] : 0;
+    if ($name === "" && $roomId <= 0) rm_fail(400, "Missing room identifier");
     $model = "";
     if (isset($_GET["model"]) && trim((string)$_GET["model"]) !== "") {
       $safe = rm_model_name((string)$_GET["model"]);
       if ($safe === null) rm_fail(400, "Invalid model");
       $model = $safe;
     }
-    $hasSource = rm_col($conn, "rooms", "source_model_file");
-    $hasBuildingId = rm_col($conn, "rooms", "building_id");
-    $hasBuildingName = rm_col($conn, "rooms", "building_name");
-    $buildingExpr = $hasBuildingId
-      ? "COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ") AS building_name"
-      : (($hasBuildingName ? "r.building_name" : "NULL") . " AS building_name");
-    $sqlCols = "r.room_id, "
-      . ($hasBuildingId ? "r.building_id, " : "NULL AS building_id, ")
-      . "r.room_name, r.room_number, r.room_type, r.floor_number, {$buildingExpr}, r.description, r.image_path, "
-      . (rm_col($conn, "rooms", "last_seen_version_id") ? "r.last_seen_version_id" : "NULL AS last_seen_version_id")
-      . ", " . (rm_col($conn, "rooms", "last_edited_at") ? "r.last_edited_at" : "NULL AS last_edited_at")
-      . ", " . ($hasSource ? "r.source_model_file" : "NULL AS source_model_file");
+    $buildingHints = rm_parse_string_list($_GET["buildingHints"] ?? []);
+    [$sqlCols, $hasSource, $hasBuildingId] = rm_room_meta_sql_cols($conn);
+
     $row = null;
-    if ($model !== "" && $hasSource) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM rooms r " . ($hasBuildingId ? "LEFT JOIN buildings b ON b.building_id = r.building_id " : "") . "WHERE r.source_model_file = ? AND r.room_name = ? LIMIT 1");
-      if ($stmt) {
-        $stmt->bind_param("ss", $model, $name);
-        if ($stmt->execute()) {
-          $res = $stmt->get_result();
-          $row = $res ? $res->fetch_assoc() : null;
-        }
+    $matchedBy = "";
+    $candidates = [];
+
+    if ($roomId > 0) {
+      $sql = "SELECT {$sqlCols} FROM rooms r "
+        . ($hasBuildingId ? "LEFT JOIN buildings b ON b.building_id = r.building_id " : "")
+        . "WHERE r.room_id = ?";
+      $types = "i";
+      $params = [$roomId];
+      if ($model !== "" && $hasSource) {
+        $sql .= " AND r.source_model_file = ?";
+        $types .= "s";
+        $params[] = $model;
+      }
+      $sql .= " LIMIT 1";
+      $stmt = $conn->prepare($sql);
+      if (!$stmt) rm_fail(500, "Failed to prepare room lookup");
+      $stmt->bind_param($types, ...$params);
+      if (!$stmt->execute()) rm_fail(500, "Failed to load room metadata");
+      $res = $stmt->get_result();
+      $row = $res ? $res->fetch_assoc() : null;
+      $stmt->close();
+      if ($row) $matchedBy = "room_id";
+    }
+
+    if (!$row && $name !== "") {
+      $variants = rm_room_name_variants($name);
+      $candidates = rm_fetch_room_meta_candidates($conn, $sqlCols, $hasSource, $hasBuildingId, $variants, $model);
+      $picked = rm_pick_room_meta_candidate($candidates, $buildingHints);
+      $row = $picked["room"];
+      $candidates = $picked["rows"];
+      if ($row) {
+        $matchedBy = $buildingHints ? "building_hint" : "room_name";
       }
     }
-    if (!$row) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM rooms r " . ($hasBuildingId ? "LEFT JOIN buildings b ON b.building_id = r.building_id " : "") . "WHERE r.room_name = ? ORDER BY r.room_id DESC LIMIT 1");
-      if ($stmt) {
-        $stmt->bind_param("s", $name);
-        if ($stmt->execute()) {
-          $res = $stmt->get_result();
-          $row = $res ? $res->fetch_assoc() : null;
-        }
-      }
+
+    if ($row) {
+      echo json_encode([
+        "ok" => true,
+        "found" => true,
+        "ambiguous" => false,
+        "matchedBy" => $matchedBy,
+        "room" => $row
+      ], JSON_PRETTY_PRINT);
+      exit;
     }
-    echo json_encode(["ok" => true, "found" => (bool)$row, "room" => $row ?: null], JSON_PRETTY_PRINT);
+
+    $candidatePayload = array_map(static function(array $candidate): array {
+      return [
+        "room_id" => isset($candidate["room_id"]) ? (int)$candidate["room_id"] : null,
+        "building_id" => isset($candidate["building_id"]) ? (int)$candidate["building_id"] : null,
+        "room_name" => trim((string)($candidate["room_name"] ?? "")),
+        "room_number" => trim((string)($candidate["room_number"] ?? "")),
+        "floor_number" => trim((string)($candidate["floor_number"] ?? "")),
+        "building_name" => trim((string)($candidate["building_name"] ?? "")),
+        "source_model_file" => trim((string)($candidate["source_model_file"] ?? ""))
+      ];
+    }, $candidates);
+
+    echo json_encode([
+      "ok" => true,
+      "found" => false,
+      "ambiguous" => count($candidatePayload) > 1,
+      "matchedBy" => "",
+      "room" => null,
+      "candidates" => $candidatePayload
+    ], JSON_PRETTY_PRINT);
     exit;
   }
 
@@ -370,16 +576,23 @@ if (isset($_GET["action"])) {
     rm_post_csrf();
     $modelFile = rm_model_name((string)($_POST["modelFile"] ?? ""));
     if ($modelFile === null) rm_fail(400, "Invalid model file");
+    $editableModel = rm_editor_model_file();
+    if ($editableModel !== null && strcasecmp($editableModel, $modelFile) !== 0) {
+      rm_fail(409, "Only the default admin model can be edited here. Switch the default model in Map Editor before editing this snapshot.");
+    }
     $modelPath = $MODEL_DIR . "/" . $modelFile;
     if (!file_exists($modelPath)) rm_fail(404, "Model not found");
 
     $oldName = trim((string)($_POST["oldName"] ?? ""));
     $newName = trim((string)($_POST["newName"] ?? ""));
+    $roomId = isset($_POST["roomId"]) && is_numeric($_POST["roomId"]) ? (int)$_POST["roomId"] : 0;
     $roomNumber = trim((string)($_POST["roomNumber"] ?? ""));
     $roomType = trim((string)($_POST["roomType"] ?? ""));
     $floorNumber = trim((string)($_POST["floorNumber"] ?? ""));
     $buildingName = trim((string)($_POST["buildingName"] ?? ""));
     $description = trim((string)($_POST["description"] ?? ""));
+    $indoorGuideText = str_replace("\r\n", "\n", (string)($_POST["indoorGuideText"] ?? ""));
+    $indoorGuideText = trim((string)preg_replace("/\n{3,}/", "\n\n", $indoorGuideText));
     $imagePath = trim((string)($_POST["imagePath"] ?? ""));
 
     if ($oldName === "") rm_fail(400, "Missing old name");
@@ -389,6 +602,7 @@ if (isset($_GET["action"])) {
     if (mb_strlen($roomType) > 100) rm_fail(400, "Room type too long");
     if (mb_strlen($floorNumber) > 50) rm_fail(400, "Floor number too long");
     if (mb_strlen($buildingName) > 255) rm_fail(400, "Building name too long");
+    if (mb_strlen($indoorGuideText) > 8000) rm_fail(400, "Indoor guide text is too long");
     if (mb_strlen($imagePath) > 255) rm_fail(400, "Image path too long");
 
     if (!isset($_FILES["glb"])) rm_fail(400, "Missing GLB upload");
@@ -418,25 +632,61 @@ if (isset($_GET["action"])) {
       $versionId = rm_version_id($conn, $modelFile, $hash, $adminId);
 
       $id = 0;
-      $lookupNames = array_values(array_unique(array_merge(
-        rm_room_name_variants($oldName),
-        rm_room_name_variants($newName)
-      )));
-
-      foreach ($lookupNames as $candidate) {
-        if ($id > 0) break;
-        $stmt = $conn->prepare("SELECT room_id FROM rooms WHERE source_model_file = ? AND room_name = ? ORDER BY room_id DESC LIMIT 1");
-        if (!$stmt) throw new RuntimeException("Failed to prepare model lookup");
-        $stmt->bind_param("ss", $modelFile, $candidate);
+      if ($roomId > 0) {
+        if (rm_col($conn, "rooms", "source_model_file")) {
+          $stmt = $conn->prepare("SELECT room_id FROM rooms WHERE room_id = ? AND source_model_file = ? LIMIT 1");
+          if (!$stmt) throw new RuntimeException("Failed to prepare exact room lookup");
+          $stmt->bind_param("is", $roomId, $modelFile);
+        } else {
+          $stmt = $conn->prepare("SELECT room_id FROM rooms WHERE room_id = ? LIMIT 1");
+          if (!$stmt) throw new RuntimeException("Failed to prepare exact room lookup");
+          $stmt->bind_param("i", $roomId);
+        }
         if (!$stmt->execute()) throw new RuntimeException("Failed room lookup");
         $res = $stmt->get_result();
         $row = $res ? $res->fetch_assoc() : null;
-        if ($row && isset($row["room_id"])) $id = (int)$row["room_id"];
+        if ($row && isset($row["room_id"])) {
+          $id = (int)$row["room_id"];
+        } else {
+          throw new RuntimeException("Selected room record could not be found for this model. Reload the room metadata and try again.");
+        }
         $stmt->close();
+      } else {
+        $lookupNames = array_values(array_unique(array_merge(
+          rm_room_name_variants($oldName),
+          rm_room_name_variants($newName)
+        )));
+
+        if ($buildingName !== "" && rm_col($conn, "rooms", "building_name")) {
+          foreach ($lookupNames as $candidate) {
+            if ($id > 0) break;
+            $stmt = $conn->prepare("SELECT room_id FROM rooms WHERE source_model_file = ? AND room_name = ? AND building_name = ? ORDER BY room_id DESC LIMIT 1");
+            if (!$stmt) throw new RuntimeException("Failed to prepare building-scoped room lookup");
+            $stmt->bind_param("sss", $modelFile, $candidate, $buildingName);
+            if (!$stmt->execute()) throw new RuntimeException("Failed room lookup");
+            $res = $stmt->get_result();
+            $row = $res ? $res->fetch_assoc() : null;
+            if ($row && isset($row["room_id"])) $id = (int)$row["room_id"];
+            $stmt->close();
+          }
+        }
+
+        foreach ($lookupNames as $candidate) {
+          if ($id > 0) break;
+          $stmt = $conn->prepare("SELECT room_id FROM rooms WHERE source_model_file = ? AND room_name = ? ORDER BY room_id DESC LIMIT 1");
+          if (!$stmt) throw new RuntimeException("Failed to prepare model lookup");
+          $stmt->bind_param("ss", $modelFile, $candidate);
+          if (!$stmt->execute()) throw new RuntimeException("Failed room lookup");
+          $res = $stmt->get_result();
+          $row = $res ? $res->fetch_assoc() : null;
+          if ($row && isset($row["room_id"])) $id = (int)$row["room_id"];
+          $stmt->close();
+        }
       }
 
       $hasBuildingId = rm_col($conn, "rooms", "building_id");
       $existingBuildingId = null;
+      $existingBuildingName = "";
       if ($id > 0 && $hasBuildingId) {
         $stmt = $conn->prepare("SELECT building_id, building_name FROM rooms WHERE room_id = ? LIMIT 1");
         if (!$stmt) throw new RuntimeException("Failed to prepare existing room lookup");
@@ -447,9 +697,11 @@ if (isset($_GET["action"])) {
         $stmt->close();
         if ($row) {
           if ($buildingName === "") $buildingName = trim((string)($row["building_name"] ?? ""));
+          $existingBuildingName = trim((string)($row["building_name"] ?? ""));
           if (isset($row["building_id"]) && $row["building_id"] !== null) $existingBuildingId = (int)$row["building_id"];
         }
       }
+      $oldGuideBuildingName = $existingBuildingName !== "" ? $existingBuildingName : $buildingName;
 
       $buildingMeta = rm_ensure_building_for_model($conn, $modelFile, $versionId, $buildingName);
       if (!$buildingMeta && $existingBuildingId !== null) {
@@ -486,22 +738,22 @@ if (isset($_GET["action"])) {
         if ($hasBuildingId && $buildingMeta) {
           $buildingId = (int)$buildingMeta["building_id"];
           if ($adminId === null) {
-            $stmt = $conn->prepare("UPDATE rooms SET building_id=?, room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE room_id=?");
+            $stmt = $conn->prepare("UPDATE rooms SET building_id=?, room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, indoor_guide_text=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE room_id=?");
             if (!$stmt) throw new RuntimeException("Failed to prepare update");
-            $stmt->bind_param("issssssssii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $id);
+            $stmt->bind_param("isssssssssii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $id);
           } else {
-            $stmt = $conn->prepare("UPDATE rooms SET building_id=?, room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE room_id=?");
+            $stmt = $conn->prepare("UPDATE rooms SET building_id=?, room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, indoor_guide_text=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE room_id=?");
             if (!$stmt) throw new RuntimeException("Failed to prepare update");
-            $stmt->bind_param("issssssssiii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
+            $stmt->bind_param("isssssssssiii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $adminId, $id);
           }
         } elseif ($adminId === null) {
-          $stmt = $conn->prepare("UPDATE rooms SET room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE room_id=?");
+          $stmt = $conn->prepare("UPDATE rooms SET room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, indoor_guide_text=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE room_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssssssii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $id);
+          $stmt->bind_param("sssssssssii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $id);
         } else {
-          $stmt = $conn->prepare("UPDATE rooms SET room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE room_id=?");
+          $stmt = $conn->prepare("UPDATE rooms SET room_name=?, room_number=?, room_type=?, floor_number=?, building_name=?, description=?, indoor_guide_text=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE room_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssssssiii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
+          $stmt->bind_param("sssssssssiii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $adminId, $id);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to update room");
         $stmt->close();
@@ -510,26 +762,38 @@ if (isset($_GET["action"])) {
         if ($hasBuildingId && $buildingMeta) {
           $buildingId = (int)$buildingMeta["building_id"];
           if ($adminId === null) {
-            $stmt = $conn->prepare("INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
+            $stmt = $conn->prepare("INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
             if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-            $stmt->bind_param("issssssssii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $versionId);
+            $stmt->bind_param("isssssssssii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $versionId);
           } else {
-            $stmt = $conn->prepare("INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
+            $stmt = $conn->prepare("INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
             if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-            $stmt->bind_param("issssssssiii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
+            $stmt->bind_param("isssssssssiii", $buildingId, $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $versionId, $adminId);
           }
         } elseif ($adminId === null) {
-          $stmt = $conn->prepare("INSERT INTO rooms (room_name, room_number, room_type, floor_number, building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
+          $stmt = $conn->prepare("INSERT INTO rooms (room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssssssii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $versionId);
+          $stmt->bind_param("sssssssssii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $versionId);
         } else {
-          $stmt = $conn->prepare("INSERT INTO rooms (room_name, room_number, room_type, floor_number, building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
+          $stmt = $conn->prepare("INSERT INTO rooms (room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssssssiii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
+          $stmt->bind_param("sssssssssiii", $newName, $roomNumber, $roomType, $floorNumber, $buildingName, $description, $indoorGuideText, $imagePath, $modelFile, $versionId, $versionId, $adminId);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to insert room");
         $id = (int)$stmt->insert_id;
         $stmt->close();
+      }
+
+      if (
+        !$inserted
+        && (
+          strcasecmp($oldName, $newName) !== 0
+          || strcasecmp($oldGuideBuildingName, $buildingName) !== 0
+        )
+      ) {
+        if (!map_sync_retarget_room_guide_entries(__DIR__ . "/..", $modelFile, $oldGuideBuildingName, $oldName, $buildingName, $newName)) {
+          throw new RuntimeException("Failed to sync published room text guides");
+        }
       }
 
       $meta = $conn->prepare("SELECT DATE_FORMAT(last_edited_at, '%Y-%m-%d %H:%i:%s') AS edited_at FROM rooms WHERE room_id = ? LIMIT 1");
@@ -603,6 +867,7 @@ admin_layout_start("Rooms", "rooms");
       <div class="row"><div class="label">Floor Number</div><input id="room-floor" class="input" /></div>
       <div class="row"><div class="label">Building</div><input id="room-building" class="input" /></div>
       <div class="row"><div class="label">Description</div><textarea id="room-description" class="textarea"></textarea></div>
+      <div class="row"><div class="label">Indoor Guide</div><textarea id="room-indoor-guide" class="textarea" placeholder="One instruction per line. Example:&#10;Enter through the main entrance.&#10;Turn right at the lobby.&#10;Room 100 is the second door on the left."></textarea></div>
       <div class="row"><div class="label">Image Path</div><input id="room-image-path" class="input" placeholder="/assets/rooms/101.jpg" /></div>
       <div class="row"><div class="label">Version ID</div><input id="room-version" class="input" readonly /></div>
       <div class="row"><div class="label">Last Edited</div><input id="room-edited-at" class="input" readonly /></div>
@@ -661,6 +926,7 @@ const roomType = document.getElementById("room-type");
 const roomFloor = document.getElementById("room-floor");
 const roomBuilding = document.getElementById("room-building");
 const desc = document.getElementById("room-description");
+const indoorGuide = document.getElementById("room-indoor-guide");
 const imagePath = document.getElementById("room-image-path");
 const version = document.getElementById("room-version");
 const editedAt = document.getElementById("room-edited-at");
@@ -714,6 +980,8 @@ let hoverBox = null;
 let roomPickMeshes = [];
 let meshToRoom = new WeakMap();
 let roomNodeCount = 0;
+let selectedDbRoomId = 0;
+let modelRows = [];
 const TOUCH_TAP_SLOP_PX = 10;
 const TOUCH_CLICK_SUPPRESS_MS = 450;
 const activeTouchPointerIds = new Set();
@@ -734,6 +1002,25 @@ function esc(v) {
     .replaceAll("'", "&#39;");
 }
 
+function currentModelMeta() {
+  return modelRows.find((row) => String(row?.file || "") === String(modelSel.value || "")) || null;
+}
+
+function isCurrentModelEditable() {
+  const meta = currentModelMeta();
+  return !meta || !!meta.isEditable;
+}
+
+function updateEditorMode() {
+  const meta = currentModelMeta();
+  const editable = isCurrentModelEditable();
+  saveBtn.disabled = !editable;
+  saveBtn.title = editable ? "" : "Archive models are read-only here. Switch the default model in Map Editor to edit this snapshot.";
+  if (!editable && meta?.file) {
+    setStatus(`Archive snapshot selected: ${meta.file}. Switch the default model in Map Editor to edit this snapshot.`, "#b54708");
+  }
+}
+
 function isGroundName(name) {
   const n = String(name || "").trim().toLowerCase();
   if (!n) return false;
@@ -745,6 +1032,10 @@ function isGenericName(name) {
   const raw = String(name || "").trim().toLowerCase();
   const d = raw.replace(/([._-]\d+)+$/g, "");
   return d === "scene" || d === "auxscene" || d === "root" || d === "rootnode" || d === "gltf" || d === "model" || d === "group";
+}
+
+function isRoadLikeName(name) {
+  return /^road(?:[._-]\d+)?$/i.test(String(name || "").trim());
 }
 
 function roomNodeLabel(obj) {
@@ -762,6 +1053,47 @@ function isTargetRoomName(name) {
   if (!/^room/i.test(n)) return false;
   if (/^room[\s_-]*middle\b/i.test(n)) return false;
   return true;
+}
+
+function parseRoomLabelDetails(name) {
+  const raw = String(name || "").trim();
+  if (!raw) return { canonicalName: "", roomNumber: "" };
+
+  const exact = raw.match(/^room[\s._-]*([0-9]+)$/i);
+  if (exact) {
+    return {
+      canonicalName: `ROOM ${exact[1]}`,
+      roomNumber: exact[1]
+    };
+  }
+
+  const loaderSuffix = raw.match(/^room[\s._-]*([0-9]+)[._-](\d{1,3})$/i);
+  if (loaderSuffix) {
+    return {
+      canonicalName: `ROOM ${loaderSuffix[1]}`,
+      roomNumber: loaderSuffix[1]
+    };
+  }
+
+  return { canonicalName: raw, roomNumber: "" };
+}
+
+function collectRoomBuildingHints(obj, root) {
+  const out = [];
+  const seen = new Set();
+  let p = obj?.parent || null;
+  while (p && p !== root) {
+    const label = roomNodeLabel(p);
+    if (label && !isGenericName(label) && !isGroundName(label) && !isRoadLikeName(label) && !isTargetRoomName(label)) {
+      const key = label.trim().toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(label.trim());
+      }
+    }
+    p = p.parent;
+  }
+  return out;
 }
 
 function buildRoomPickIndex(root) {
@@ -815,6 +1147,7 @@ function clearHelper(ref) {
 }
 
 function clearSelectionForm() {
+  selectedDbRoomId = 0;
   selectedName.value = "";
   newName.value = "";
   roomNumber.value = "";
@@ -822,6 +1155,7 @@ function clearSelectionForm() {
   roomFloor.value = "";
   roomBuilding.value = "";
   desc.value = "";
+  indoorGuide.value = "";
   imagePath.value = "";
   version.value = "";
   editedAt.value = "";
@@ -839,7 +1173,9 @@ function setSelection(root) {
   scene.add(selectedBox);
   selectedName.value = selectedRoot.name || "";
   selectedModel.value = modelSel.value || "";
-  newName.value = selectedRoot.name || "";
+  const parsed = parseRoomLabelDetails(selectedRoot.name || "");
+  newName.value = parsed.canonicalName || selectedRoot.name || "";
+  roomNumber.value = parsed.roomNumber || "";
   loadSelectedMeta().catch((err) => setStatus(`Meta load failed: ${err?.message || err}`, "#b42318"));
 }
 
@@ -933,28 +1269,38 @@ function exportBinary(root) {
 }
 
 async function loadModels() {
+  const previousValue = modelSel.value || "";
   const res = await fetch("room.php?action=list_models", { cache: "no-store" });
   const data = await res.json();
   if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
   const rows = Array.isArray(data.models) ? data.models : [];
+  modelRows = rows;
   modelSel.innerHTML = "";
   if (!rows.length) {
     modelSel.disabled = true;
     modelSel.innerHTML = "<option value=\"\">No model</option>";
     selectedModel.value = "";
+    saveBtn.disabled = true;
     await loadRoomsTable();
     return;
   }
   rows.forEach((r) => {
     const o = document.createElement("option");
     o.value = r.file;
-    o.textContent = r.isOriginal ? `${r.file} (original)` : r.file;
+    const tags = [];
+    if (r.isEditable) tags.push("default/editable");
+    else if (r.isLive) tags.push("live");
+    if (r.isOriginal) tags.push("original");
+    if (!r.isEditable) tags.push("archive");
+    o.textContent = tags.length ? `${r.file} (${tags.join(", ")})` : r.file;
     modelSel.appendChild(o);
   });
   modelSel.disabled = false;
   const names = rows.map((r) => r.file);
-  modelSel.value = names.includes(ORIGINAL) ? ORIGINAL : names[0];
+  const preferred = rows.find((r) => r.isEditable)?.file || rows.find((r) => r.isLive)?.file || (names.includes(ORIGINAL) ? ORIGINAL : names[0]);
+  modelSel.value = names.includes(previousValue) ? previousValue : preferred;
   selectedModel.value = modelSel.value || "";
+  updateEditorMode();
   await loadRoomsTable();
 }
 
@@ -979,30 +1325,60 @@ async function loadRoomsTable() {
 
 async function loadSelectedMeta() {
   if (!selectedRoot || !selectedRoot.name || !modelSel.value) return;
-  const url = `room.php?action=get_room_meta&model=${encodeURIComponent(modelSel.value)}&name=${encodeURIComponent(selectedRoot.name)}`;
-  const res = await fetch(url, { cache: "no-store" });
+  selectedDbRoomId = 0;
+  const parsedSelected = parseRoomLabelDetails(selectedRoot.name || "");
+  const buildingHints = collectRoomBuildingHints(selectedRoot, mapRoot);
+  const url = new URL("room.php", window.location.href);
+  url.searchParams.set("action", "get_room_meta");
+  url.searchParams.set("model", modelSel.value);
+  url.searchParams.set("name", selectedRoot.name);
+  if (buildingHints.length) {
+    url.searchParams.set("buildingHints", JSON.stringify(buildingHints));
+  }
+  const res = await fetch(url.toString(), { cache: "no-store" });
   const data = await res.json();
   if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
   if (!data.found || !data.room) {
-    roomNumber.value = "";
+    newName.value = parsedSelected.canonicalName || selectedRoot.name || "";
+    roomNumber.value = parsedSelected.roomNumber || "";
     roomType.value = "";
     roomFloor.value = "";
-    roomBuilding.value = "";
+    roomBuilding.value = buildingHints[0] || "";
     desc.value = "";
+    indoorGuide.value = "";
     imagePath.value = "";
     version.value = "";
     editedAt.value = "";
+    if (data?.ambiguous) {
+      const names = Array.isArray(data.candidates)
+        ? data.candidates
+            .map((candidate) => String(candidate?.building_name || "").trim())
+            .filter(Boolean)
+        : [];
+      const summary = names.length ? ` Matching buildings: ${Array.from(new Set(names)).join(", ")}.` : "";
+      setStatus(`Multiple DB room matches were found for ${selectedRoot.name}.${summary}`, "#b54708");
+    } else if (buildingHints.length) {
+      setStatus(`No DB metadata matched ${selectedRoot.name}. Inferred building hint: ${buildingHints[0]}.`, "#b54708");
+    } else {
+      setStatus(`No DB metadata matched ${selectedRoot.name}.`, "#b54708");
+    }
     return;
   }
   const b = data.room;
-  roomNumber.value = String(b.room_number || "");
+  const parsedDb = parseRoomLabelDetails(String(b.room_name || selectedRoot.name || ""));
+  const dbRoomNumber = b.room_number == null ? "" : String(b.room_number).trim();
+  selectedDbRoomId = Number(b.room_id || 0);
+  newName.value = String(b.room_name || parsedDb.canonicalName || parsedSelected.canonicalName || selectedRoot.name || "");
+  roomNumber.value = dbRoomNumber || parsedDb.roomNumber || parsedSelected.roomNumber || "";
   roomType.value = String(b.room_type || "");
-  roomFloor.value = String(b.floor_number || "");
+  roomFloor.value = b.floor_number == null ? "" : String(b.floor_number);
   roomBuilding.value = String(b.building_name || "");
   desc.value = String(b.description || "");
+  indoorGuide.value = String(b.indoor_guide_text || "");
   imagePath.value = String(b.image_path || "");
   version.value = b.last_seen_version_id != null ? String(b.last_seen_version_id) : "";
   editedAt.value = String(b.last_edited_at || "");
+  setStatus(`Loaded DB metadata for ${String(b.room_name || selectedRoot.name)}${b.building_name ? ` in ${b.building_name}` : ""}.`, "#0f766e");
 }
 
 async function loadMapModel() {
@@ -1037,7 +1413,11 @@ async function loadMapModel() {
   });
   await loadRoomsTable();
   if (roomNodeCount > 0) {
-    setStatus(`Model loaded. ROOM nodes: ${roomNodeCount}, clickable room meshes: ${roomPickMeshes.length}. Hover or tap/click a ROOM to edit.`, "#0f766e");
+    if (isCurrentModelEditable()) {
+      setStatus(`Model loaded. ROOM nodes: ${roomNodeCount}, clickable room meshes: ${roomPickMeshes.length}. Hover or tap/click a ROOM to edit.`, "#0f766e");
+    } else {
+      setStatus(`Model loaded in archive mode. ROOM nodes: ${roomNodeCount}, clickable room meshes: ${roomPickMeshes.length}. You can inspect metadata, but saving is disabled for this snapshot.`, "#b54708");
+    }
   } else {
     setStatus("Model loaded, but no ROOM nodes were found in this scene graph.", "#b42318");
   }
@@ -1050,6 +1430,10 @@ async function saveRoom() {
   }
   if (!modelSel.value) {
     setStatus("Select model first.", "#b42318");
+    return;
+  }
+  if (!isCurrentModelEditable()) {
+    setStatus("This snapshot is archive-only here. Switch the default model in Map Editor before saving room changes.", "#b54708");
     return;
   }
   const oldName = String(selectedRoot.name || "").trim();
@@ -1068,11 +1452,13 @@ async function saveRoom() {
     fd.append("modelFile", modelSel.value);
     fd.append("oldName", oldName);
     fd.append("newName", nextName);
+    if (selectedDbRoomId > 0) fd.append("roomId", String(selectedDbRoomId));
     fd.append("roomNumber", roomNumber.value || "");
     fd.append("roomType", roomType.value || "");
     fd.append("floorNumber", roomFloor.value || "");
     fd.append("buildingName", roomBuilding.value || "");
     fd.append("description", desc.value || "");
+    fd.append("indoorGuideText", indoorGuide.value || "");
     fd.append("imagePath", imagePath.value || "");
     fd.append("glb", new Blob([binary], { type: "model/gltf-binary" }), modelSel.value);
 
@@ -1085,6 +1471,7 @@ async function saveRoom() {
     if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
 
     selectedName.value = nextName;
+    selectedDbRoomId = Number(data.roomId || selectedDbRoomId || 0);
     version.value = data.versionId != null ? String(data.versionId) : "";
     editedAt.value = String(data.editedAt || "");
     await loadRoomsTable();
@@ -1158,6 +1545,7 @@ reloadBtn.addEventListener("click", () => {
 modelSel.addEventListener("change", () => {
   selectedModel.value = modelSel.value || "";
   setSelection(null);
+  updateEditorMode();
   loadRoomsTable().catch((err) => setStatus(`Table refresh failed: ${err?.message || err}`, "#b42318"));
 });
 saveBtn.addEventListener("click", () => {

@@ -11,6 +11,8 @@ function admin_layout_start(string $title, string $active = "") { ?>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title><?= htmlspecialchars($title) ?></title>
   <link rel="stylesheet" href="assets/admin.css" />
+  <?= isset($GLOBALS["admin_extra_head"]) ? (string)$GLOBALS["admin_extra_head"] : "" ?>
+  <script src="../js/on-screen-keyboard.js"></script>
 </head>
 <body>
   <div class="admin-shell">

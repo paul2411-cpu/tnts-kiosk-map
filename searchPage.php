@@ -9,6 +9,7 @@ header('Content-Type: text/html; charset=UTF-8');
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TANZA National Trade School - Search</title>
     <link rel="stylesheet" href="searchPage.css">
+    <script src="js/on-screen-keyboard.js"></script>
 </head>
 <body>
     <div class="kiosk-container">

@@ -394,7 +394,8 @@ function editor_ensure_snapshot_schema(mysqli $conn): void {
   if (!editor_db_col($conn, "rooms", "floor_number")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN floor_number VARCHAR(50) NULL AFTER room_type");
   if (!editor_db_col($conn, "rooms", "building_name")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN building_name VARCHAR(255) NULL AFTER floor_number");
   if (!editor_db_col($conn, "rooms", "description")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN description TEXT NULL AFTER building_name");
-  if (!editor_db_col($conn, "rooms", "image_path")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN image_path VARCHAR(255) NULL AFTER description");
+  if (!editor_db_col($conn, "rooms", "indoor_guide_text")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN indoor_guide_text TEXT NULL AFTER description");
+  if (!editor_db_col($conn, "rooms", "image_path")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN image_path VARCHAR(255) NULL AFTER indoor_guide_text");
   if (!editor_db_col($conn, "rooms", "source_model_file")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN source_model_file VARCHAR(255) NULL AFTER image_path");
   if (!editor_db_col($conn, "rooms", "first_seen_version_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
   if (!editor_db_col($conn, "rooms", "last_seen_version_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
@@ -482,6 +483,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       floor_number,
       building_name,
       description,
+      indoor_guide_text,
       image_path,
       source_model_file,
       first_seen_version_id,
@@ -490,12 +492,12 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       last_edited_at,
       last_edited_by_admin_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   ");
   if (!$insertRoomStmt) throw new RuntimeException("Failed to prepare cloned room insert");
 
   $roomQueryStmt = $conn->prepare("
-    SELECT room_name, room_number, room_type, floor_number, building_name, description, image_path, last_edited_at, last_edited_by_admin_id
+    SELECT room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
     FROM rooms
     WHERE source_model_file = ? AND building_id = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
     ORDER BY room_id ASC
@@ -540,12 +542,13 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       $floorNumber = trim((string)($room["floor_number"] ?? ""));
       $roomBuildingName = trim((string)($room["building_name"] ?? $buildingName));
       $roomDescription = trim((string)($room["description"] ?? ""));
+      $roomIndoorGuideText = trim((string)($room["indoor_guide_text"] ?? ""));
       $roomImagePath = trim((string)($room["image_path"] ?? ""));
       $roomEditedAt = isset($room["last_edited_at"]) ? (string)$room["last_edited_at"] : null;
       $roomEditedBy = isset($room["last_edited_by_admin_id"]) ? (int)$room["last_edited_by_admin_id"] : null;
 
       $insertRoomStmt->bind_param(
-        "issssssssiisi",
+        "isssssssssiisi",
         $newBuildingId,
         $roomName,
         $roomNumber,
@@ -553,6 +556,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
         $floorNumber,
         $roomBuildingName,
         $roomDescription,
+        $roomIndoorGuideText,
         $roomImagePath,
         $targetModel,
         $targetVersionId,
@@ -2159,6 +2163,7 @@ function handleBuildingKeyboardPress(e) {
 }
 
 function setupBuildingFilterKeyboard() {
+  if (window.TNTSOnScreenKeyboard) return;
   if (!buildingFilterEl) return;
 
   createBuildingKeyboard();
@@ -2755,6 +2760,7 @@ function normalizeBuildingName(name) {
 }
 
 const EXPORT_ENTITY_KIOSK_ROUTE_RE = /^KIOSK_START(?:\.\d+|\d+)?$/i;
+const EXPORT_ENTITY_ROAD_RE = /^road(?:[._-]\d+)?$/i;
 
 function normalizeExportBuildingName(name) {
   let n = String(name || "").trim();
@@ -2764,6 +2770,8 @@ function normalizeExportBuildingName(name) {
   if (!n) return "";
   if (isGroundLikeName(n)) return "";
   if (EXPORT_ENTITY_KIOSK_ROUTE_RE.test(n)) return "";
+  // Exported road groups are named road, road_1, road_2, etc.; never sync them as buildings.
+  if (EXPORT_ENTITY_ROAD_RE.test(n)) return "";
   return n;
 }
 

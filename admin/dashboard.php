@@ -3,6 +3,7 @@ require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_sync.php";
+require_once __DIR__ . "/inc/announcements.php";
 require_once __DIR__ . "/inc/layout.php";
 
 function dashboard_has_column(mysqli $conn, string $table, string $column): bool {
@@ -74,19 +75,7 @@ $roomCount = dashboard_count_active_model_or_all(
 $facilityCount = dashboard_scalar_count($conn, "SELECT COUNT(*) AS cnt FROM facilities");
 $eventCount = dashboard_scalar_count($conn, "SELECT COUNT(*) AS cnt FROM events");
 
-$recentAnnouncements = [];
-$annRes = $conn->query("
-  SELECT announcement_id, title, date_posted, expiry_date
-  FROM announcements
-  WHERE expiry_date IS NULL OR expiry_date >= CURDATE()
-  ORDER BY date_posted DESC
-  LIMIT 5
-");
-if ($annRes instanceof mysqli_result) {
-  while ($row = $annRes->fetch_assoc()) {
-    $recentAnnouncements[] = $row;
-  }
-}
+$recentAnnouncements = array_slice(announcements_load_rows($conn, true), 0, 5);
 
 admin_layout_start("Dashboard", "dashboard");
 ?>
@@ -121,13 +110,12 @@ admin_layout_start("Dashboard", "dashboard");
           $title = htmlspecialchars((string)($ann["title"] ?? ""), ENT_QUOTES, "UTF-8");
           $posted = (string)($ann["date_posted"] ?? "");
           $postedLabel = $posted !== "" ? date("M d, Y h:i A", strtotime($posted)) : "Unknown date";
-          $expiry = (string)($ann["expiry_date"] ?? "");
-          $expiryLabel = $expiry !== "" ? date("M d, Y", strtotime($expiry)) : "No expiry";
+          $scheduleLabel = announcements_format_schedule($ann);
         ?>
         <div style="padding:10px 12px;border:1px solid #eaecf0;border-radius:10px;">
           <div style="font-weight:800; color:#101828;"><?= $title ?></div>
           <div style="font-size:12px; color:#667085; margin-top:3px;">
-            Posted: <?= htmlspecialchars($postedLabel, ENT_QUOTES, "UTF-8") ?> | Expires: <?= htmlspecialchars($expiryLabel, ENT_QUOTES, "UTF-8") ?>
+            Posted: <?= htmlspecialchars($postedLabel, ENT_QUOTES, "UTF-8") ?> | Schedule: <?= htmlspecialchars($scheduleLabel, ENT_QUOTES, "UTF-8") ?>
           </div>
         </div>
       <?php endforeach; ?>

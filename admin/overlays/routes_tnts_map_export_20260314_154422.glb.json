@@ -1,7 +1,7 @@
 {
     "ok": true,
     "model": "tnts_map_export_20260314_154422.glb",
-    "updated": 1773820234,
+    "updated": 1773976096,
     "routes": {
         "epimasco_velasco": {
             "name": "EPIMASCO_VELASCO",
@@ -2885,8 +2885,8 @@
             ],
             "updated": 1773592251075
         },
-        "paul": {
-            "name": "paul",
+        "sota": {
+            "name": "SOTA",
             "distance": 117.70271427982956,
             "points": [
                 [

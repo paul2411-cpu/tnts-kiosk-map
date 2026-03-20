@@ -173,6 +173,12 @@ function import_clean_building_name(string $name): string {
   return substr($v, 0, 100);
 }
 
+function import_is_road_like_building_name(string $name): bool {
+  $v = trim($name);
+  if ($v === "") return false;
+  return (bool)preg_match('/^road(?:[._-]\d+)?$/i', $v);
+}
+
 function import_clean_room_name(string $name): string {
   $v = trim($name);
   $v = preg_replace('/\s+/', ' ', $v);
@@ -224,6 +230,9 @@ function import_ensure_schema(mysqli $conn): void {
   if (!import_column_exists($conn, "rooms", "source_model_file")) {
     import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN source_model_file VARCHAR(255) NULL AFTER description");
   }
+  if (!import_column_exists($conn, "rooms", "indoor_guide_text")) {
+    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN indoor_guide_text TEXT NULL AFTER description");
+  }
   if (!import_column_exists($conn, "rooms", "first_seen_version_id")) {
     import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
   }
@@ -232,6 +241,18 @@ function import_ensure_schema(mysqli $conn): void {
   }
   if (!import_column_exists($conn, "rooms", "is_present_in_latest")) {
     import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
+  }
+  if (!import_column_exists($conn, "rooms", "last_edited_at")) {
+    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
+  }
+  if (!import_column_exists($conn, "rooms", "last_edited_by_admin_id")) {
+    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
+  }
+  if (!import_column_exists($conn, "buildings", "last_edited_at")) {
+    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
+  }
+  if (!import_column_exists($conn, "buildings", "last_edited_by_admin_id")) {
+    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
   }
 }
 
@@ -546,6 +567,7 @@ if (isset($_GET["action"])) {
       if (!is_array($buildingRow)) continue;
       $buildingName = import_clean_building_name((string)($buildingRow["name"] ?? ""));
       if ($buildingName === "") continue;
+      if (import_is_road_like_building_name($buildingName)) continue;
       $totalBuildings++;
       $roomsIn = isset($buildingRow["rooms"]) && is_array($buildingRow["rooms"]) ? $buildingRow["rooms"] : [];
       $uniqueRooms = [];
@@ -570,6 +592,7 @@ if (isset($_GET["action"])) {
       "roomsInserted" => 0,
       "roomsExisting" => 0,
       "buildingsUnclassified" => 0,
+      "skippedRoadLikeBuildings" => 0,
       "skippedBuildingNames" => 0,
       "skippedRoomNames" => 0,
       "buildingsMissingAfterSync" => 0,
@@ -605,15 +628,15 @@ if (isset($_GET["action"])) {
         LIMIT 1
       ");
       $selectBuildingTemplateStmt = $conn->prepare("
-        SELECT description, image_path
+        SELECT description, image_path, last_edited_at, last_edited_by_admin_id
         FROM buildings
         WHERE building_name = ?
         ORDER BY building_id DESC
         LIMIT 1
       ");
       $insertBuildingStmt = $conn->prepare("
-        INSERT INTO buildings (building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
+        INSERT INTO buildings (building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateBuildingSeenStmt = $conn->prepare("
         UPDATE buildings
@@ -626,15 +649,15 @@ if (isset($_GET["action"])) {
         WHERE source_model_file = ? AND building_id = ?
       ");
       $selectRoomTemplateStmt = $conn->prepare("
-        SELECT room_number, room_type, floor_number, description, image_path
+        SELECT room_number, room_type, floor_number, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
         FROM rooms
         WHERE room_name = ? AND building_name = ?
         ORDER BY room_id DESC
         LIMIT 1
       ");
       $insertRoomStmt = $conn->prepare("
-        INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateRoomSeenStmt = $conn->prepare("
         UPDATE rooms
@@ -671,6 +694,10 @@ if (isset($_GET["action"])) {
           $summary["skippedBuildingNames"]++;
           continue;
         }
+        if (import_is_road_like_building_name($buildingName)) {
+          $summary["skippedRoadLikeBuildings"]++;
+          continue;
+        }
 
         $selectBuildingStmt->bind_param("ss", $modelFile, $buildingName);
         if (!$selectBuildingStmt->execute()) {
@@ -690,6 +717,8 @@ if (isset($_GET["action"])) {
         } else {
           $buildingDescription = "";
           $buildingImagePath = "";
+          $buildingEditedAt = null;
+          $buildingEditedBy = null;
           $selectBuildingTemplateStmt->bind_param("s", $buildingName);
           if (!$selectBuildingTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query building template");
@@ -699,9 +728,11 @@ if (isset($_GET["action"])) {
           if ($templateRow) {
             $buildingDescription = import_copy_text($templateRow["description"] ?? "");
             $buildingImagePath = import_copy_text($templateRow["image_path"] ?? "");
+            $buildingEditedAt = isset($templateRow["last_edited_at"]) ? (string)$templateRow["last_edited_at"] : null;
+            $buildingEditedBy = isset($templateRow["last_edited_by_admin_id"]) ? (int)$templateRow["last_edited_by_admin_id"] : null;
           }
 
-          $insertBuildingStmt->bind_param("ssssii", $buildingName, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId);
+          $insertBuildingStmt->bind_param("ssssiisi", $buildingName, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
           if (!$insertBuildingStmt->execute()) {
             throw new RuntimeException("Failed to insert building: " . $buildingName);
           }
@@ -759,7 +790,10 @@ if (isset($_GET["action"])) {
           $roomType = "";
           $floorNumber = "";
           $roomDescription = "";
+          $roomIndoorGuideText = "";
           $roomImagePath = "";
+          $roomEditedAt = null;
+          $roomEditedBy = null;
           $selectRoomTemplateStmt->bind_param("ss", $roomName, $buildingName);
           if (!$selectRoomTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query room template");
@@ -771,11 +805,14 @@ if (isset($_GET["action"])) {
             $roomType = import_copy_text($roomTemplate["room_type"] ?? "");
             $floorNumber = import_copy_text($roomTemplate["floor_number"] ?? "");
             $roomDescription = import_copy_text($roomTemplate["description"] ?? "");
+            $roomIndoorGuideText = import_copy_text($roomTemplate["indoor_guide_text"] ?? "");
             $roomImagePath = import_copy_text($roomTemplate["image_path"] ?? "");
+            $roomEditedAt = isset($roomTemplate["last_edited_at"]) ? (string)$roomTemplate["last_edited_at"] : null;
+            $roomEditedBy = isset($roomTemplate["last_edited_by_admin_id"]) ? (int)$roomTemplate["last_edited_by_admin_id"] : null;
           }
 
           $insertRoomStmt->bind_param(
-            "issssssssii",
+            "isssssssssiisi",
             $buildingId,
             $roomName,
             $roomNumber,
@@ -783,10 +820,13 @@ if (isset($_GET["action"])) {
             $floorNumber,
             $buildingName,
             $roomDescription,
+            $roomIndoorGuideText,
             $roomImagePath,
             $modelFile,
             $versionId,
-            $versionId
+            $versionId,
+            $roomEditedAt,
+            $roomEditedBy
           );
           if (!$insertRoomStmt->execute()) {
             throw new RuntimeException("Failed to insert room: " . $roomName);
@@ -954,6 +994,7 @@ const auditBody = document.getElementById("audit-body");
 
 const GENERIC_NODE_NAMES = new Set(["scene", "auxscene", "root", "rootnode", "gltf", "model", "group"]);
 const KIOSK_ROUTE_RE = /^KIOSK_START(?:\.\d+|\d+)?$/i;
+const ROAD_LIKE_BUILDING_RE = /^road(?:[._-]\d+)?$/i;
 
 let selectedModelFile = "";
 let selectedBackupFile = "";
@@ -1010,6 +1051,8 @@ function normalizeBuildingName(name) {
   if (!n) return "";
   if (isGroundLikeName(n)) return "";
   if (KIOSK_ROUTE_RE.test(n)) return "";
+  // Exported road groups are named road, road_1, road_2, etc.; never import them as buildings.
+  if (ROAD_LIKE_BUILDING_RE.test(n)) return "";
   return n;
 }
 

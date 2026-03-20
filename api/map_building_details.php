@@ -89,6 +89,8 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
   $hasRoomType = has_column($conn, "rooms", "room_type");
   $hasFloor = has_column($conn, "rooms", "floor_number");
   $hasDescription = has_column($conn, "rooms", "description");
+  $hasIndoorGuideText = has_column($conn, "rooms", "indoor_guide_text");
+  $hasEdited = has_column($conn, "rooms", "last_edited_at");
 
   $where = " WHERE r.room_name IS NOT NULL AND r.room_name <> ''";
   if ($hasRoomPresent) $where .= " AND (r.is_present_in_latest = 1 OR r.is_present_in_latest IS NULL)";
@@ -120,6 +122,7 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
     . ", " . ($hasRoomType ? "r.room_type" : "NULL AS room_type")
     . ", " . ($hasFloor ? "r.floor_number" : "NULL AS floor_number")
     . ", " . ($hasDescription ? "r.description" : "NULL AS description")
+    . ", " . ($hasIndoorGuideText ? "r.indoor_guide_text" : "NULL AS indoor_guide_text")
     . ", " . ($hasRoomSource ? "r.source_model_file" : "NULL AS source_model_file")
     . " FROM rooms r"
     . $where;
@@ -128,6 +131,9 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
   if ($hasFloor) $orderParts[] = "r.floor_number ASC";
   if ($hasRoomNumber) $orderParts[] = "r.room_number ASC";
   $orderParts[] = "r.room_name ASC";
+  if ($hasIndoorGuideText) $orderParts[] = "(CASE WHEN r.indoor_guide_text IS NULL OR TRIM(r.indoor_guide_text) = '' THEN 1 ELSE 0 END) ASC";
+  if ($hasEdited) $orderParts[] = "r.last_edited_at DESC";
+  if ($hasRoomId) $orderParts[] = "r.room_id DESC";
   $sql .= " ORDER BY " . implode(", ", $orderParts);
 
   $stmt = $conn->prepare($sql);
@@ -143,7 +149,17 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
     while ($row = $res->fetch_assoc()) $rows[] = $row;
   }
   $stmt->close();
-  return $rows;
+  $deduped = [];
+  $seen = [];
+  foreach ($rows as $row) {
+    $roomName = trim((string)($row["room_name"] ?? ""));
+    if ($roomName === "") continue;
+    $dedupeKey = mb_strtolower($roomName . "|" . trim((string)($row["room_number"] ?? "")) . "|" . trim((string)($row["floor_number"] ?? "")));
+    if (isset($seen[$dedupeKey])) continue;
+    $seen[$dedupeKey] = true;
+    $deduped[] = $row;
+  }
+  return $deduped;
 }
 
 $requestedModel = map_sync_sanitize_glb_name($_GET["model"] ?? "");
@@ -194,6 +210,7 @@ try {
         "roomType" => trim((string)($row["room_type"] ?? "")),
         "floorNumber" => trim((string)($row["floor_number"] ?? "")),
         "description" => trim((string)($row["description"] ?? "")),
+        "indoorGuideText" => trim((string)($row["indoor_guide_text"] ?? "")),
         "modelFile" => trim((string)($row["source_model_file"] ?? ""))
       ];
     }, $rooms)

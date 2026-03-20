@@ -38,6 +38,12 @@ function bld_model_name(string $raw): ?string {
   return $base;
 }
 
+function bld_is_road_like_name(string $raw): bool {
+  $name = trim($raw);
+  if ($name === "") return false;
+  return (bool)preg_match('/^road(?:[._-]\d+)?$/i', $name);
+}
+
 function bld_col(mysqli $conn, string $table, string $col): bool {
   $safeTable = str_replace("`", "``", $table);
   $safeCol = $conn->real_escape_string($col);
@@ -145,20 +151,39 @@ function bld_sync_linked_room_names(mysqli $conn, int $buildingId, string $oldNa
   $stmt->close();
 }
 
+function bld_editor_model_file(): ?string {
+  return map_sync_resolve_editor_model(dirname(__DIR__));
+}
+
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
   $action = (string)$_GET["action"];
 
   if ($action === "list_models") {
+    $editorModel = bld_editor_model_file();
+    $publicState = map_sync_resolve_public_model(dirname(__DIR__));
+    $publicModel = trim((string)($publicState["modelFile"] ?? ""));
     $rows = [];
     if (is_dir($MODEL_DIR)) {
       foreach (scandir($MODEL_DIR) as $f) {
         if ($f === "." || $f === "..") continue;
         if (!preg_match('/\.glb$/i', $f)) continue;
-        $rows[] = ["file" => $f, "isOriginal" => strcasecmp($f, $ORIGINAL_MODEL_NAME) === 0];
+        $rows[] = [
+          "file" => $f,
+          "isOriginal" => strcasecmp($f, $ORIGINAL_MODEL_NAME) === 0,
+          "isDefault" => ($editorModel !== null && strcasecmp($f, $editorModel) === 0),
+          "isLive" => ($publicModel !== "" && strcasecmp($f, $publicModel) === 0),
+          "isEditable" => ($editorModel !== null && strcasecmp($f, $editorModel) === 0)
+        ];
       }
     }
-    usort($rows, fn($a, $b) => strnatcasecmp($a["file"], $b["file"]));
+    usort($rows, static function(array $a, array $b): int {
+      $editableCmp = ((int)!empty($a["isEditable"])) <=> ((int)!empty($b["isEditable"]));
+      if ($editableCmp !== 0) return -$editableCmp;
+      $liveCmp = ((int)!empty($a["isLive"])) <=> ((int)!empty($b["isLive"]));
+      if ($liveCmp !== 0) return -$liveCmp;
+      return strnatcasecmp((string)$a["file"], (string)$b["file"]);
+    });
     echo json_encode(["ok" => true, "models" => $rows], JSON_PRETTY_PRINT);
     exit;
   }
@@ -246,6 +271,10 @@ if (isset($_GET["action"])) {
     bld_post_csrf();
     $modelFile = bld_model_name((string)($_POST["modelFile"] ?? ""));
     if ($modelFile === null) bld_fail(400, "Invalid model file");
+    $editableModel = bld_editor_model_file();
+    if ($editableModel !== null && strcasecmp($editableModel, $modelFile) !== 0) {
+      bld_fail(409, "Only the default admin model can be edited here. Switch the default model in Map Editor before editing this snapshot.");
+    }
     $modelPath = $MODEL_DIR . "/" . $modelFile;
     if (!file_exists($modelPath)) bld_fail(404, "Model not found");
 
@@ -257,6 +286,9 @@ if (isset($_GET["action"])) {
     if ($newName === "") bld_fail(400, "Missing new name");
     if (mb_strlen($newName) > 100) bld_fail(400, "Building name too long");
     if (mb_strlen($imagePath) > 255) bld_fail(400, "Image path too long");
+    if (bld_is_road_like_name($oldName) || bld_is_road_like_name($newName)) {
+      bld_fail(400, "Road objects cannot be saved as buildings");
+    }
 
     if (!isset($_FILES["glb"])) bld_fail(400, "Missing GLB upload");
     if ((int)($_FILES["glb"]["error"] ?? 1) !== UPLOAD_ERR_OK) bld_fail(400, "GLB upload error");
@@ -530,6 +562,7 @@ let selectedRoot = null;
 let hoverRoot = null;
 let selectedBox = null;
 let hoverBox = null;
+let modelRows = [];
 const TOUCH_TAP_SLOP_PX = 10;
 const TOUCH_CLICK_SUPPRESS_MS = 450;
 const activeTouchPointerIds = new Set();
@@ -550,11 +583,36 @@ function esc(v) {
     .replaceAll("'", "&#39;");
 }
 
+function currentModelMeta() {
+  return modelRows.find((row) => String(row?.file || "") === String(modelSel.value || "")) || null;
+}
+
+function isCurrentModelEditable() {
+  const meta = currentModelMeta();
+  return !meta || !!meta.isEditable;
+}
+
+function updateEditorMode() {
+  const meta = currentModelMeta();
+  const editable = isCurrentModelEditable();
+  saveBtn.disabled = !editable;
+  saveBtn.title = editable ? "" : "Archive models are read-only here. Switch the default model in Map Editor to edit this snapshot.";
+  if (!editable && meta?.file) {
+    setStatus(`Archive snapshot selected: ${meta.file}. Switch the default model in Map Editor to edit this snapshot.`, "#b54708");
+  }
+}
+
 function isGroundName(name) {
   const n = String(name || "").trim().toLowerCase();
   if (!n) return false;
   if (n === "ground" || n === "cground") return true;
   return /(^|[^a-z0-9])c?ground($|[^a-z0-9])/i.test(n);
+}
+
+function isRoadLikeName(name) {
+  const n = String(name || "").trim();
+  if (!n) return false;
+  return /^road(?:[._-]\d+)?$/i.test(n);
 }
 
 function isGenericName(name) {
@@ -567,7 +625,7 @@ function topNamedAncestor(obj, root) {
   let p = obj;
   let top = null;
   while (p && p !== root) {
-    if (p.name && !isGenericName(p.name) && !isGroundName(p.name)) top = p;
+    if (p.name && !isGenericName(p.name) && !isGroundName(p.name) && !isRoadLikeName(p.name)) top = p;
     p = p.parent;
   }
   return top;
@@ -697,28 +755,38 @@ function exportBinary(root) {
 }
 
 async function loadModels() {
+  const previousValue = modelSel.value || "";
   const res = await fetch("building.php?action=list_models", { cache: "no-store" });
   const data = await res.json();
   if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
   const rows = Array.isArray(data.models) ? data.models : [];
+  modelRows = rows;
   modelSel.innerHTML = "";
   if (!rows.length) {
     modelSel.disabled = true;
     modelSel.innerHTML = "<option value=\"\">No model</option>";
     selectedModel.value = "";
+    saveBtn.disabled = true;
     await loadBuildingsTable();
     return;
   }
   rows.forEach((r) => {
     const o = document.createElement("option");
     o.value = r.file;
-    o.textContent = r.isOriginal ? `${r.file} (original)` : r.file;
+    const tags = [];
+    if (r.isEditable) tags.push("default/editable");
+    else if (r.isLive) tags.push("live");
+    if (r.isOriginal) tags.push("original");
+    if (!r.isEditable) tags.push("archive");
+    o.textContent = tags.length ? `${r.file} (${tags.join(", ")})` : r.file;
     modelSel.appendChild(o);
   });
   modelSel.disabled = false;
   const names = rows.map((r) => r.file);
-  modelSel.value = names.includes(ORIGINAL) ? ORIGINAL : names[0];
+  const preferred = rows.find((r) => r.isEditable)?.file || rows.find((r) => r.isLive)?.file || (names.includes(ORIGINAL) ? ORIGINAL : names[0]);
+  modelSel.value = names.includes(previousValue) ? previousValue : preferred;
   selectedModel.value = modelSel.value || "";
+  updateEditorMode();
   await loadBuildingsTable();
 }
 
@@ -788,7 +856,11 @@ async function loadMapModel() {
     );
   });
   await loadBuildingsTable();
-  setStatus("Model loaded. Tap/click a building to edit.", "#0f766e");
+  if (isCurrentModelEditable()) {
+    setStatus("Model loaded. Tap/click a building to edit.", "#0f766e");
+  } else {
+    setStatus("Model loaded in archive mode. You can inspect metadata, but saving is disabled for this snapshot.", "#b54708");
+  }
 }
 
 async function saveBuilding() {
@@ -798,6 +870,10 @@ async function saveBuilding() {
   }
   if (!modelSel.value) {
     setStatus("Select model first.", "#b42318");
+    return;
+  }
+  if (!isCurrentModelEditable()) {
+    setStatus("This snapshot is archive-only here. Switch the default model in Map Editor before saving building changes.", "#b54708");
     return;
   }
   const oldName = String(selectedRoot.name || "").trim();
@@ -902,6 +978,7 @@ reloadBtn.addEventListener("click", () => {
 modelSel.addEventListener("change", () => {
   selectedModel.value = modelSel.value || "";
   setSelection(null);
+  updateEditorMode();
   loadBuildingsTable().catch((err) => setStatus(`Table refresh failed: ${err?.message || err}`, "#b42318"));
 });
 saveBtn.addEventListener("click", () => {

@@ -26,6 +26,22 @@ const mapView3dBtn = document.getElementById("map-view-3d-btn");
 const mapView2dBtn = document.getElementById("map-view-2d-btn");
 const mapZoomSlider = document.getElementById("map-zoom-slider");
 const mapZoomValue = document.getElementById("map-zoom-value");
+const eventFocusCard = document.getElementById("event-focus-card");
+const eventFocusSchedule = document.getElementById("event-focus-schedule");
+const eventFocusHealth = document.getElementById("event-focus-health");
+const eventFocusTitle = document.getElementById("event-focus-title");
+const eventFocusDate = document.getElementById("event-focus-date");
+const eventFocusLocation = document.getElementById("event-focus-location");
+const eventFocusCopy = document.getElementById("event-focus-copy");
+const eventFocusMessage = document.getElementById("event-focus-message");
+const eventFocusCloseBtn = document.getElementById("event-focus-close-btn");
+const eventFocusMapBtn = document.getElementById("event-focus-map-btn");
+const eventFocusRouteBtn = document.getElementById("event-focus-route-btn");
+const pageUrl = new URL(window.location.href);
+const requestedEventId = Number.parseInt(pageUrl.searchParams.get("event") || "", 10) || 0;
+const requestedEventAutoRoute = ["1", "true", "yes"].includes(
+  String(pageUrl.searchParams.get("autoroute") || "").toLowerCase()
+);
 
 
 // ==========================
@@ -357,6 +373,7 @@ function kbHandlePress(e) {
 
 // ----- INIT -----
 function setupOnScreenKeyboard() {
+  if (window.TNTSOnScreenKeyboard) return;
   const input = getSearchInput();
   if (!input) {
     console.warn("On-screen keyboard: search input not found. Set SEARCH_INPUT_SELECTOR.");
@@ -626,6 +643,7 @@ function ensureNavigationOverlayStyles() {
 
 let navigationOverlayLayer = null;
 let kioskMarkerEl = null;
+let eventAreaMarkerGroup = null;
 
 function ensureNavigationOverlayLayer() {
   ensureNavigationOverlayStyles();
@@ -657,6 +675,148 @@ function ensureKioskMarker() {
     layer.appendChild(kioskMarkerEl);
   }
   return kioskMarkerEl;
+}
+
+function setEventPillState(element, label, variantClass) {
+  if (!element) return;
+  element.className = "event-focus-card__pill";
+  if (!label) {
+    element.classList.add("hidden");
+    element.textContent = "";
+    return;
+  }
+  if (variantClass) element.classList.add(variantClass);
+  element.classList.remove("hidden");
+  element.textContent = label;
+}
+
+function showEventFocusCard() {
+  eventFocusCard?.classList.remove("hidden");
+}
+
+function hideEventFocusCard() {
+  eventFocusCard?.classList.add("hidden");
+}
+
+function renderEventFocusPayload(payload) {
+  if (!eventFocusCard || !payload) return;
+
+  setEventPillState(
+    eventFocusSchedule,
+    String(payload.scheduleLabel || "").trim(),
+    payload.schedule ? `schedule-${payload.schedule}` : ""
+  );
+  setEventPillState(
+    eventFocusHealth,
+    String(payload.healthLabel || "").trim(),
+    payload.health ? `health-${payload.health}` : ""
+  );
+
+  if (eventFocusTitle) eventFocusTitle.textContent = payload.title || "Event";
+  if (eventFocusDate) eventFocusDate.textContent = payload.dateLabel || "Date TBA";
+  if (eventFocusLocation) eventFocusLocation.textContent = payload.locationLabel || "Location to be announced";
+  if (eventFocusCopy) {
+    eventFocusCopy.textContent = payload.description || "No additional event details were provided.";
+  }
+  if (eventFocusMessage) {
+    eventFocusMessage.textContent = payload.healthMessage || "This event does not have a map action right now.";
+  }
+  if (eventFocusMapBtn) {
+    eventFocusMapBtn.classList.toggle("hidden", !payload.canMap);
+  }
+  if (eventFocusRouteBtn) {
+    eventFocusRouteBtn.disabled = !payload.canRoute;
+    eventFocusRouteBtn.classList.toggle("hidden", !payload.canRoute);
+  }
+
+  showEventFocusCard();
+}
+
+function showEventNoticeCard(title, message) {
+  renderEventFocusPayload({
+    title: title || "Event unavailable",
+    description: "",
+    dateLabel: "",
+    locationLabel: "Map preview",
+    health: "broken",
+    healthLabel: "Unavailable",
+    healthMessage: message || "The requested event could not be loaded.",
+    canMap: false,
+    canRoute: false,
+    schedule: "",
+    scheduleLabel: ""
+  });
+  if (eventFocusMapBtn) eventFocusMapBtn.classList.add("hidden");
+  if (eventFocusRouteBtn) eventFocusRouteBtn.classList.add("hidden");
+}
+
+function clearEventAreaHighlight() {
+  if (eventAreaMarkerGroup) {
+    eventAreaMarkerGroup.visible = false;
+  }
+}
+
+function ensureEventAreaHighlight() {
+  if (eventAreaMarkerGroup) return eventAreaMarkerGroup;
+
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(6.5, 8, 72),
+    new THREE.MeshBasicMaterial({
+      color: 0xb42318,
+      transparent: true,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+  );
+  ring.rotation.x = -Math.PI / 2;
+
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(1.1, 24, 16),
+    new THREE.MeshStandardMaterial({
+      color: 0xdc2626,
+      emissive: 0x7f1d1d,
+      emissiveIntensity: 0.44,
+    })
+  );
+  core.position.y = 1.2;
+
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.08, 0.08, 2.4, 16),
+    new THREE.MeshStandardMaterial({ color: 0x111827 })
+  );
+  stem.position.y = 1.2;
+
+  eventAreaMarkerGroup = new THREE.Group();
+  eventAreaMarkerGroup.visible = false;
+  eventAreaMarkerGroup.add(ring, core, stem);
+  scene.add(eventAreaMarkerGroup);
+  return eventAreaMarkerGroup;
+}
+
+function renderEventAreaHighlight(point, radius = 8) {
+  if (!point) {
+    clearEventAreaHighlight();
+    return;
+  }
+
+  const safeRadius = Math.max(2, Number(radius) || 8);
+  const marker = ensureEventAreaHighlight();
+  marker.visible = true;
+  marker.position.copy(point);
+
+  const ring = marker.children[0];
+  if (ring?.geometry) ring.geometry.dispose();
+  ring.geometry = new THREE.RingGeometry(safeRadius * 0.84, safeRadius, 72);
+  ring.rotation.x = -Math.PI / 2;
+}
+
+function updateEventAreaHighlightAnimation(timeMs) {
+  if (!eventAreaMarkerGroup?.visible) return;
+  const ring = eventAreaMarkerGroup.children[0];
+  if (!ring) return;
+  const pulse = 1 + (Math.sin(timeMs / 340) * 0.05);
+  ring.scale.setScalar(pulse);
 }
 
 // --- Controls
@@ -777,7 +937,9 @@ function buildControlsForMode(cameraObject, mode) {
     };
     nextControls.touches = {
       ONE: THREE.TOUCH.PAN,
-      TWO: THREE.TOUCH.PAN,
+      // OrbitControls only supports TWO as DOLLY_PAN or DOLLY_ROTATE.
+      // With enableZoom disabled, DOLLY_PAN still gives us two-finger pan.
+      TWO: THREE.TOUCH.DOLLY_PAN,
     };
   } else {
     nextControls.enableRotate = true;
@@ -791,7 +953,8 @@ function buildControlsForMode(cameraObject, mode) {
     };
     nextControls.touches = {
       ONE: THREE.TOUCH.ROTATE,
-      TWO: THREE.TOUCH.PAN,
+      // Keep two-finger movement in the supported DOLLY_PAN mode so touch panning works.
+      TWO: THREE.TOUCH.DOLLY_PAN,
     };
     nextControls.minDistance = 0;
     nextControls.maxDistance = mapWorldDiagonal * 5;
@@ -901,6 +1064,63 @@ function setViewMode(nextMode, { reset = false } = {}) {
   }
 }
 
+const eventFocusBounds = new THREE.Box3();
+const eventFocusCenter = new THREE.Vector3();
+const eventFocusSize = new THREE.Vector3();
+
+function syncCameraToCurrentViewState() {
+  if (!controls) return;
+
+  if (currentViewMode === VIEW_MODE_2D) {
+    orthographicCamera.position.set(
+      orthographicViewState.target.x,
+      orthographicViewState.target.y + getOrthoCameraHeightOffset(),
+      orthographicViewState.target.z
+    );
+    controls.object = orthographicCamera;
+    controls.target.copy(orthographicViewState.target);
+    orthographicCamera.updateProjectionMatrix();
+  } else {
+    perspectiveCamera.position.copy(perspectiveViewState.position);
+    controls.object = perspectiveCamera;
+    controls.target.copy(perspectiveViewState.target);
+    perspectiveCamera.updateProjectionMatrix();
+  }
+
+  controls.update();
+  syncZoomUi();
+}
+
+function focusActiveViewOnPoint(point, { distanceScale = 0.2 } = {}) {
+  if (!point) return;
+
+  if (currentViewMode === VIEW_MODE_2D) {
+    orthographicViewState.target.copy(point);
+    syncCameraToCurrentViewState();
+    return;
+  }
+
+  const distance = Math.max(mapWorldDiagonal * distanceScale, 14);
+  perspectiveViewState.target.copy(point);
+  perspectiveViewState.position
+    .copy(point)
+    .add(DEFAULT_VIEW_DIRECTION.clone().multiplyScalar(distance));
+  syncCameraToCurrentViewState();
+}
+
+function focusActiveViewOnObject(object3D) {
+  if (!object3D) return;
+  eventFocusBounds.setFromObject(object3D);
+  if (eventFocusBounds.isEmpty()) return;
+
+  eventFocusBounds.getCenter(eventFocusCenter);
+  eventFocusBounds.getSize(eventFocusSize);
+  const diagonal = Math.max(eventFocusSize.length(), 1);
+  focusActiveViewOnPoint(eventFocusCenter, {
+    distanceScale: Math.max(0.14, Math.min((diagonal / Math.max(mapWorldDiagonal, 1)) * 1.8, 0.3))
+  });
+}
+
 // --- Resize to container
 function resizeToContainer() {
   const rect = mapStage.getBoundingClientRect();
@@ -944,7 +1164,6 @@ const mouse = new THREE.Vector2();
 const activeTouchPointers = new Map();
 let touchSceneTap = null;
 let suppressSceneClickUntil = 0;
-let pinchDistance = 0;
 let isSceneHoverActive = false;
 
 function setMouseFromEvent(event) {
@@ -966,21 +1185,97 @@ canvas.addEventListener("pointerleave", () => {
 });
 
 // ==========================
-// Custom wheel / pinch zoom
+// Custom wheel gesture handling
 // ==========================
 const WHEEL_ZOOM_FACTOR = 0.06;
 const TOUCH_TAP_SLOP_PX = 12;
 const TOUCH_CLICK_SUPPRESS_MS = 450;
-const TOUCH_PINCH_SLOP_PX = 2;
-const TOUCH_ZOOM_FACTOR = 0.18;
+const WHEEL_MOUSE_STEP_THRESHOLD = 72;
+const wheelPanOffset = new THREE.Vector3();
+const wheelPanAxis = new THREE.Vector3();
+const wheelPanAxisAlt = new THREE.Vector3();
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
+function isLikelyMouseWheelEvent(event) {
+  const absDeltaX = Math.abs(event.deltaX);
+  const absDeltaY = Math.abs(event.deltaY);
+  if (event.deltaMode === 1 || event.deltaMode === 2) return true;
+  return absDeltaX === 0 && absDeltaY >= WHEEL_MOUSE_STEP_THRESHOLD && Number.isInteger(absDeltaY);
+}
+
+function shouldPanFromWheel(event) {
+  if (event.ctrlKey || event.metaKey) return false;
+  if (Math.abs(event.deltaX) > 0) return true;
+  return !isLikelyMouseWheelEvent(event);
+}
+
+function panActiveViewByWheel(deltaX, deltaY) {
+  if (!controls || !camera) return;
+
+  const element = renderer.domElement;
+  const width = Math.max(1, element.clientWidth || 1);
+  const height = Math.max(1, element.clientHeight || 1);
+  const panSpeed = Number(controls.panSpeed) || 1;
+
+  wheelPanOffset.set(0, 0, 0);
+
+  const panLeft = (distance) => {
+    wheelPanAxis.setFromMatrixColumn(camera.matrix, 0);
+    wheelPanAxis.multiplyScalar(-distance);
+    wheelPanOffset.add(wheelPanAxis);
+  };
+
+  const panUp = (distance) => {
+    if (controls.screenSpacePanning) {
+      wheelPanAxis.setFromMatrixColumn(camera.matrix, 1);
+    } else {
+      wheelPanAxis.setFromMatrixColumn(camera.matrix, 0);
+      wheelPanAxisAlt.crossVectors(camera.up, wheelPanAxis);
+      wheelPanAxis.copy(wheelPanAxisAlt);
+    }
+    wheelPanAxis.multiplyScalar(distance);
+    wheelPanOffset.add(wheelPanAxis);
+  };
+
+  if (camera.isPerspectiveCamera) {
+    const targetDistance =
+      camera.position.distanceTo(controls.target) * Math.tan((camera.fov * Math.PI / 180) / 2);
+    panLeft((2 * deltaX * targetDistance / height) * panSpeed);
+    panUp((2 * deltaY * targetDistance / height) * panSpeed);
+  } else if (camera.isOrthographicCamera) {
+    panLeft((deltaX * (camera.right - camera.left) / camera.zoom / width) * panSpeed);
+    panUp((deltaY * (camera.top - camera.bottom) / camera.zoom / height) * panSpeed);
+  } else {
+    return;
+  }
+
+  controls.target.add(wheelPanOffset);
+  camera.position.add(wheelPanOffset);
+  camera.updateMatrixWorld();
+
+  if (currentViewMode === VIEW_MODE_2D) {
+    orthographicViewState.target.copy(controls.target);
+  } else {
+    perspectiveViewState.target.copy(controls.target);
+    perspectiveViewState.position.copy(perspectiveCamera.position);
+  }
+
+  controls.update();
+}
+
 function onWheelZoom(e) {
   e.preventDefault();
   e.stopPropagation();
+
+  if (shouldPanFromWheel(e)) {
+    panActiveViewByWheel(e.deltaX, e.deltaY);
+    logCameraState("WHEEL_PAN");
+    return;
+  }
+
   nudgeActiveZoomPercent(-e.deltaY * WHEEL_ZOOM_FACTOR);
   logCameraState("WHEEL_ZOOM");
 }
@@ -998,31 +1293,6 @@ function trackTouchPointer(event) {
 
 function releaseTouchPointer(pointerId) {
   activeTouchPointers.delete(pointerId);
-  if (activeTouchPointers.size < 2) pinchDistance = 0;
-}
-
-function getTouchDistance() {
-  const points = Array.from(activeTouchPointers.values());
-  if (points.length < 2) return 0;
-  const [a, b] = points;
-  return Math.hypot(b.x - a.x, b.y - a.y);
-}
-
-function updateTouchZoom() {
-  if (activeTouchPointers.size < 2) {
-    pinchDistance = 0;
-    return;
-  }
-  const distance = getTouchDistance();
-  if (!(distance > 0)) return;
-  if (!(pinchDistance > 0)) {
-    pinchDistance = distance;
-    return;
-  }
-  const delta = distance - pinchDistance;
-  if (Math.abs(delta) < TOUCH_PINCH_SLOP_PX) return;
-  nudgeActiveZoomPercent(delta * TOUCH_ZOOM_FACTOR);
-  pinchDistance = distance;
 }
 
 function isEventOnCanvas(event) {
@@ -1038,6 +1308,7 @@ function isEventOnCanvas(event) {
 const LIVE_MAP_ENDPOINT = "../api/map_live.php";
 const BUILDING_DETAILS_ENDPOINT = "../api/map_building_details.php";
 const SEARCH_INDEX_ENDPOINT = "../api/map_search.php";
+const EVENT_DETAILS_ENDPOINT = "../api/event_details.php";
 const FALLBACK_MODEL_URL = "../models/tnts_navigation.glb";
 const LIVE_POLL_INTERVAL_MS = 30000;
 
@@ -1047,6 +1318,7 @@ let routeNamesForSearch = [];      // display names
 let dbBuildingNamesForSearch = []; // DB building names
 let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
 let dbBuildingsByKey = new Map();  // normalized building name -> metadata
+let dbRoomsByKey = new Map();      // normalized building+room -> metadata
 let liveVersion = null;
 let livePollTimer = null;
 let livePollBusy = false;
@@ -1056,6 +1328,9 @@ let cardRoomsCache = new Map();
 let publishedKioskPoint = null;
 let publishedKioskPointAligned = null;
 let selectedGuideTarget = null;
+let activeEventPayload = null;
+let activeEventAutoRoute = requestedEventAutoRoute;
+let activeEventLoadPromise = null;
 
 const kioskMarkerScreen = new THREE.Vector3();
 
@@ -1179,7 +1454,7 @@ function setSelectedGuideTarget(target) {
   };
 }
 
-function getGuideEntryForTarget(target) {
+function getExactGuideEntryForTarget(target) {
   if (!target || !target.buildingName) return null;
   const buildingCandidates = [
     String(target.buildingName || "").trim(),
@@ -1194,6 +1469,16 @@ function getGuideEntryForTarget(target) {
     const exact = activeGuidesByKey.get(exactKey);
     if (exact) return exact;
   }
+
+  return null;
+}
+
+function getBuildingGuideEntryForTarget(target) {
+  if (!target || !target.buildingName) return null;
+  const buildingCandidates = [
+    String(target.buildingName || "").trim(),
+    String(getDisplayBuildingName(target.buildingName) || "").trim()
+  ].filter(Boolean);
 
   for (const candidate of buildingCandidates) {
     const buildingKey = buildGuideKey("building", { buildingName: candidate });
@@ -1220,6 +1505,16 @@ function formatGuideDistanceText(distance) {
   const safe = Number(distance);
   if (!Number.isFinite(safe) || safe <= 0) return "Distance unavailable";
   return `${Math.round(safe)} units`;
+}
+
+function isUsablePublishedGuide(entry) {
+  return !!(
+    entry
+    && entry.status !== "orphaned"
+    && entry.status !== "missing_route"
+    && Array.isArray(entry.finalSteps)
+    && entry.finalSteps.length > 0
+  );
 }
 
 function hideDirectionsPanel() {
@@ -1279,6 +1574,112 @@ function buildPublicGuideLandmarks() {
   return landmarks;
 }
 
+function normalizeRoomGuideLine(text) {
+  return String(text || "")
+    .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "")
+    .trim();
+}
+
+function parseRoomGuideText(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .split(/\n+/)
+    .map(normalizeRoomGuideLineSafe)
+    .filter(Boolean)
+    .map((line) => ({ kind: "room_detail", text: line }));
+}
+
+function normalizeRoomGuideLineSafe(text) {
+  return String(text || "")
+    .replace(/^\s*(?:[-*]|\u2022|\u00e2\u20ac\u00a2|\d+[.)])\s*/, "")
+    .trim();
+}
+
+function buildRoomLookupKeys(buildingName, roomName) {
+  const safeRoom = String(roomName || "").trim();
+  if (!safeRoom) return [];
+
+  const roomKeys = new Set();
+  const pushRoom = (value) => {
+    const key = normalizeQuery(value);
+    if (key) roomKeys.add(key);
+  };
+  pushRoom(safeRoom);
+  pushRoom(removeOneNumericSuffix(safeRoom));
+  pushRoom(safeRoom.replace(/\./g, ""));
+  pushRoom(removeOneNumericSuffix(safeRoom.replace(/\./g, "")));
+
+  const keys = [];
+  for (const buildingKey of getBuildingLookupKeys(buildingName)) {
+    for (const roomKey of roomKeys) {
+      keys.push(`${buildingKey}::${roomKey}`);
+    }
+  }
+  return keys;
+}
+
+function registerDbRoomMeta(entry) {
+  for (const key of buildRoomLookupKeys(entry?.buildingName, entry?.roomName)) {
+    if (!dbRoomsByKey.has(key)) {
+      dbRoomsByKey.set(key, entry);
+    }
+  }
+}
+
+function getDbRoomMeta(buildingName, roomName) {
+  const buildingCandidates = [
+    String(buildingName || "").trim(),
+    String(getDisplayBuildingName(buildingName) || "").trim()
+  ].filter(Boolean);
+
+  for (const candidate of buildingCandidates) {
+    for (const key of buildRoomLookupKeys(candidate, roomName)) {
+      const entry = dbRoomsByKey.get(key);
+      if (entry) return entry;
+    }
+  }
+  return null;
+}
+
+function buildRoomSupplementSteps(target, roomMeta, displayBuildingName) {
+  if (!target?.roomName) return [];
+
+  const manualSteps = parseRoomGuideText(roomMeta?.indoorGuideText || "");
+  if (manualSteps.length) return manualSteps;
+
+  const steps = [];
+  const floorValue = String(roomMeta?.floorNumber || "").trim();
+  if (floorValue) {
+    if (floorValue === "0") {
+      steps.push({ kind: "room_floor", text: "Stay on the ground floor." });
+    } else {
+      steps.push({ kind: "room_floor", text: `Go to floor ${floorValue}.` });
+    }
+  }
+
+  const roomNumber = String(roomMeta?.roomNumber || "").trim();
+  if (roomNumber && normalizeQuery(roomNumber) !== normalizeQuery(target.roomName || "")) {
+    steps.push({ kind: "room_number", text: `Look for room number ${roomNumber}.` });
+  }
+
+  const description = String(roomMeta?.description || "").trim();
+  if (description) {
+    steps.push({
+      kind: "room_note",
+      text: /[.!?]$/.test(description) ? description : `${description}.`
+    });
+  }
+
+  if (!steps.length) {
+    steps.push({
+      kind: "room_fallback",
+      text: `Proceed inside ${displayBuildingName} to ${target.roomName}. Follow posted room signs if needed.`
+    });
+  }
+
+  return steps;
+}
+
 function showDirectionsPanelForSelection(target, routeEntry, alignedPoints, routeDistance) {
   if (!directionsPanel || !target?.buildingName) return;
 
@@ -1290,35 +1691,54 @@ function showDirectionsPanelForSelection(target, routeEntry, alignedPoints, rout
     ? `Route via ${displayBuildingName} • ${formatGuideDistanceText(routeDistance)}`
     : `${displayBuildingName} • ${formatGuideDistanceText(routeDistance)}`;
 
-  const guideEntry = getGuideEntryForTarget(target);
-  const usablePublishedGuide = guideEntry
-    && guideEntry.status !== "orphaned"
-    && guideEntry.status !== "missing_route"
-    && Array.isArray(guideEntry.finalSteps)
-    && guideEntry.finalSteps.length > 0;
+  const summaryText = String(summary || "").replace(/\s*(?:\u2022|\u00e2\u20ac\u00a2)\s*/g, " - ");
+  const exactGuideEntry = getExactGuideEntryForTarget(target);
+  const buildingGuideEntry = getBuildingGuideEntryForTarget(target);
+  const usableExactGuide = isUsablePublishedGuide(exactGuideEntry);
+  const usableBuildingGuide = isUsablePublishedGuide(buildingGuideEntry);
+  const roomMeta = target.type === "room" && target.roomName
+    ? getDbRoomMeta(target.buildingName, target.roomName)
+    : null;
 
-  const steps = usablePublishedGuide
-    ? guideEntry.finalSteps
-    : buildGuideStepsFromPoints(
-        alignedPoints.map((point) => [point.x, point.y, point.z]),
-        {
-          destinationName: target.roomName || displayBuildingName,
-          arrivalText: target.type === "room" && target.roomName
-            ? `Arrive at ${displayBuildingName}. Proceed to ${target.roomName}.`
-            : `Arrive at ${displayBuildingName}.`,
-          landmarks: buildPublicGuideLandmarks()
-        }
-      );
+  let steps = [];
+  let statusText = "";
+
+  if (usableExactGuide) {
+    steps = exactGuideEntry.finalSteps;
+    const notes = Array.isArray(exactGuideEntry.notes) ? exactGuideEntry.notes : [];
+    statusText = notes[0] || "";
+  } else {
+    const routeSteps = usableBuildingGuide
+      ? buildingGuideEntry.finalSteps
+      : buildGuideStepsFromPoints(
+          alignedPoints.map((point) => [point.x, point.y, point.z]),
+          {
+            destinationName: displayBuildingName,
+            arrivalText: `Arrive at ${displayBuildingName}.`,
+            landmarks: buildPublicGuideLandmarks()
+          }
+        );
+
+    if (target.type === "room" && target.roomName) {
+      const roomSteps = buildRoomSupplementSteps(target, roomMeta, displayBuildingName);
+      steps = [...routeSteps, ...roomSteps];
+      statusText = String(roomMeta?.indoorGuideText || "").trim()
+        ? "Using the building route plus saved room-specific indoor guidance."
+        : "Using the building route plus a room-level fallback because no published room text guide is available yet.";
+    } else {
+      steps = routeSteps;
+      const notes = usableBuildingGuide && Array.isArray(buildingGuideEntry?.notes) ? buildingGuideEntry.notes : [];
+      statusText = usableBuildingGuide
+        ? (notes[0] || "")
+        : "Using an auto-generated fallback because no published text guide is available yet.";
+    }
+  }
 
   if (directionsTitle) directionsTitle.textContent = title;
-  if (directionsSummary) directionsSummary.textContent = summary;
+  if (directionsSummary) directionsSummary.textContent = summaryText;
   if (directionsStatus) {
-    const notes = usablePublishedGuide ? guideEntry.notes : [];
-    if (!usablePublishedGuide) {
-      directionsStatus.textContent = "Using an auto-generated fallback because no published text guide is available yet.";
-      directionsStatus.classList.remove("hidden");
-    } else if (Array.isArray(notes) && notes.length) {
-      directionsStatus.textContent = notes[0];
+    if (statusText) {
+      directionsStatus.textContent = statusText;
       directionsStatus.classList.remove("hidden");
     } else {
       directionsStatus.classList.add("hidden");
@@ -1389,6 +1809,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
 
     cardRoomsCache.clear();
     dbBuildingsByKey = new Map();
+    dbRoomsByKey = new Map();
     dbBuildingNamesForSearch = [];
     for (const raw of buildings) {
       const name = String(raw?.name || "").trim();
@@ -1405,11 +1826,18 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
 
     dbRoomEntriesForSearch = rooms
       .map((r) => ({
+        id: r?.id ?? null,
         roomName: String(r?.roomName || "").trim(),
         buildingName: String(r?.buildingName || "").trim(),
+        roomNumber: String(r?.roomNumber || "").trim(),
+        roomType: String(r?.roomType || "").trim(),
+        floorNumber: String(r?.floorNumber || "").trim(),
+        description: String(r?.description || "").trim(),
+        indoorGuideText: String(r?.indoorGuideText || "").trim(),
         modelFile: String(r?.modelFile || "").trim()
       }))
       .filter((r) => r.roomName && r.buildingName);
+    dbRoomEntriesForSearch.forEach(registerDbRoomMeta);
 
     refreshBuildingLabelText();
     if (selectedBuildingName) {
@@ -1425,6 +1853,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbBuildingNamesForSearch = [];
     dbRoomEntriesForSearch = [];
     dbBuildingsByKey = new Map();
+    dbRoomsByKey = new Map();
   }
 }
 
@@ -1582,7 +2011,9 @@ function selectBuildingByName(buildingName) {
   const previousSelectedBuilding = selectedBuildingName;
   selectedBuildingName = entry?.name || anchor.name || candidateName;
   if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {
+    clearRouteOnly();
     hideDirectionsPanel();
+    clearRouteBtn.disabled = true;
   }
 
   // Clear previous selection visuals
@@ -1628,6 +2059,8 @@ function handleSearchSelect(rawValue, opts = {}) {
   if (!selected) return;
 
   if (selected.type === "room" && selected.roomName) {
+    const roomMeta = getDbRoomMeta(selected.buildingName, selected.roomName);
+    const hasIndoorGuide = !!String(roomMeta?.indoorGuideText || "").trim();
     setSelectedGuideTarget({
       type: "room",
       buildingName: selected.buildingName,
@@ -1636,7 +2069,7 @@ function handleSearchSelect(rawValue, opts = {}) {
     hideDirectionsPanel();
     const routeReady = !!getRouteEntryForBuilding(selected.buildingName);
     cardInfo.textContent = routeReady
-      ? `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. Select "Get Directions" to show the route.`
+      ? `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. Select "Get Directions" to show the route${hasIndoorGuide ? " and indoor guide" : ""}.`
       : `Matched ${selected.roomName} in ${getDisplayBuildingName(selected.buildingName)}. No published route for this building.`;
     if (autoRoute) {
       activateDirectionsForSelectedBuilding();
@@ -2106,6 +2539,21 @@ async function loadCardBuildingDetails(buildingName) {
     if (requestSeq !== cardDetailsRequestSeq) return;
 
     const rooms = Array.isArray(data.rooms) ? data.rooms : [];
+    rooms.forEach((room) => {
+      const roomName = String(room?.name || "").trim();
+      if (!roomName || !displayName) return;
+      registerDbRoomMeta({
+        id: room?.id ?? null,
+        roomName,
+        buildingName: displayName,
+        roomNumber: String(room?.roomNumber || "").trim(),
+        roomType: String(room?.roomType || "").trim(),
+        floorNumber: String(room?.floorNumber || "").trim(),
+        description: String(room?.description || "").trim(),
+        indoorGuideText: String(room?.indoorGuideText || "").trim(),
+        modelFile: String(room?.modelFile || "").trim()
+      });
+    });
     cardRoomsCache.set(cacheKey, rooms);
     renderCardRoomsList(rooms);
   } catch (err) {
@@ -2210,6 +2658,7 @@ directionsBtn.addEventListener("click", () => {
 });
 
 clearRouteBtn.addEventListener("click", () => {
+  activeEventAutoRoute = false;
   clearRouteOnly();
   hideDirectionsPanel();
   clearRouteBtn.disabled = true;
@@ -2218,9 +2667,181 @@ clearRouteBtn.addEventListener("click", () => {
 directionsCloseBtn?.addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
+  activeEventAutoRoute = false;
   clearRouteOnly();
   hideDirectionsPanel();
   clearRouteBtn.disabled = true;
+});
+
+function formatEventScheduleLabel(schedule) {
+  return String(schedule || "")
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function dismissActiveEventContext() {
+  activeEventPayload = null;
+  activeEventAutoRoute = false;
+  clearEventAreaHighlight();
+  hideEventFocusCard();
+}
+
+function renderEventPayloadWithFallbackMessage(message) {
+  if (!activeEventPayload) return;
+  renderEventFocusPayload({
+    ...activeEventPayload,
+    canMap: false,
+    canRoute: false,
+    health: "needs_review",
+    healthLabel: "Needs Review",
+    healthMessage: message || activeEventPayload.healthMessage
+  });
+}
+
+function applyActiveEventToMap({ autoRoute = activeEventAutoRoute, recenter = true } = {}) {
+  clearEventAreaHighlight();
+
+  if (!loadedModel || !activeEventPayload) return;
+  const target = activeEventPayload.resolvedTarget;
+  let runtimePayload = { ...activeEventPayload };
+
+  if (!activeEventPayload.canMap || !target) {
+    renderEventFocusPayload(runtimePayload);
+    return;
+  }
+
+  if (target.type === "specific_area") {
+    renderEventFocusPayload({
+      ...runtimePayload,
+      canMap: true,
+      canRoute: false
+    });
+    hideCardAndClear();
+    const rawPoint = new THREE.Vector3(Number(target.x) || 0, Number(target.y) || 0, Number(target.z) || 0);
+    const alignedPoint = alignPointToModelSurface(rawPoint);
+    renderEventAreaHighlight(alignedPoint, Number(target.radius) || 8);
+    if (recenter) {
+      focusActiveViewOnPoint(alignedPoint, { distanceScale: 0.16 });
+    }
+    return;
+  }
+
+  const buildingName = String(target.buildingName || "").trim();
+  if (!buildingName) {
+    renderEventPayloadWithFallbackMessage("The linked event destination is incomplete and cannot be focused on the map.");
+    return;
+  }
+
+  const runtimeCanRoute = !!getRouteEntryForBuilding(buildingName);
+  if (runtimePayload.canRoute !== runtimeCanRoute) {
+    runtimePayload = {
+      ...runtimePayload,
+      canRoute: runtimeCanRoute,
+      health: runtimeCanRoute ? runtimePayload.health : "limited",
+      healthLabel: runtimeCanRoute ? runtimePayload.healthLabel : "Limited",
+      healthMessage: runtimeCanRoute
+        ? runtimePayload.healthMessage
+        : "This event can open on the map, but no published route is available right now."
+    };
+  }
+  renderEventFocusPayload(runtimePayload);
+
+  const selected = selectBuildingByName(buildingName);
+  if (!selected) {
+    renderEventPayloadWithFallbackMessage("The linked destination could not be found in the current map model.");
+    return;
+  }
+
+  const buildingEntry = getBuildingEntryByName(buildingName);
+  if (recenter && buildingEntry?.object) {
+    focusActiveViewOnObject(buildingEntry.object);
+  }
+
+  if (target.type === "room") {
+    setSelectedGuideTarget({
+      type: "room",
+      buildingName,
+      roomName: String(target.roomName || "").trim()
+    });
+
+    if (cardInfo) {
+      cardInfo.textContent = runtimePayload.canRoute
+        ? `Event is linked to ${String(target.roomName || "this room").trim()}. Select "Get Directions" to show the route.`
+        : "This room can open on the map, but no published route is available for its building right now.";
+    }
+  } else {
+    setSelectedGuideTarget({
+      type: "building",
+      buildingName,
+      roomName: ""
+    });
+  }
+
+  if (autoRoute && runtimePayload.canRoute) {
+    activateDirectionsForSelectedBuilding();
+  }
+}
+
+async function loadRequestedEvent() {
+  if (requestedEventId <= 0) return;
+  if (activeEventPayload) {
+    applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: false });
+    return;
+  }
+  if (activeEventLoadPromise) return activeEventLoadPromise;
+
+  activeEventLoadPromise = (async () => {
+    try {
+      const url = new URL(EVENT_DETAILS_ENDPOINT, window.location.href);
+      url.searchParams.set("event", String(requestedEventId));
+      url.searchParams.set("v", String(Date.now()));
+
+      const response = await fetch(url, { cache: "no-store" });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.error || `Event fetch failed (${response.status})`);
+      }
+
+      if (!payload?.found || !payload?.event) {
+        showEventNoticeCard("Event unavailable", payload?.message || "This event is unavailable or no longer public.");
+        return;
+      }
+
+      activeEventPayload = {
+        ...payload.event,
+        schedule: String(payload.event.schedule || "").trim(),
+        scheduleLabel: String(payload.event.scheduleLabel || formatEventScheduleLabel(payload.event.schedule || "")).trim(),
+        health: String(payload.event.health || "limited").trim(),
+        healthLabel: String(payload.event.healthLabel || "Limited").trim(),
+      };
+      renderEventFocusPayload(activeEventPayload);
+      applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: true });
+    } catch (error) {
+      console.error("Event context failed to load:", error);
+      showEventNoticeCard("Event unavailable", error?.message || "The requested event could not be loaded.");
+    } finally {
+      activeEventLoadPromise = null;
+    }
+  })();
+
+  return activeEventLoadPromise;
+}
+
+eventFocusCloseBtn?.addEventListener("click", () => {
+  dismissActiveEventContext();
+});
+
+eventFocusMapBtn?.addEventListener("click", () => {
+  if (!activeEventPayload?.canMap) return;
+  applyActiveEventToMap({ autoRoute: false, recenter: true });
+});
+
+eventFocusRouteBtn?.addEventListener("click", () => {
+  if (!activeEventPayload?.canRoute) return;
+  activeEventAutoRoute = true;
+  applyActiveEventToMap({ autoRoute: true, recenter: true });
 });
 
 function findBestOutlineMesh(hitObject) {
@@ -2749,6 +3370,10 @@ function applyLoadedModel(newModel) {
     handleSearchSelect(pendingSearchQuery);
   }
 
+  if (activeEventPayload) {
+    applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: false });
+  }
+
   console.log("GLB loaded. Size:", mapWorldDiagonal, "Center:", mapWorldCenter);
 }
 
@@ -2803,6 +3428,9 @@ async function loadLiveMap(payload, { forceReloadModel = false } = {}) {
 
   // Refresh searchable rooms/buildings from DB when map payload is loaded.
   loadSearchCatalog(currentLiveModelFile).catch(() => {});
+  if (activeEventPayload && !shouldReload) {
+    applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: false });
+  }
 }
 
 async function bootLiveMap() {
@@ -2832,6 +3460,9 @@ async function checkLiveMapUpdates() {
       currentLiveModelFile = String(payload?.modelFile || currentLiveModelFile || "");
       applyPublishedRoutes(payload);
       loadSearchCatalog(currentLiveModelFile).catch(() => {});
+      if (activeEventPayload) {
+        applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: false });
+      }
     }
   } catch (_) {
     // Keep current map/routes when offline or temporarily unavailable.
@@ -2840,10 +3471,12 @@ async function checkLiveMapUpdates() {
   }
 }
 
-bootLiveMap().catch((error) => {
-  console.error("LIVE MAP BOOT ERROR:", error);
-  alert("Map failed to load.");
-});
+bootLiveMap()
+  .then(() => loadRequestedEvent())
+  .catch((error) => {
+    console.error("LIVE MAP BOOT ERROR:", error);
+    alert("Map failed to load.");
+  });
 
 if (!livePollTimer) {
   livePollTimer = setInterval(checkLiveMapUpdates, LIVE_POLL_INTERVAL_MS);
@@ -2863,7 +3496,7 @@ function pickSceneSelection(event) {
 }
 
 function isInteractiveOverlayClick(event) {
-  return !!event.target?.closest?.("#info-card, #directions-panel, #map-view-controls, .topbar, .bottom-nav");
+  return !!event.target?.closest?.("#info-card, #directions-panel, #event-focus-card, #map-view-controls, .topbar, .bottom-nav");
 }
 
 function handleSceneSelection(event) {
@@ -2885,7 +3518,9 @@ function handleSceneSelection(event) {
     roomName: ""
   });
   if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {
+    clearRouteOnly();
     hideDirectionsPanel();
+    clearRouteBtn.disabled = true;
   }
 
   const outlineTarget = buildingEntry.object || hit;
@@ -2920,7 +3555,6 @@ canvas.addEventListener("pointermove", (event) => {
     if (dx > TOUCH_TAP_SLOP_PX || dy > TOUCH_TAP_SLOP_PX) touchSceneTap.moved = true;
   }
   if (touchSceneTap && activeTouchPointers.size > 1) touchSceneTap.hadMultiTouch = true;
-  updateTouchZoom();
 }, true);
 
 window.addEventListener("pointerup", (event) => {
@@ -2989,6 +3623,7 @@ function animate() {
   controls.update();
   updateBuildingLabels();
   updateKioskMarker();
+  updateEventAreaHighlightAnimation(performance.now());
   renderer.render(scene, camera);
 }
 

@@ -79,12 +79,26 @@ try {
   $hasRoomSource = has_column($conn, "rooms", "source_model_file");
   $hasRoomBuildingId = has_column($conn, "rooms", "building_id");
   $hasRoomBuildingName = has_column($conn, "rooms", "building_name");
+  $hasRoomId = has_column($conn, "rooms", "room_id");
+  $hasRoomNumber = has_column($conn, "rooms", "room_number");
+  $hasRoomType = has_column($conn, "rooms", "room_type");
+  $hasFloor = has_column($conn, "rooms", "floor_number");
+  $hasDescription = has_column($conn, "rooms", "description");
+  $hasIndoorGuideText = has_column($conn, "rooms", "indoor_guide_text");
+  $hasRoomEdited = has_column($conn, "rooms", "last_edited_at");
 
   $roomBuildingExpr = $hasRoomBuildingId
     ? "COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasRoomBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ")"
     : ($hasRoomBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL");
 
-  $roomSql = "SELECT r.room_name, {$roomBuildingExpr} AS building_name"
+  $roomSql = "SELECT "
+    . ($hasRoomId ? "r.room_id" : "NULL AS room_id")
+    . ", r.room_name, {$roomBuildingExpr} AS building_name"
+    . ", " . ($hasRoomNumber ? "r.room_number" : "NULL AS room_number")
+    . ", " . ($hasRoomType ? "r.room_type" : "NULL AS room_type")
+    . ", " . ($hasFloor ? "r.floor_number" : "NULL AS floor_number")
+    . ", " . ($hasDescription ? "r.description" : "NULL AS description")
+    . ", " . ($hasIndoorGuideText ? "r.indoor_guide_text" : "NULL AS indoor_guide_text")
     . ($hasRoomSource ? ", r.source_model_file" : ", NULL AS source_model_file")
     . " FROM rooms r "
     . ($hasRoomBuildingId ? "LEFT JOIN buildings b ON b.building_id = r.building_id " : "")
@@ -96,9 +110,17 @@ try {
     $roomSql .= " AND (b.building_id IS NULL OR b.is_present_in_latest = 1 OR b.is_present_in_latest IS NULL)";
   }
 
+  $roomOrderParts = ["building_name ASC", "r.room_name ASC"];
+  if ($hasIndoorGuideText) $roomOrderParts[] = "(CASE WHEN r.indoor_guide_text IS NULL OR TRIM(r.indoor_guide_text) = '' THEN 1 ELSE 0 END) ASC";
+  if ($hasRoomNumber) $roomOrderParts[] = "(CASE WHEN r.room_number IS NULL OR TRIM(r.room_number) = '' THEN 1 ELSE 0 END) ASC";
+  if ($hasFloor) $roomOrderParts[] = "(CASE WHEN r.floor_number IS NULL OR TRIM(r.floor_number) = '' THEN 1 ELSE 0 END) ASC";
+  if ($hasRoomEdited) $roomOrderParts[] = "r.last_edited_at DESC";
+  if ($hasRoomId) $roomOrderParts[] = "r.room_id DESC";
+  $roomOrderSql = " ORDER BY " . implode(", ", $roomOrderParts);
+
   $roomRows = [];
   if ($currentModel !== "" && $hasRoomSource) {
-    $stmt = $conn->prepare($roomSql . " AND r.source_model_file = ? ORDER BY building_name ASC, r.room_name ASC");
+    $stmt = $conn->prepare($roomSql . " AND r.source_model_file = ?" . $roomOrderSql);
     if (!$stmt) throw new RuntimeException("Failed to prepare rooms query");
     $stmt->bind_param("s", $currentModel);
     if (!$stmt->execute()) throw new RuntimeException("Failed to load rooms");
@@ -108,7 +130,7 @@ try {
     }
     $stmt->close();
   } else {
-    $res = $conn->query($roomSql . " ORDER BY building_name ASC, r.room_name ASC");
+    $res = $conn->query($roomSql . $roomOrderSql);
     if (!($res instanceof mysqli_result)) throw new RuntimeException("Failed to load rooms");
     while ($row = $res->fetch_assoc()) $roomRows[] = $row;
   }
@@ -124,8 +146,14 @@ try {
     $seenRooms[$dedupeKey] = true;
 
     $rooms[] = [
+      "id" => isset($row["room_id"]) ? (int)$row["room_id"] : null,
       "roomName" => $roomName,
       "buildingName" => $buildingName,
+      "roomNumber" => trim((string)($row["room_number"] ?? "")),
+      "roomType" => trim((string)($row["room_type"] ?? "")),
+      "floorNumber" => trim((string)($row["floor_number"] ?? "")),
+      "description" => trim((string)($row["description"] ?? "")),
+      "indoorGuideText" => trim((string)($row["indoor_guide_text"] ?? "")),
       "modelFile" => trim((string)($row["source_model_file"] ?? ""))
     ];
   }

@@ -18,6 +18,7 @@ if (!isset($extraScripts)) $extraScripts = "";
   <link rel="stylesheet" href="../css/map.css">
 
   <?= $extraHead ?>
+  <script src="../js/on-screen-keyboard.js"></script>
 </head>
 <body>
 
