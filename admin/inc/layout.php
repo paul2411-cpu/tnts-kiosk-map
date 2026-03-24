@@ -2,6 +2,8 @@
 // /admin/inc/layout.php
 if (session_status() === PHP_SESSION_NONE) session_start();
 require_once __DIR__ . "/auth.php";
+require_once __DIR__ . "/app_logger.php";
+app_logger_bootstrap(["subsystem" => "admin_ui"]);
 
 function admin_layout_start(string $title, string $active = "") { ?>
 <!doctype html>
@@ -12,6 +14,12 @@ function admin_layout_start(string $title, string $active = "") { ?>
   <title><?= htmlspecialchars($title) ?></title>
   <link rel="stylesheet" href="assets/admin.css" />
   <?= isset($GLOBALS["admin_extra_head"]) ? (string)$GLOBALS["admin_extra_head"] : "" ?>
+  <?= app_logger_client_bootstrap([
+    "endpoint" => "../api/client_error_log.php",
+    "scriptSrc" => "../js/app-error-tracker.js",
+    "subsystem" => "admin_ui",
+    "page" => $active !== "" ? $active : $title,
+  ]) ?>
   <script src="../js/on-screen-keyboard.js"></script>
 </head>
 <body>
@@ -50,6 +58,9 @@ function admin_layout_start(string $title, string $active = "") { ?>
 
         <a class="nav-item <?= $active==='mapeditor'?'active':'' ?>" href="mapEditor.php">
           <span class="ico">🗺️</span><span>Map Editor</span>
+        </a>
+        <a class="nav-item <?= $active==='errorlogs'?'active':'' ?>" href="errorLogs.php">
+          <span class="ico">LOG</span><span>Error Logs</span>
         </a>
         <a class="nav-item <?= $active==='admins'?'active':'' ?>" href="adminUser.php">
           <span class="ico">👤</span><span>Admin Users</span>

@@ -7,6 +7,7 @@ header("Expires: 0");
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
+app_logger_set_default_subsystem("api.map_search");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
   $safeTable = str_replace("`", "``", $table);
@@ -27,11 +28,15 @@ try {
   $hasBuildingId = has_column($conn, "buildings", "building_id");
   $hasBuildingPresent = has_column($conn, "buildings", "is_present_in_latest");
   $hasBuildingSource = has_column($conn, "buildings", "source_model_file");
+  $hasBuildingUid = has_column($conn, "buildings", "building_uid");
+  $hasObjectName = has_column($conn, "buildings", "model_object_name");
   $hasBuildingDescription = has_column($conn, "buildings", "description");
   $hasBuildingImage = has_column($conn, "buildings", "image_path");
 
   $buildingSql = "SELECT "
     . ($hasBuildingId ? "building_id" : "NULL AS building_id")
+    . ", " . ($hasBuildingUid ? "building_uid" : "NULL AS building_uid")
+    . ", " . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
     . ", building_name, "
     . ($hasBuildingDescription ? "description" : "NULL AS description")
     . ", " . ($hasBuildingImage ? "image_path" : "NULL AS image_path")
@@ -68,7 +73,9 @@ try {
 
     $buildings[] = [
       "id" => isset($row["building_id"]) ? (int)$row["building_id"] : null,
+      "buildingUid" => trim((string)($row["building_uid"] ?? "")),
       "name" => $name,
+      "objectName" => trim((string)($row["model_object_name"] ?? $name)),
       "description" => trim((string)($row["description"] ?? "")),
       "imagePath" => trim((string)($row["image_path"] ?? "")),
       "modelFile" => trim((string)($row["source_model_file"] ?? ""))
@@ -158,6 +165,14 @@ try {
     ];
   }
 } catch (Throwable $e) {
+  app_log_exception($e, [
+    "requestedModel" => $requestedModel,
+    "resolvedModel" => $currentModel,
+  ], [
+    "subsystem" => "api.map_search",
+    "event" => "search_failed",
+    "message" => "Search index failed",
+  ]);
   http_response_code(500);
   echo json_encode([
     "ok" => false,

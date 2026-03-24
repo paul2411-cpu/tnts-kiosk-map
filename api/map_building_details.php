@@ -7,6 +7,7 @@ header("Expires: 0");
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
+app_logger_set_default_subsystem("api.map_building_details");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
   $safeTable = str_replace("`", "``", $table);
@@ -15,14 +16,56 @@ function has_column(mysqli $conn, string $table, string $column): bool {
   return $res instanceof mysqli_result && $res->num_rows > 0;
 }
 
+function natural_room_field_compare($left, $right): int {
+  $a = trim((string)$left);
+  $b = trim((string)$right);
+  if ($a === $b) return 0;
+  if ($a === "") return 1;
+  if ($b === "") return -1;
+
+  if (is_numeric($a) && is_numeric($b)) {
+    $cmp = (float)$a <=> (float)$b;
+    if ($cmp !== 0) return $cmp;
+  }
+
+  return strnatcasecmp($a, $b);
+}
+
+function sort_room_rows(array &$rows): void {
+  usort($rows, static function(array $a, array $b): int {
+    $cmp = natural_room_field_compare($a["floor_number"] ?? "", $b["floor_number"] ?? "");
+    if ($cmp !== 0) return $cmp;
+
+    $cmp = natural_room_field_compare($a["room_number"] ?? "", $b["room_number"] ?? "");
+    if ($cmp !== 0) return $cmp;
+
+    $cmp = natural_room_field_compare($a["room_name"] ?? "", $b["room_name"] ?? "");
+    if ($cmp !== 0) return $cmp;
+
+    $aGuideEmpty = trim((string)($a["indoor_guide_text"] ?? "")) === "" ? 1 : 0;
+    $bGuideEmpty = trim((string)($b["indoor_guide_text"] ?? "")) === "" ? 1 : 0;
+    if ($aGuideEmpty !== $bGuideEmpty) return $aGuideEmpty <=> $bGuideEmpty;
+
+    $editedA = trim((string)($a["last_edited_at"] ?? ""));
+    $editedB = trim((string)($b["last_edited_at"] ?? ""));
+    if ($editedA !== $editedB) return $editedB <=> $editedA;
+
+    return (int)($b["room_id"] ?? 0) <=> (int)($a["room_id"] ?? 0);
+  });
+}
+
 function fetch_building(mysqli $conn, string $modelFile, ?int $buildingId, string $buildingName): ?array {
   $hasBuildingId = has_column($conn, "buildings", "building_id");
   $hasBuildingPresent = has_column($conn, "buildings", "is_present_in_latest");
   $hasBuildingSource = has_column($conn, "buildings", "source_model_file");
+  $hasBuildingUid = has_column($conn, "buildings", "building_uid");
+  $hasObjectName = has_column($conn, "buildings", "model_object_name");
   $hasDescription = has_column($conn, "buildings", "description");
   $hasImage = has_column($conn, "buildings", "image_path");
 
   $sqlCols = ($hasBuildingId ? "building_id" : "NULL AS building_id")
+    . ", " . ($hasBuildingUid ? "building_uid" : "NULL AS building_uid")
+    . ", " . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
     . ", building_name"
     . ", " . ($hasDescription ? "description" : "NULL AS description")
     . ", " . ($hasImage ? "image_path" : "NULL AS image_path")
@@ -54,10 +97,14 @@ function fetch_building(mysqli $conn, string $modelFile, ?int $buildingId, strin
   }
 
   if ($buildingName !== "") {
+    $nameWhere = $hasObjectName
+      ? "(building_name = ? OR model_object_name = ?)"
+      : "building_name = ?";
     if ($modelFile !== "" && $hasBuildingSource) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_name = ? AND source_model_file = ?{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
+      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE {$nameWhere} AND source_model_file = ?{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
       if (!$stmt) throw new RuntimeException("Failed to prepare building-name lookup");
-      $stmt->bind_param("ss", $buildingName, $modelFile);
+      if ($hasObjectName) $stmt->bind_param("sss", $buildingName, $buildingName, $modelFile);
+      else $stmt->bind_param("ss", $buildingName, $modelFile);
       if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
       $res = $stmt->get_result();
       $row = $res ? $res->fetch_assoc() : null;
@@ -66,9 +113,10 @@ function fetch_building(mysqli $conn, string $modelFile, ?int $buildingId, strin
       return null;
     }
 
-    $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_name = ?{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
+    $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE {$nameWhere}{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
     if (!$stmt) throw new RuntimeException("Failed to prepare building-name fallback lookup");
-    $stmt->bind_param("s", $buildingName);
+    if ($hasObjectName) $stmt->bind_param("ss", $buildingName, $buildingName);
+    else $stmt->bind_param("s", $buildingName);
     if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
     $res = $stmt->get_result();
     $row = $res ? $res->fetch_assoc() : null;
@@ -159,6 +207,7 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
     $seen[$dedupeKey] = true;
     $deduped[] = $row;
   }
+  sort_room_rows($deduped);
   return $deduped;
 }
 
@@ -197,7 +246,9 @@ try {
     "modelFile" => $currentModel,
     "building" => [
       "id" => $resolvedBuildingId,
+      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
       "name" => $resolvedBuildingName,
+      "objectName" => trim((string)($building["model_object_name"] ?? $resolvedBuildingName)),
       "description" => trim((string)($building["description"] ?? "")),
       "imagePath" => trim((string)($building["image_path"] ?? "")),
       "modelFile" => trim((string)($building["source_model_file"] ?? ""))
@@ -216,6 +267,16 @@ try {
     }, $rooms)
   ], JSON_PRETTY_PRINT);
 } catch (Throwable $e) {
+  app_log_exception($e, [
+    "requestedModel" => $requestedModel,
+    "resolvedModel" => $currentModel,
+    "buildingId" => $buildingId,
+    "buildingName" => $buildingName,
+  ], [
+    "subsystem" => "api.map_building_details",
+    "event" => "building_details_failed",
+    "message" => "Building details failed",
+  ]);
   http_response_code(500);
   echo json_encode([
     "ok" => false,

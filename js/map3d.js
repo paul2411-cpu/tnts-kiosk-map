@@ -11,6 +11,7 @@ const infoCard = document.getElementById("info-card");
 const cardTitle = document.getElementById("card-title");
 const cardInfo = document.getElementById("card-info");
 const cardRoomsWrap = document.getElementById("card-rooms-wrap");
+const cardRoomsTitle = infoCard?.querySelector(".card-rooms-title") || null;
 const cardRoomsStatus = document.getElementById("card-rooms-status");
 const cardRoomsList = document.getElementById("card-rooms-list");
 const closeBtn = document.getElementById("close-btn");
@@ -450,6 +451,11 @@ scene.add(new THREE.AmbientLight(0xffffff, 1.0));
 const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
 dirLight.position.set(5, 10, 7);
 scene.add(dirLight);
+
+const publishedRoadRoot = new THREE.Group();
+publishedRoadRoot.name = "publishedRoadRoot";
+publishedRoadRoot.visible = false;
+scene.add(publishedRoadRoot);
 
 // --- Camera
 const VIEW_MODE_3D = "3d";
@@ -1318,6 +1324,7 @@ let routeNamesForSearch = [];      // display names
 let dbBuildingNamesForSearch = []; // DB building names
 let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
 let dbBuildingsByKey = new Map();  // normalized building name -> metadata
+let dbBuildingsByUid = new Map();  // stable uid -> metadata
 let dbRoomsByKey = new Map();      // normalized building+room -> metadata
 let liveVersion = null;
 let livePollTimer = null;
@@ -1333,15 +1340,57 @@ let activeEventAutoRoute = requestedEventAutoRoute;
 let activeEventLoadPromise = null;
 
 const kioskMarkerScreen = new THREE.Vector3();
+const PUBLISHED_ROAD_Y_OFFSET = 0.8;
+const PUBLISHED_ROAD_DEFAULT_WIDTH = 12;
+const PUBLISHED_ROAD_THICKNESS = 0.3;
+
+const publishedRoadMaterial = new THREE.MeshStandardMaterial({
+  color: 0x9ca3af,
+  roughness: 1.0,
+  metalness: 0.0,
+  polygonOffset: true,
+  polygonOffsetFactor: -4,
+  polygonOffsetUnits: -4
+});
+
+const publishedRoadSideMaterial = new THREE.MeshStandardMaterial({
+  color: 0x6b7280,
+  roughness: 1.0,
+  metalness: 0.0,
+  polygonOffset: true,
+  polygonOffsetFactor: -3,
+  polygonOffsetUnits: -3
+});
+
+function normalizeBuildingUid(uid) {
+  return String(uid || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "");
+}
+
+function getRouteEntryKeys(entry = {}) {
+  const keys = new Set();
+  const uid = normalizeBuildingUid(entry?.buildingUid || entry?.destinationUid || entry?.uid || "");
+  if (uid) keys.add(uid);
+  for (const value of [entry?.name, entry?.buildingName, entry?.objectName, entry?.modelObjectName]) {
+    const key = normalizeQuery(value);
+    if (key) keys.add(key);
+  }
+  return [...keys];
+}
 
 function rebuildRouteCatalog(entries) {
   activeRoutesByKey = new Map();
   routeNamesForSearch = [];
   for (const entry of (entries || [])) {
     const name = String(entry?.name || "").trim();
-    const key = normalizeQuery(name);
-    if (!key || !name) continue;
-    activeRoutesByKey.set(key, entry);
+    if (!name) continue;
+    for (const key of getRouteEntryKeys(entry)) {
+      if (!activeRoutesByKey.has(key)) {
+        activeRoutesByKey.set(key, entry);
+      }
+    }
     routeNamesForSearch.push(name);
   }
 }
@@ -1379,6 +1428,307 @@ function setPublishedKioskPoint(point) {
   updateKioskMarker();
 }
 
+function disposePublishedRoadGeometries(root) {
+  root?.traverse?.((node) => {
+    if (node?.geometry?.dispose) node.geometry.dispose();
+  });
+}
+
+function clearPublishedRoadnet() {
+  for (let i = publishedRoadRoot.children.length - 1; i >= 0; i--) {
+    const child = publishedRoadRoot.children[i];
+    disposePublishedRoadGeometries(child);
+    publishedRoadRoot.remove(child);
+  }
+  publishedRoadRoot.visible = false;
+}
+
+function toFiniteTriplet(value, fallback = [0, 0, 0]) {
+  if (!Array.isArray(value) || value.length < 3) return fallback.slice(0, 3);
+  return [
+    Number.isFinite(Number(value[0])) ? Number(value[0]) : fallback[0],
+    Number.isFinite(Number(value[1])) ? Number(value[1]) : fallback[1],
+    Number.isFinite(Number(value[2])) ? Number(value[2]) : fallback[2]
+  ];
+}
+
+function buildPublishedRoadGeometry(points, width) {
+  const geometry = new THREE.BufferGeometry();
+  if (!Array.isArray(points) || points.length < 1) return geometry;
+
+  const halfWidth = Math.max(0.1, (Number(width) || PUBLISHED_ROAD_DEFAULT_WIDTH) / 2);
+  const cleanPoints = [];
+  const epsilonSq = 1e-6;
+
+  for (const point of points) {
+    if (!point) continue;
+    if (!cleanPoints.length) {
+      cleanPoints.push(point.clone());
+      continue;
+    }
+
+    const last = cleanPoints[cleanPoints.length - 1];
+    const dx = point.x - last.x;
+    const dz = point.z - last.z;
+    if ((dx * dx + dz * dz) > epsilonSq) cleanPoints.push(point.clone());
+  }
+
+  if (cleanPoints.length === 1) {
+    const point = cleanPoints[0];
+    const y = point.y + PUBLISHED_ROAD_Y_OFFSET;
+
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array([
+      point.x - halfWidth, y, point.z - halfWidth,
+      point.x + halfWidth, y, point.z - halfWidth,
+      point.x + halfWidth, y, point.z + halfWidth,
+      point.x - halfWidth, y, point.z + halfWidth
+    ]), 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array([
+      0, 1, 0,
+      0, 1, 0,
+      0, 1, 0,
+      0, 1, 0
+    ]), 3));
+    geometry.setAttribute("uv", new THREE.BufferAttribute(new Float32Array([
+      0, 0,
+      1, 0,
+      1, 1,
+      0, 1
+    ]), 2));
+    geometry.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 2, 1, 0, 3, 2]), 1));
+    return geometry;
+  }
+
+  if (cleanPoints.length < 2) return geometry;
+
+  let accumulatedLength = 0;
+  const segmentLengths = new Array(cleanPoints.length).fill(0);
+  for (let i = 1; i < cleanPoints.length; i++) {
+    const delta = cleanPoints[i].clone().sub(cleanPoints[i - 1]);
+    delta.y = 0;
+    accumulatedLength += delta.length();
+    segmentLengths[i] = accumulatedLength;
+  }
+  const totalLength = Math.max(1e-6, accumulatedLength);
+
+  const positions = [];
+  const uvs = [];
+  const normals = [];
+  const indices = [];
+  let vertexCount = 0;
+
+  const addVertex = (x, y, z, u, v) => {
+    positions.push(x, y, z);
+    uvs.push(u, v);
+    normals.push(0, 1, 0);
+    return vertexCount++;
+  };
+
+  const crossXZ = (ax, az, bx, bz) => (ax * bz) - (az * bx);
+  const direction = new THREE.Vector3();
+  const normal = new THREE.Vector3();
+  const twoPi = Math.PI * 2;
+
+  for (let i = 0; i < cleanPoints.length - 1; i++) {
+    const start = cleanPoints[i];
+    const end = cleanPoints[i + 1];
+
+    direction.copy(end).sub(start);
+    direction.y = 0;
+    const length = direction.length();
+    if (length < 1e-6) continue;
+    direction.multiplyScalar(1 / length);
+
+    normal.set(-direction.z, 0, direction.x);
+
+    const y0 = start.y + PUBLISHED_ROAD_Y_OFFSET;
+    const y1 = end.y + PUBLISHED_ROAD_Y_OFFSET;
+    const v0 = segmentLengths[i] / totalLength;
+    const v1 = segmentLengths[i + 1] / totalLength;
+
+    const left0 = addVertex(start.x + normal.x * halfWidth, y0, start.z + normal.z * halfWidth, 0, v0);
+    const right0 = addVertex(start.x - normal.x * halfWidth, y0, start.z - normal.z * halfWidth, 1, v0);
+    const left1 = addVertex(end.x + normal.x * halfWidth, y1, end.z + normal.z * halfWidth, 0, v1);
+    const right1 = addVertex(end.x - normal.x * halfWidth, y1, end.z - normal.z * halfWidth, 1, v1);
+
+    indices.push(left0, left1, right0);
+    indices.push(right0, left1, right1);
+  }
+
+  for (let i = 1; i < cleanPoints.length - 1; i++) {
+    const previous = cleanPoints[i - 1];
+    const current = cleanPoints[i];
+    const next = cleanPoints[i + 1];
+
+    const previousDirection = current.clone().sub(previous);
+    previousDirection.y = 0;
+    const nextDirection = next.clone().sub(current);
+    nextDirection.y = 0;
+    if (previousDirection.lengthSq() < 1e-8 || nextDirection.lengthSq() < 1e-8) continue;
+    previousDirection.normalize();
+    nextDirection.normalize();
+
+    const dot = previousDirection.dot(nextDirection);
+    if (dot > 0.9999) continue;
+
+    const turn = crossXZ(previousDirection.x, previousDirection.z, nextDirection.x, nextDirection.z);
+    if (Math.abs(turn) < 1e-8) continue;
+
+    const previousNormal = new THREE.Vector3(-previousDirection.z, 0, previousDirection.x);
+    const nextNormal = new THREE.Vector3(-nextDirection.z, 0, nextDirection.x);
+    if (turn > 0) {
+      previousNormal.multiplyScalar(-1);
+      nextNormal.multiplyScalar(-1);
+    }
+
+    const y = current.y + PUBLISHED_ROAD_Y_OFFSET;
+    const v = segmentLengths[i] / totalLength;
+    const centerIndex = addVertex(current.x, y, current.z, 0.5, v);
+
+    const startAngle = Math.atan2(previousNormal.z, previousNormal.x);
+    let endAngle = Math.atan2(nextNormal.z, nextNormal.x);
+    const ccw = turn > 0;
+
+    if (ccw) {
+      while (endAngle <= startAngle) endAngle += twoPi;
+    } else {
+      while (endAngle >= startAngle) endAngle -= twoPi;
+    }
+
+    const delta = endAngle - startAngle;
+    const steps = Math.max(1, Math.min(24, Math.ceil(Math.abs(delta) / (Math.PI / 18))));
+    const arcIndices = [];
+
+    for (let step = 0; step <= steps; step++) {
+      const t = step / steps;
+      const angle = startAngle + delta * t;
+      arcIndices.push(addVertex(
+        current.x + Math.cos(angle) * halfWidth,
+        y,
+        current.z + Math.sin(angle) * halfWidth,
+        0.5,
+        v
+      ));
+    }
+
+    for (let step = 0; step < steps; step++) {
+      const aIndex = arcIndices[step];
+      const bIndex = arcIndices[step + 1];
+      if (ccw) indices.push(centerIndex, bIndex, aIndex);
+      else indices.push(centerIndex, aIndex, bIndex);
+    }
+  }
+
+  const IndexArray = vertexCount > 65535 ? Uint32Array : Uint16Array;
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normals), 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(uvs), 2));
+  geometry.setIndex(new THREE.BufferAttribute(new IndexArray(indices), 1));
+  return geometry;
+}
+
+function buildPublishedRoadSideGeometry(topGeometry, thickness) {
+  const geometry = new THREE.BufferGeometry();
+  if (!topGeometry?.attributes?.position) return geometry;
+
+  const depth = Number(thickness || 0);
+  if (!(depth > 0)) return geometry;
+
+  const edges = new THREE.EdgesGeometry(topGeometry);
+  const positions = edges.attributes?.position?.array;
+  if (!positions || positions.length < 6) {
+    edges.dispose();
+    return geometry;
+  }
+
+  const sidePositions = [];
+  const sideIndices = [];
+  let vertex = 0;
+
+  for (let i = 0; i < positions.length; i += 6) {
+    const ax = positions[i];
+    const ay = positions[i + 1];
+    const az = positions[i + 2];
+    const bx = positions[i + 3];
+    const by = positions[i + 4];
+    const bz = positions[i + 5];
+
+    sidePositions.push(
+      ax, ay, az,
+      bx, by, bz,
+      bx, by - depth, bz,
+      ax, ay - depth, az
+    );
+    sideIndices.push(vertex, vertex + 1, vertex + 2, vertex, vertex + 2, vertex + 3);
+    vertex += 4;
+  }
+
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(sidePositions), 3));
+  geometry.setIndex(sideIndices);
+  geometry.computeVertexNormals();
+  edges.dispose();
+  return geometry;
+}
+
+function buildPublishedRoadObject(roadItem) {
+  if (!roadItem || (roadItem.type !== "road" && !Array.isArray(roadItem.points))) return null;
+
+  const width = Number(roadItem.width);
+  const safeWidth = Number.isFinite(width) && width > 0 ? width : PUBLISHED_ROAD_DEFAULT_WIDTH;
+  const localPoints = Array.isArray(roadItem.points)
+    ? roadItem.points.map((point) => {
+        const [x, y, z] = toFiniteTriplet(point);
+        return new THREE.Vector3(x, y, z);
+      })
+    : [];
+  if (!localPoints.length) return null;
+
+  const group = new THREE.Group();
+  group.name = String(roadItem.name || "road");
+
+  const topGeometry = buildPublishedRoadGeometry(localPoints, safeWidth);
+  if (!topGeometry?.attributes?.position) return null;
+  const topMesh = new THREE.Mesh(topGeometry, publishedRoadMaterial);
+  topMesh.renderOrder = 1;
+  topMesh.userData.isPublishedRoad = true;
+  group.add(topMesh);
+
+  if (PUBLISHED_ROAD_THICKNESS > 0) {
+    const sideGeometry = buildPublishedRoadSideGeometry(topGeometry, PUBLISHED_ROAD_THICKNESS);
+    if (sideGeometry?.attributes?.position) {
+      const sideMesh = new THREE.Mesh(sideGeometry, publishedRoadSideMaterial);
+      sideMesh.renderOrder = 0;
+      sideMesh.userData.isPublishedRoadSide = true;
+      group.add(sideMesh);
+    }
+  }
+
+  const [px, py, pz] = toFiniteTriplet(roadItem.position);
+  const [rx, ry, rz] = toFiniteTriplet(roadItem.rotation);
+  const [sx, sy, sz] = toFiniteTriplet(roadItem.scale, [1, 1, 1]);
+  group.position.set(px, py, pz);
+  group.rotation.set(rx, ry, rz);
+  group.scale.set(sx, sy, sz);
+  group.updateMatrixWorld(true);
+  return group;
+}
+
+function setPublishedRoadnet(roadItems) {
+  clearPublishedRoadnet();
+  if (!Array.isArray(roadItems) || !roadItems.length) return false;
+
+  let added = 0;
+  for (const roadItem of roadItems) {
+    const roadObject = buildPublishedRoadObject(roadItem);
+    if (!roadObject) continue;
+    publishedRoadRoot.add(roadObject);
+    added += 1;
+  }
+
+  publishedRoadRoot.visible = added > 0;
+  return added > 0;
+}
+
 function setPublishedRoutes(routesObj) {
   if (!routesObj || typeof routesObj !== "object") {
     setPublishedKioskPoint(null);
@@ -1396,6 +1746,8 @@ function setPublishedRoutes(routesObj) {
     if (points.length < 2) continue;
     entries.push({
       name,
+      buildingUid: normalizeBuildingUid(rawEntry?.buildingUid || rawEntry?.destinationUid || rawEntry?.uid || ""),
+      objectName: String(rawEntry?.objectName || rawEntry?.modelObjectName || "").trim(),
       mode: "points",
       points,
       distance: Number(rawEntry.distance)
@@ -1418,14 +1770,18 @@ function setPublishedGuides(guidesObj) {
     if (!rawEntry || typeof rawEntry !== "object") continue;
     const destinationType = String(rawEntry.destinationType || rawEntry.type || (String(rawKey).startsWith("room::") ? "room" : "building")).trim() || "building";
     const buildingName = String(rawEntry.buildingName || rawEntry.name || rawEntry.routeName || rawEntry.destinationName || "").trim();
+    const buildingUid = normalizeBuildingUid(rawEntry.buildingUid || rawEntry.destinationUid || rawEntry.uid || "");
+    const objectName = String(rawEntry.objectName || rawEntry.modelObjectName || "").trim();
     const roomName = String(rawEntry.roomName || "").trim();
-    const key = String(rawEntry.key || rawKey || buildGuideKey(destinationType, { buildingName, roomName })).trim();
+    const key = String(buildGuideKey(destinationType, { buildingName, buildingUid, roomName }) || rawEntry.key || rawKey).trim();
     if (!key || !buildingName) continue;
 
     activeGuidesByKey.set(key, {
       key,
       destinationType,
       buildingName,
+      buildingUid,
+      objectName,
       roomName,
       destinationName: String(rawEntry.destinationName || "").trim(),
       routeName: String(rawEntry.routeName || buildingName).trim(),
@@ -1450,24 +1806,31 @@ function setSelectedGuideTarget(target) {
   selectedGuideTarget = {
     type: String(target.type || "building").trim() || "building",
     buildingName: String(target.buildingName || "").trim(),
+    buildingUid: normalizeBuildingUid(target.buildingUid || ""),
+    objectName: String(target.objectName || "").trim(),
     roomName: String(target.roomName || "").trim()
   };
 }
 
 function getExactGuideEntryForTarget(target) {
   if (!target || !target.buildingName) return null;
+  const buildingUid = normalizeBuildingUid(target.buildingUid || getDbBuildingMeta(target.buildingName)?.buildingUid || "");
   const buildingCandidates = [
     String(target.buildingName || "").trim(),
+    String(target.objectName || "").trim(),
     String(getDisplayBuildingName(target.buildingName) || "").trim()
   ].filter(Boolean);
 
   for (const candidate of buildingCandidates) {
-    const exactKey = buildGuideKey(target.type || "building", {
-      buildingName: candidate,
-      roomName: target.roomName || ""
-    });
-    const exact = activeGuidesByKey.get(exactKey);
-    if (exact) return exact;
+    for (const maybeUid of [buildingUid, ""]) {
+      const exactKey = buildGuideKey(target.type || "building", {
+        buildingName: candidate,
+        buildingUid: maybeUid,
+        roomName: target.roomName || ""
+      });
+      const exact = activeGuidesByKey.get(exactKey);
+      if (exact) return exact;
+    }
   }
 
   return null;
@@ -1475,15 +1838,19 @@ function getExactGuideEntryForTarget(target) {
 
 function getBuildingGuideEntryForTarget(target) {
   if (!target || !target.buildingName) return null;
+  const buildingUid = normalizeBuildingUid(target.buildingUid || getDbBuildingMeta(target.buildingName)?.buildingUid || "");
   const buildingCandidates = [
     String(target.buildingName || "").trim(),
+    String(target.objectName || "").trim(),
     String(getDisplayBuildingName(target.buildingName) || "").trim()
   ].filter(Boolean);
 
   for (const candidate of buildingCandidates) {
-    const buildingKey = buildGuideKey("building", { buildingName: candidate });
-    const buildingGuide = activeGuidesByKey.get(buildingKey);
-    if (buildingGuide) return buildingGuide;
+    for (const maybeUid of [buildingUid, ""]) {
+      const buildingKey = buildGuideKey("building", { buildingName: candidate, buildingUid: maybeUid });
+      const buildingGuide = activeGuidesByKey.get(buildingKey);
+      if (buildingGuide) return buildingGuide;
+    }
   }
 
   return null;
@@ -1492,9 +1859,12 @@ function getBuildingGuideEntryForTarget(target) {
 function buildDirectionsTarget() {
   if (selectedGuideTarget?.buildingName) return selectedGuideTarget;
   if (selectedBuildingName) {
+    const meta = getDbBuildingMeta(selectedBuildingName);
     return {
       type: "building",
       buildingName: selectedBuildingName,
+      buildingUid: normalizeBuildingUid(meta?.buildingUid || ""),
+      objectName: String(meta?.objectName || "").trim(),
       roomName: ""
     };
   }
@@ -1751,23 +2121,51 @@ function showDirectionsPanelForSelection(target, routeEntry, alignedPoints, rout
 }
 
 function getRouteEntry(name) {
-  const key = normalizeQuery(name);
-  if (!key) return null;
-  return activeRoutesByKey.get(key) || null;
+  const buildingMeta = getDbBuildingMeta(name);
+  const candidateKeys = new Set([
+    normalizeBuildingUid(buildingMeta?.buildingUid || ""),
+    ...getBuildingLookupKeys(buildingMeta?.name || ""),
+    ...getBuildingLookupKeys(buildingMeta?.objectName || ""),
+    ...getBuildingLookupKeys(name)
+  ].filter(Boolean));
+  for (const key of candidateKeys) {
+    const entry = activeRoutesByKey.get(key);
+    if (entry) return entry;
+  }
+  return null;
 }
 
 rebuildRouteCatalog([]);
 
 function registerDbBuildingMeta(entry) {
-  for (const key of getBuildingLookupKeys(entry?.name)) {
-    if (!dbBuildingsByKey.has(key)) {
-      dbBuildingsByKey.set(key, entry);
+  const normalizedUid = normalizeBuildingUid(entry?.buildingUid || "");
+  const normalizedEntry = {
+    ...entry,
+    buildingUid: normalizedUid,
+    objectName: String(entry?.objectName || "").trim()
+  };
+  if (normalizedUid && !dbBuildingsByUid.has(normalizedUid)) {
+    dbBuildingsByUid.set(normalizedUid, normalizedEntry);
+  }
+  const aliases = [
+    normalizedEntry?.name,
+    normalizedEntry?.objectName
+  ];
+  for (const alias of aliases) {
+    for (const key of getBuildingLookupKeys(alias)) {
+      if (!dbBuildingsByKey.has(key)) {
+        dbBuildingsByKey.set(key, normalizedEntry);
+      }
     }
   }
 }
 
-function getDbBuildingMeta(name) {
-  for (const key of getBuildingLookupKeys(name)) {
+function getDbBuildingMeta(nameOrUid) {
+  const safeUid = normalizeBuildingUid(nameOrUid);
+  if (safeUid && dbBuildingsByUid.has(safeUid)) {
+    return dbBuildingsByUid.get(safeUid) || null;
+  }
+  for (const key of getBuildingLookupKeys(nameOrUid)) {
     const entry = dbBuildingsByKey.get(key);
     if (entry) return entry;
   }
@@ -1779,16 +2177,35 @@ function getDisplayBuildingName(name) {
 }
 
 function getRouteEntryForBuilding(name) {
-  const displayName = getDisplayBuildingName(name);
-  return getRouteEntry(displayName) || getRouteEntry(name);
+  const meta = getDbBuildingMeta(name);
+  const displayName = String(meta?.name || getDisplayBuildingName(name) || name || "").trim();
+  const objectName = String(meta?.objectName || "").trim();
+  const buildingUid = normalizeBuildingUid(meta?.buildingUid || "");
+  const candidateKeys = new Set([
+    buildingUid,
+    ...getBuildingLookupKeys(displayName),
+    ...getBuildingLookupKeys(objectName),
+    ...getBuildingLookupKeys(name)
+  ].filter(Boolean));
+  for (const key of candidateKeys) {
+    const entry = activeRoutesByKey.get(key);
+    if (entry) return entry;
+  }
+  return null;
 }
 
 function refreshBuildingLabelText() {
+  buildingEntriesByKey = new Map();
+  buildingEntriesByObject = new Map();
   for (const entry of buildingLabels) {
-    const nextLabel = formatBuildingLabel(getDisplayBuildingName(entry.name));
+    const meta = getDbBuildingMeta(entry.objectName || entry.name || entry.displayName);
+    entry.displayName = String(meta?.name || entry.displayName || entry.name || "").trim();
+    entry.objectName = String(meta?.objectName || entry.objectName || entry.name || "").trim();
+    const nextLabel = formatBuildingLabel(getDisplayBuildingName(entry.displayName || entry.name || entry.objectName));
     if (entry.element.textContent !== nextLabel) {
       entry.element.textContent = nextLabel;
     }
+    registerBuildingEntry(entry);
   }
   updateBuildingLabels();
 }
@@ -1809,6 +2226,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
 
     cardRoomsCache.clear();
     dbBuildingsByKey = new Map();
+    dbBuildingsByUid = new Map();
     dbRoomsByKey = new Map();
     dbBuildingNamesForSearch = [];
     for (const raw of buildings) {
@@ -1816,7 +2234,9 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
       if (!name) continue;
       registerDbBuildingMeta({
         id: raw?.id ?? null,
+        buildingUid: raw?.buildingUid ?? "",
         name,
+        objectName: String(raw?.objectName || "").trim(),
         description: String(raw?.description || "").trim(),
         imagePath: String(raw?.imagePath || "").trim(),
         modelFile: String(raw?.modelFile || "").trim()
@@ -1840,7 +2260,14 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbRoomEntriesForSearch.forEach(registerDbRoomMeta);
 
     refreshBuildingLabelText();
-    if (selectedBuildingName) {
+    if (selectedGuideTarget?.type === "room" && selectedGuideTarget.buildingName && selectedGuideTarget.roomName) {
+      const persistedRoom = getDbRoomMeta(selectedGuideTarget.buildingName, selectedGuideTarget.roomName);
+      if (persistedRoom) {
+        showRoomCard(persistedRoom);
+      } else if (selectedBuildingName) {
+        showCard(selectedBuildingName);
+      }
+    } else if (selectedBuildingName) {
       showCard(selectedBuildingName);
     }
 
@@ -1853,10 +2280,10 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbBuildingNamesForSearch = [];
     dbRoomEntriesForSearch = [];
     dbBuildingsByKey = new Map();
+    dbBuildingsByUid = new Map();
     dbRoomsByKey = new Map();
   }
 }
-
 
 
 
@@ -1912,27 +2339,75 @@ function scoreSearchMatch(queryNorm, targetNorm) {
   return 0;
 }
 
+function getRoomSearchAliases(roomName, roomNumber = "") {
+  const aliases = new Set();
+  const pushAlias = (value) => {
+    const safeValue = String(value || "").trim();
+    if (safeValue) aliases.add(safeValue);
+  };
+
+  const safeRoomNumber = String(roomNumber || "").trim();
+  pushAlias(roomName);
+  if (safeRoomNumber) {
+    pushAlias(safeRoomNumber);
+    pushAlias(`ROOM ${safeRoomNumber}`);
+  }
+
+  return Array.from(aliases);
+}
+
+function getRoomSearchCombinedAliases(roomName, buildingName, roomNumber = "") {
+  const safeBuildingName = String(buildingName || "").trim();
+  if (!safeBuildingName) return [];
+  return getRoomSearchAliases(roomName, roomNumber).map((alias) => `${alias} ${safeBuildingName}`);
+}
+
 function collectSearchCandidates(queryNorm) {
   if (!queryNorm) return [];
 
   const out = [];
   const seen = new Set();
 
-  const pushCandidate = (type, label, buildingName, roomName = "") => {
-    const key = `${type}::${String(label)}::${String(buildingName)}::${String(roomName)}`;
+  const pushCandidate = (candidate) => {
+    const type = String(candidate?.type || "").trim();
+    const label = String(candidate?.label || "").trim();
+    const buildingName = String(candidate?.buildingName || "").trim();
+    const roomName = String(candidate?.roomName || "").trim();
+    const roomNumber = String(candidate?.roomNumber || "").trim();
+    const roomType = String(candidate?.roomType || "").trim();
+    const floorNumber = String(candidate?.floorNumber || "").trim();
+    const description = String(candidate?.description || "").trim();
+    const indoorGuideText = String(candidate?.indoorGuideText || "").trim();
+    const roomId = candidate?.id ?? null;
+    const key = `${type}::${label}::${buildingName}::${roomName}::${roomNumber}`;
     if (seen.has(key)) return;
     seen.add(key);
 
     let score = 0;
     if (type === "room") {
-      // Match by room only, and by room+building when user includes both.
-      const roomNorm = normalizeQuery(roomName);
-      const roomWithBuildingNorm = normalizeQuery(`${roomName} ${buildingName}`);
+      const roomAliases = getRoomSearchAliases(roomName, roomNumber);
+      const roomNorms = roomAliases.map((alias) => normalizeQuery(alias)).filter(Boolean);
+      const roomCombinedNorms = getRoomSearchCombinedAliases(roomName, buildingName, roomNumber)
+        .map((alias) => normalizeQuery(alias))
+        .filter(Boolean);
       const roomLabelNorm = normalizeQuery(label);
+      const roomLabelScore = scoreSearchMatch(queryNorm, roomLabelNorm);
+      const queryFlat = normalizeLoose(queryNorm);
+      const standaloneScores = roomNorms.map((targetNorm) => scoreSearchMatch(queryNorm, targetNorm));
+      const combinedScores = roomCombinedNorms.map((targetNorm) => scoreSearchMatch(queryNorm, targetNorm));
+      const queryStartsWithRoom = roomNorms.some((targetNorm) => {
+        const roomFlat = normalizeLoose(targetNorm);
+        return !!roomFlat && (queryNorm.startsWith(targetNorm) || queryFlat.startsWith(roomFlat));
+      });
+
       score = Math.max(
-        scoreSearchMatch(queryNorm, roomNorm),
-        scoreSearchMatch(queryNorm, roomWithBuildingNorm) + 5,
-        scoreSearchMatch(queryNorm, roomLabelNorm) + 3
+        ...standaloneScores,
+        ...combinedScores.map((candidateScore) => (
+          candidateScore > 0
+            ? candidateScore + (queryStartsWithRoom ? 80 : 8)
+            : 0
+        )),
+        roomLabelScore > 0 ? roomLabelScore + 3 : 0
       );
     } else {
       score = scoreSearchMatch(queryNorm, normalizeQuery(label));
@@ -1945,6 +2420,12 @@ function collectSearchCandidates(queryNorm) {
       label,
       buildingName,
       roomName,
+      roomNumber,
+      roomType,
+      floorNumber,
+      description,
+      indoorGuideText,
+      id: roomId,
       hasRoute,
       score: score + (hasRoute ? 20 : 0)
     });
@@ -1952,17 +2433,28 @@ function collectSearchCandidates(queryNorm) {
 
   // Route-published buildings (highest confidence for routing).
   for (const name of routeNamesForSearch) {
-    pushCandidate("building", name, name, "");
+    pushCandidate({ type: "building", label: name, buildingName: name });
   }
 
   // DB buildings (may include buildings without published route yet).
   for (const bName of dbBuildingNamesForSearch) {
-    pushCandidate("building", bName, bName, "");
+    pushCandidate({ type: "building", label: bName, buildingName: bName });
   }
 
   // DB rooms -> route by parent building.
   for (const row of dbRoomEntriesForSearch) {
-    pushCandidate("room", `${row.roomName} (${row.buildingName})`, row.buildingName, row.roomName);
+    pushCandidate({
+      type: "room",
+      label: `${row.roomName} (${row.buildingName})`,
+      buildingName: row.buildingName,
+      roomName: row.roomName,
+      roomNumber: row.roomNumber,
+      roomType: row.roomType,
+      floorNumber: row.floorNumber,
+      description: row.description,
+      indoorGuideText: row.indoorGuideText,
+      id: row.id ?? null
+    });
   }
 
   out.sort((a, b) => {
@@ -1973,7 +2465,19 @@ function collectSearchCandidates(queryNorm) {
   return out;
 }
 
-function selectBuildingByName(buildingName) {
+function getExactStandaloneRoomCandidates(queryNorm, candidates) {
+  const queryFlat = normalizeLoose(queryNorm);
+  if (!queryFlat) return [];
+
+  return candidates.filter((candidate) => {
+    if (candidate?.type !== "room") return false;
+    return getRoomSearchAliases(candidate.roomName, candidate.roomNumber)
+      .some((alias) => normalizeLoose(alias) === queryFlat);
+  });
+}
+
+function selectBuildingByName(buildingName, opts = {}) {
+  const { showInfoCard = true } = opts;
   if (!loadedModel || !buildingName) return false;
 
   let candidateName = String(buildingName);
@@ -2022,7 +2526,9 @@ function selectBuildingByName(buildingName) {
   clearClickOutline();
 
   setClickOutline(meshForOutline);
-  showCard(selectedBuildingName);
+  if (showInfoCard) {
+    showCard(selectedBuildingName);
+  }
 
   return true;
 }
@@ -2033,6 +2539,7 @@ function handleSearchSelect(rawValue, opts = {}) {
 
   if (!loadedModel) return; // model not ready yet
 
+  const searchText = String(rawValue || "").trim();
   const q = normalizeQuery(rawValue);
   if (!q) {
     // if user cleared search, hide card + selection
@@ -2041,29 +2548,48 @@ function handleSearchSelect(rawValue, opts = {}) {
   }
 
   const candidates = collectSearchCandidates(q);
-  if (!candidates.length) return;
+  if (!candidates.length) {
+    showSearchFeedback("Search", `No rooms or buildings matched "${searchText}".`);
+    return;
+  }
+
+  const exactStandaloneRooms = getExactStandaloneRoomCandidates(q, candidates);
+  if (exactStandaloneRooms.length > 1) {
+    showRoomSearchResults(searchText, exactStandaloneRooms);
+    return;
+  }
 
   // Prefer rooms/buildings whose parent building has a published route.
-  const prioritized = [
-    ...candidates.filter((c) => c.hasRoute),
-    ...candidates.filter((c) => !c.hasRoute)
-  ];
+  const prioritized = exactStandaloneRooms.length === 1
+    ? exactStandaloneRooms
+    : [
+        ...candidates.filter((c) => c.hasRoute),
+        ...candidates.filter((c) => !c.hasRoute)
+      ];
 
   let selected = null;
   for (const candidate of prioritized) {
-    if (selectBuildingByName(candidate.buildingName)) {
+    if (selectBuildingByName(candidate.buildingName, { showInfoCard: candidate.type !== "room" })) {
       selected = candidate;
       break;
     }
   }
-  if (!selected) return;
+  if (!selected) {
+    showSearchFeedback("Search", `The best match for "${searchText}" is not available in the current map model.`);
+    return;
+  }
 
   if (selected.type === "room" && selected.roomName) {
+    showRoomCard(selected, { autoRoute });
+    return;
     const roomMeta = getDbRoomMeta(selected.buildingName, selected.roomName);
+    const buildingMeta = getDbBuildingMeta(selected.buildingName);
     const hasIndoorGuide = !!String(roomMeta?.indoorGuideText || "").trim();
     setSelectedGuideTarget({
       type: "room",
       buildingName: selected.buildingName,
+      buildingUid: buildingMeta?.buildingUid || "",
+      objectName: buildingMeta?.objectName || "",
       roomName: selected.roomName
     });
     hideDirectionsPanel();
@@ -2218,9 +2744,20 @@ function registerBuildingEntry(entry) {
   if (entry?.object?.uuid) {
     buildingEntriesByObject.set(entry.object.uuid, entry);
   }
-  for (const key of getBuildingLookupKeys(entry?.name)) {
-    if (!buildingEntriesByKey.has(key)) {
-      buildingEntriesByKey.set(key, entry);
+  const aliases = [
+    entry?.name,
+    entry?.objectName,
+    entry?.displayName
+  ];
+  const dbMeta = getDbBuildingMeta(entry?.name) || getDbBuildingMeta(entry?.objectName) || getDbBuildingMeta(entry?.displayName);
+  if (dbMeta) {
+    aliases.push(dbMeta?.name, dbMeta?.objectName);
+  }
+  for (const alias of aliases) {
+    for (const key of getBuildingLookupKeys(alias)) {
+      if (!buildingEntriesByKey.has(key)) {
+        buildingEntriesByKey.set(key, entry);
+      }
     }
   }
 }
@@ -2301,14 +2838,19 @@ function rebuildBuildingLabels(model, modelSize) {
     const meshForOutline = findOutlineMeshForObject(root);
     const worldPosition = getLabelAnchorPosition(root, modelSize);
     if (!meshForOutline || !worldPosition) continue;
+    const dbMeta = getDbBuildingMeta(root.name);
+    const displayName = String(dbMeta?.name || root.name || "").trim();
+    const objectName = String(dbMeta?.objectName || root.name || "").trim();
 
     const element = document.createElement("div");
     element.className = "map-building-label";
-    element.textContent = formatBuildingLabel(getDisplayBuildingName(root.name));
+    element.textContent = formatBuildingLabel(displayName);
     buildingLabelLayer.appendChild(element);
 
     const entry = {
       name: root.name,
+      objectName,
+      displayName,
       object: root,
       meshForOutline,
       worldPosition,
@@ -2440,29 +2982,166 @@ function clearRouteOnly() {
 
 function resetCardRoomsPanel() {
   if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  if (cardRoomsTitle) cardRoomsTitle.textContent = "Rooms";
   cardRoomsWrap.classList.add("hidden");
   cardRoomsStatus.classList.remove("hidden");
   cardRoomsStatus.textContent = "Loading rooms...";
   cardRoomsList.replaceChildren();
 }
 
-function setCardRoomsLoading(message = "Loading rooms...") {
+function setCardRoomsLoading(message = "Loading rooms...", title = "Rooms") {
   if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  if (cardRoomsTitle) cardRoomsTitle.textContent = String(title || "Rooms");
   cardRoomsWrap.classList.remove("hidden");
   cardRoomsStatus.classList.remove("hidden");
   cardRoomsStatus.textContent = message;
   cardRoomsList.replaceChildren();
 }
 
-function setCardRoomsMessage(message) {
+function setCardRoomsMessage(message, title = "Rooms") {
   if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  if (cardRoomsTitle) cardRoomsTitle.textContent = String(title || "Rooms");
   cardRoomsWrap.classList.remove("hidden");
   cardRoomsStatus.classList.remove("hidden");
   cardRoomsStatus.textContent = message;
   cardRoomsList.replaceChildren();
+}
+
+function buildCardRoomGuideLines(room, displayBuildingName, maxLines = 0) {
+  const roomName = String(room?.roomName || room?.name || "").trim();
+  if (!roomName) return [];
+
+  const lines = buildRoomSupplementSteps(
+    { roomName },
+    {
+      roomName,
+      roomNumber: String(room?.roomNumber || "").trim(),
+      roomType: String(room?.roomType || "").trim(),
+      floorNumber: String(room?.floorNumber || "").trim(),
+      description: String(room?.description || "").trim(),
+      indoorGuideText: String(room?.indoorGuideText || "").trim()
+    },
+    displayBuildingName
+  )
+    .map((step) => String(step?.text || "").trim())
+    .filter(Boolean);
+
+  return maxLines > 0 ? lines.slice(0, maxLines) : lines;
+}
+
+function createCardRoomItem(room, opts = {}) {
+  const {
+    title = "",
+    subtitle = "",
+    includeDescription = true,
+    includeGuide = false,
+    guideLineLimit = 0,
+    statusText = "",
+    actionLabel = "",
+    onSelect = null
+  } = opts;
+
+  const roomName = String(room?.roomName || room?.name || "").trim() || "Unnamed Room";
+  const displayBuildingName = getDisplayBuildingName(room?.buildingName) || String(room?.buildingName || "").trim();
+  const roomNumber = String(room?.roomNumber || "").trim();
+  const primaryTitle = String(title || roomName).trim() || roomName;
+  const secondaryTitle = String(subtitle || "").trim();
+  const interactive = typeof onSelect === "function";
+  const item = document.createElement(interactive ? "button" : "div");
+
+  if (interactive) {
+    item.type = "button";
+    item.className = "card-room-item card-room-item--interactive";
+    item.addEventListener("click", () => onSelect(room));
+  } else {
+    item.className = "card-room-item";
+  }
+
+  const head = document.createElement("div");
+  head.className = "card-room-head";
+
+  const name = document.createElement("div");
+  name.className = "card-room-name";
+  name.textContent = primaryTitle;
+
+  const number = document.createElement("div");
+  number.className = "card-room-number";
+  number.textContent = roomNumber || "-";
+
+  head.appendChild(name);
+  head.appendChild(number);
+  item.appendChild(head);
+
+  if (secondaryTitle) {
+    const subtitleEl = document.createElement("div");
+    subtitleEl.className = "card-room-subtitle";
+    subtitleEl.textContent = secondaryTitle;
+    item.appendChild(subtitleEl);
+  }
+
+  const metaParts = [];
+  if (String(room?.floorNumber || "").trim()) metaParts.push(`Floor ${String(room.floorNumber).trim()}`);
+  if (String(room?.roomType || "").trim()) metaParts.push(String(room.roomType).trim());
+  if (includeDescription && String(room?.description || "").trim()) metaParts.push(String(room.description).trim());
+
+  if (metaParts.length) {
+    const meta = document.createElement("div");
+    meta.className = "card-room-meta";
+    meta.textContent = metaParts.join(" - ");
+    item.appendChild(meta);
+  }
+
+  if (includeGuide) {
+    const guideLines = buildCardRoomGuideLines(room, displayBuildingName, guideLineLimit);
+    if (guideLines.length) {
+      const guide = document.createElement("div");
+      guide.className = "card-room-guide";
+      guide.textContent = guideLines.join("\n");
+      item.appendChild(guide);
+    }
+  }
+
+  if (statusText) {
+    const status = document.createElement("div");
+    status.className = "card-room-status";
+    status.textContent = statusText;
+    item.appendChild(status);
+  }
+
+  if (actionLabel) {
+    const action = document.createElement("div");
+    action.className = "card-room-action";
+    action.textContent = actionLabel;
+    item.appendChild(action);
+  }
+
+  return item;
+}
+
+function renderCardRoomItems(items, title = "Rooms", emptyMessage = "No room details available.") {
+  if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
+  if (cardRoomsTitle) cardRoomsTitle.textContent = String(title || "Rooms");
+  cardRoomsWrap.classList.remove("hidden");
+  cardRoomsList.replaceChildren();
+
+  if (!Array.isArray(items) || !items.length) {
+    cardRoomsStatus.classList.remove("hidden");
+    cardRoomsStatus.textContent = emptyMessage;
+    return;
+  }
+
+  cardRoomsStatus.classList.add("hidden");
+  for (const item of items) {
+    if (item) cardRoomsList.appendChild(item);
+  }
 }
 
 function renderCardRoomsList(rooms) {
+  const items = Array.isArray(rooms)
+    ? rooms.map((room) => createCardRoomItem(room))
+    : [];
+  renderCardRoomItems(items, "Rooms", "No rooms found for this building in the published model.");
+  return;
   if (!cardRoomsWrap || !cardRoomsStatus || !cardRoomsList) return;
   cardRoomsWrap.classList.remove("hidden");
   cardRoomsList.replaceChildren();
@@ -2562,11 +3241,113 @@ async function loadCardBuildingDetails(buildingName) {
   }
 }
 
+function showRoomCard(room, opts = {}) {
+  const { autoRoute = false } = opts;
+  const roomName = String(room?.roomName || room?.name || "").trim();
+  const buildingName = String(room?.buildingName || "").trim();
+  if (!roomName || !buildingName) return;
+
+  const roomMeta = getDbRoomMeta(buildingName, roomName) || room;
+  const buildingMeta = getDbBuildingMeta(buildingName);
+  const displayBuildingName = getDisplayBuildingName(buildingName) || buildingName;
+  const routeReady = !!getRouteEntryForBuilding(buildingName);
+  const hasIndoorGuide = !!String(roomMeta?.indoorGuideText || "").trim();
+  const roomSupportLabel = hasIndoorGuide ? "saved room guide" : "room-level fallback guidance";
+  const statusText = routeReady
+    ? `${displayBuildingName} has a published route. Get Directions leads to the building, then shows the ${roomSupportLabel}.`
+    : `No published route is available for ${displayBuildingName} yet, but the room details below still show ${roomSupportLabel}.`;
+
+  setSelectedGuideTarget({
+    type: "room",
+    buildingName,
+    buildingUid: buildingMeta?.buildingUid || "",
+    objectName: buildingMeta?.objectName || "",
+    roomName
+  });
+
+  hideDirectionsPanel();
+  infoCard.classList.remove("hidden");
+  cardTitle.textContent = roomName;
+  cardInfo.textContent = `${roomName} is in ${displayBuildingName}. ${statusText}`;
+  directionsBtn.disabled = !routeReady;
+
+  const roomCard = createCardRoomItem(
+    {
+      ...roomMeta,
+      roomName,
+      buildingName,
+      roomNumber: String(roomMeta?.roomNumber || room?.roomNumber || "").trim(),
+      roomType: String(roomMeta?.roomType || room?.roomType || "").trim(),
+      floorNumber: String(roomMeta?.floorNumber || room?.floorNumber || "").trim(),
+      description: String(roomMeta?.description || room?.description || "").trim(),
+      indoorGuideText: String(roomMeta?.indoorGuideText || room?.indoorGuideText || "").trim()
+    },
+    {
+      title: roomName,
+      subtitle: displayBuildingName,
+      includeGuide: true,
+      statusText: routeReady ? "Get Directions available for this room." : "Indoor guidance only. Building route is not published yet."
+    }
+  );
+  renderCardRoomItems([roomCard], "Room Details");
+
+  if (autoRoute && routeReady) {
+    activateDirectionsForSelectedBuilding();
+  }
+}
+
+function showRoomSearchResults(searchText, rooms) {
+  const matches = Array.isArray(rooms) ? [...rooms] : [];
+  matches.sort((a, b) => {
+    if (Number(Boolean(b?.hasRoute)) !== Number(Boolean(a?.hasRoute))) {
+      return Number(Boolean(b?.hasRoute)) - Number(Boolean(a?.hasRoute));
+    }
+    return getDisplayBuildingName(a?.buildingName).localeCompare(getDisplayBuildingName(b?.buildingName));
+  });
+
+  const roomLabel = String(matches[0]?.roomName || searchText || "Room Search").trim() || "Room Search";
+  hideCardAndClear();
+  infoCard.classList.remove("hidden");
+  cardTitle.textContent = roomLabel;
+  cardInfo.textContent = `Multiple rooms matched "${searchText}". Choose the correct building below.`;
+  directionsBtn.disabled = true;
+
+  const items = matches.map((room) => createCardRoomItem(room, {
+    title: getDisplayBuildingName(room?.buildingName) || String(room?.buildingName || "").trim() || "Unknown Building",
+    subtitle: String(room?.roomName || "").trim(),
+    includeDescription: false,
+    includeGuide: true,
+    guideLineLimit: 2,
+    statusText: room?.hasRoute
+      ? "Get Directions is available after you open this room."
+      : "No published building route yet. Room guidance is still available.",
+    actionLabel: "Open room details",
+    onSelect: (selectedRoom) => {
+      if (!selectBuildingByName(selectedRoom.buildingName, { showInfoCard: false })) {
+        showSearchFeedback("Search", `The room in ${getDisplayBuildingName(selectedRoom.buildingName) || selectedRoom.buildingName} is not available in the current map model.`);
+        return;
+      }
+      showRoomCard(selectedRoom);
+    }
+  }));
+  renderCardRoomItems(items, "Matches", "No matching rooms were found.");
+}
+
+function showSearchFeedback(title, message) {
+  hideCardAndClear();
+  infoCard.classList.remove("hidden");
+  cardTitle.textContent = String(title || "Search");
+  cardInfo.textContent = String(message || "").trim() || "Search feedback unavailable.";
+}
+
 function showCard(buildingName) {
   if (!selectedGuideTarget || normalizeQuery(selectedGuideTarget.buildingName) !== normalizeQuery(buildingName)) {
+    const meta = getDbBuildingMeta(buildingName);
     setSelectedGuideTarget({
       type: "building",
       buildingName,
+      buildingUid: meta?.buildingUid || "",
+      objectName: meta?.objectName || "",
       roomName: ""
     });
   }
@@ -2620,6 +3401,9 @@ function activateDirectionsForSelectedBuilding() {
   const routeEntry = getRouteEntryForBuilding(selectedBuildingName);
   if (!routeEntry) {
     console.warn("No route configured for:", selectedBuildingName);
+    window.tntsReportClientError?.("route_missing", "No route configured for selected building", {
+      buildingName: selectedBuildingName,
+    });
     hideDirectionsPanel();
     showCard(selectedBuildingName);
     return;
@@ -2636,6 +3420,10 @@ function activateDirectionsForSelectedBuilding() {
 
   if (points.length < 2) {
     console.warn("Route points < 2. Check console ROUTE DEBUG MISSING list.");
+    window.tntsReportClientError?.("route_incomplete", "Route points are incomplete", {
+      buildingName: selectedBuildingName,
+      pointCount: points.length,
+    });
     cardInfo.textContent = "Route data is incomplete for this building.";
     hideDirectionsPanel();
     return;
@@ -2760,9 +3548,12 @@ function applyActiveEventToMap({ autoRoute = activeEventAutoRoute, recenter = tr
   }
 
   if (target.type === "room") {
+    const buildingMeta = getDbBuildingMeta(buildingName);
     setSelectedGuideTarget({
       type: "room",
       buildingName,
+      buildingUid: buildingMeta?.buildingUid || "",
+      objectName: buildingMeta?.objectName || "",
       roomName: String(target.roomName || "").trim()
     });
 
@@ -2772,9 +3563,12 @@ function applyActiveEventToMap({ autoRoute = activeEventAutoRoute, recenter = tr
         : "This room can open on the map, but no published route is available for its building right now.";
     }
   } else {
+    const buildingMeta = getDbBuildingMeta(buildingName);
     setSelectedGuideTarget({
       type: "building",
       buildingName,
+      buildingUid: buildingMeta?.buildingUid || "",
+      objectName: buildingMeta?.objectName || "",
       roomName: ""
     });
   }
@@ -2820,6 +3614,13 @@ async function loadRequestedEvent() {
       applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: true });
     } catch (error) {
       console.error("Event context failed to load:", error);
+      window.tntsReportClientError?.("event_context_failed", "Event context failed to load", {
+        eventId: eventIdFromUrl,
+        error: {
+          message: String(error?.message || error || ""),
+          stack: String(error?.stack || ""),
+        },
+      });
       showEventNoticeCard("Event unavailable", error?.message || "The requested event could not be loaded.");
     } finally {
       activeEventLoadPromise = null;
@@ -3401,6 +4202,7 @@ async function fetchLiveMapPayload() {
 }
 
 function applyPublishedRoutes(payload) {
+  setPublishedRoadnet(payload?.roads || null);
   const ok = setPublishedRoutes(payload?.routes || null);
   setPublishedGuides(payload?.guides || null);
   if (!ok) {
@@ -3439,7 +4241,14 @@ async function bootLiveMap() {
     await loadLiveMap(payload, { forceReloadModel: true });
   } catch (err) {
     console.warn("Live map unavailable, using fallback:", err);
+    window.tntsReportClientError?.("live_map_fallback", "Live map unavailable, using fallback", {
+      error: {
+        message: String(err?.message || err || ""),
+        stack: String(err?.stack || ""),
+      },
+    });
     rebuildRouteCatalog([]);
+    clearPublishedRoadnet();
     setPublishedGuides(null);
     setPublishedKioskPoint(null);
     currentLiveModelFile = "";
@@ -3475,6 +4284,12 @@ bootLiveMap()
   .then(() => loadRequestedEvent())
   .catch((error) => {
     console.error("LIVE MAP BOOT ERROR:", error);
+    window.tntsReportClientError?.("live_map_boot_error", "Live map boot error", {
+      error: {
+        message: String(error?.message || error || ""),
+        stack: String(error?.stack || ""),
+      },
+    });
     alert("Map failed to load.");
   });
 
@@ -3515,6 +4330,8 @@ function handleSceneSelection(event) {
   setSelectedGuideTarget({
     type: "building",
     buildingName: buildingEntry.name,
+    buildingUid: buildingEntry.buildingUid || getDbBuildingMeta(buildingEntry.name)?.buildingUid || "",
+    objectName: buildingEntry.objectName || buildingEntry.name,
     roomName: ""
   });
   if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {

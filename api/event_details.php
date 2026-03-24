@@ -7,6 +7,7 @@ header("Expires: 0");
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/events.php";
+app_logger_set_default_subsystem("api.event_details");
 
 function event_details_response(array $payload, int $statusCode = 200): void {
   http_response_code($statusCode);
@@ -92,6 +93,13 @@ try {
     ],
   ]);
 } catch (Throwable $e) {
+  app_log_exception($e, [
+    "eventId" => $eventId,
+  ], [
+    "subsystem" => "api.event_details",
+    "event" => "event_lookup_failed",
+    "message" => "Event lookup failed",
+  ]);
   event_details_response([
     "ok" => false,
     "error" => "Event lookup failed: " . $e->getMessage(),

@@ -3,6 +3,7 @@ require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_sync.php";
+app_logger_set_default_subsystem("room_admin");
 
 $MODEL_DIR = __DIR__ . "/../models";
 $ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
@@ -17,6 +18,13 @@ if (empty($_SESSION["room_editor_csrf"])) {
 $ROOM_EDITOR_CSRF = (string)$_SESSION["room_editor_csrf"];
 
 function rm_fail(int $status, string $msg): void {
+  app_log_http_problem($status, $msg, [
+    "action" => trim((string)($_GET["action"] ?? "")),
+    "modelFile" => trim((string)($_GET["model"] ?? "")),
+  ], [
+    "subsystem" => "room_admin",
+    "event" => "http_error",
+  ]);
   http_response_code($status);
   echo json_encode(["ok" => false, "error" => $msg], JSON_PRETTY_PRINT);
   exit;
@@ -806,6 +814,19 @@ if (isset($_GET["action"])) {
       $meta->close();
 
       $conn->commit();
+      app_log("info", "Room saved", [
+        "action" => $action,
+        "modelFile" => $modelFile,
+        "roomId" => $id,
+        "oldName" => $oldName,
+        "newName" => $newName,
+        "buildingName" => $buildingName,
+        "inserted" => $inserted,
+        "versionId" => $versionId,
+      ], [
+        "subsystem" => "room_admin",
+        "event" => "save_room",
+      ]);
       echo json_encode([
         "ok" => true,
         "roomId" => $id,

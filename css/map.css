@@ -260,6 +260,20 @@
   border: 1px solid #e5e7eb;
 }
 
+.card-room-item--interactive {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+  font: inherit;
+  color: inherit;
+}
+
+.card-room-item--interactive:hover {
+  border-color: #98a2b3;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08);
+}
+
 .card-room-head {
   display: flex;
   justify-content: space-between;
@@ -270,6 +284,13 @@
 .card-room-name {
   color: #101828;
   font-size: 13px;
+  font-weight: 700;
+}
+
+.card-room-subtitle {
+  margin-top: 4px;
+  color: #475467;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -285,6 +306,29 @@
   color: #667085;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.card-room-guide,
+.card-room-status,
+.card-room-action {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.card-room-guide {
+  color: #344054;
+  white-space: pre-line;
+}
+
+.card-room-status {
+  color: #0f766e;
+  font-weight: 700;
+}
+
+.card-room-action {
+  color: #175cd3;
+  font-weight: 700;
 }
 
 #close-btn {

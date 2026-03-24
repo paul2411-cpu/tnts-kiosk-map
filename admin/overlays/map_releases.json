@@ -1,44 +1,42 @@
 [
     {
-        "file": "tnts_map_export_20260314_154422.glb",
-        "routesFile": "routes_tnts_map_export_20260314_154422.glb.json",
-        "version": "20260315155738_75955b86",
-        "publishedAt": 1773586658
+        "file": "tnts_map_export_20260322_223352.glb",
+        "roadnetFile": "roadnet_tnts_map_export_20260322_223352.glb.json",
+        "routesFile": "routes_tnts_map_export_20260322_223352.glb.json",
+        "guidesFile": "guides_tnts_map_export_20260322_223352.glb.json",
+        "version": "20260322153406_62c2bfc5",
+        "publishedAt": 1774190046
     },
     {
-        "file": "tnts_navigation.glb",
-        "routesFile": "routes_tnts_navigation.glb.json",
-        "version": "20260315155710_5f8728d6",
-        "publishedAt": 1773586630
+        "file": "tnts_map_export_20260322_202255.glb",
+        "roadnetFile": "roadnet_tnts_map_export_20260322_202255.glb.json",
+        "routesFile": "routes_tnts_map_export_20260322_202255.glb.json",
+        "guidesFile": "guides_tnts_map_export_20260322_202255.glb.json",
+        "version": "20260322132306_5db7ae5f",
+        "publishedAt": 1774182186
     },
     {
-        "file": "tnts_map_export_20260314_154422.glb",
-        "routesFile": "routes_tnts_map_export_20260314_154422.glb.json",
-        "version": "20260315154135_6f46be69",
-        "publishedAt": 1773585695
+        "file": "tnts_maproadtest.glb",
+        "roadnetFile": "roadnet_tnts_maproadtest.glb.json",
+        "routesFile": "routes_tnts_maproadtest.glb.json",
+        "guidesFile": "guides_tnts_maproadtest.glb.json",
+        "version": "20260322122550_b4fc429b",
+        "publishedAt": 1774178750
     },
     {
-        "file": "tnts_navigation.glb",
-        "routesFile": "routes_tnts_navigation.glb.json",
-        "version": "20260315153916_0c3cb38f",
-        "publishedAt": 1773585556
+        "file": "tnts_map_export_20260322_162046.glb",
+        "roadnetFile": "roadnet_tnts_map_export_20260322_162046.glb.json",
+        "routesFile": "routes_tnts_map_export_20260322_162046.glb.json",
+        "guidesFile": "guides_tnts_map_export_20260322_162046.glb.json",
+        "version": "20260322120028_1e5f5aa4",
+        "publishedAt": 1774177228
     },
     {
-        "file": "tnts_map_export_20260314_154422.glb",
-        "routesFile": "routes_tnts_map_export_20260314_154422.glb.json",
-        "version": "20260315153858_879b112e",
-        "publishedAt": 1773585538
-    },
-    {
-        "file": "tnts_map_export_20260314_154422.glb",
-        "routesFile": "routes_tnts_map_export_20260314_154422.glb.json",
-        "version": "20260314084440_7eb8472c",
-        "publishedAt": 1773474280
-    },
-    {
-        "file": "tnts_navigation.glb",
-        "routesFile": "routes_tnts_navigation.glb.json",
-        "version": "20260314083039_32389539",
-        "publishedAt": 1773473439
+        "file": "tnts_map_export_20260322_162046.glb",
+        "roadnetFile": "roadnet_tnts_map_export_20260322_162046.glb.json",
+        "routesFile": "routes_tnts_map_export_20260322_162046.glb.json",
+        "guidesFile": "guides_tnts_map_export_20260322_162046.glb.json",
+        "version": "20260322092058_54b2e142",
+        "publishedAt": 1774167658
     }
 ]

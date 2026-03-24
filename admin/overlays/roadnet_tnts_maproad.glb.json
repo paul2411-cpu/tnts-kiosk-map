@@ -1,0 +1,115 @@
+{
+    "ok": true,
+    "model": "tnts_maproad.glb",
+    "updated": 1774177425,
+    "roads": [
+        {
+            "type": "road",
+            "id": "road_1774177399413_701",
+            "name": "road",
+            "position": [
+                601.7937722273346,
+                1.4310853248237336,
+                -34.76591865696365
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 6,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ]
+            ],
+            "pointIds": [
+                "rp_1774177399413_4"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774177399413_4",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774177399414
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774177405742_726",
+            "name": "road",
+            "position": [
+                601.7937722273346,
+                1.4310853248237336,
+                -34.76591865696365
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 6,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    -63.00690757409177,
+                    0,
+                    -7.105427357601002e-15
+                ],
+                [
+                    -63.00690757409177,
+                    0,
+                    -12.250178652155348
+                ]
+            ],
+            "pointIds": [
+                "rp_1774177399413_4",
+                "rp_1774177405742_6",
+                "rp_1774177409328_7"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774177399413_4",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774177399414
+                },
+                null,
+                {
+                    "id": "rp_1774177409328_7",
+                    "label": "J_REMULLA_front",
+                    "building": {
+                        "name": "J_REMULLA",
+                        "objectName": "J_REMULLA",
+                        "uid": "bld_f7eec15e033f9d72",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774177409328
+                }
+            ]
+        }
+    ]
+}

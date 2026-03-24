@@ -1,5 +1,7 @@
 <?php
 // ui/layout.php
+require_once __DIR__ . "/../admin/inc/app_logger.php";
+app_logger_bootstrap(["subsystem" => "public_ui"]);
 if (!isset($pageTitle)) $pageTitle = "TNTS";
 if (!isset($activePage)) $activePage = "";
 if (!isset($extraHead)) $extraHead = "";
@@ -18,6 +20,12 @@ if (!isset($extraScripts)) $extraScripts = "";
   <link rel="stylesheet" href="../css/map.css">
 
   <?= $extraHead ?>
+  <?= app_logger_client_bootstrap([
+    "endpoint" => "../api/client_error_log.php",
+    "scriptSrc" => "../js/app-error-tracker.js",
+    "subsystem" => "public_ui",
+    "page" => $activePage !== "" ? $activePage : $pageTitle,
+  ]) ?>
   <script src="../js/on-screen-keyboard.js"></script>
 </head>
 <body>

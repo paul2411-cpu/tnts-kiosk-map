@@ -1,5 +1,9 @@
 <?php
 
+require_once __DIR__ . "/app_logger.php";
+app_logger_bootstrap(["subsystem" => "map_sync"]);
+require_once __DIR__ . "/building_identity.php";
+
 function map_sync_sanitize_glb_name($name): ?string {
   $base = basename((string)$name);
   if ($base === "" || $base === "." || $base === "..") return null;
@@ -66,11 +70,32 @@ function map_sync_resolve_public_model(string $root): array {
     $modelFile = map_sync_first_glb_file($modelDir);
   }
 
+  $roadnetFile = null;
+  $roadnetPath = null;
   $routesFile = null;
   $routesPath = null;
   $guidesFile = null;
   $guidesPath = null;
   if ($modelFile) {
+    $rawRoadnetFile = str_replace("roadnet_", "", preg_replace('/\.json$/i', "", (string)($liveJson["roadnetFile"] ?? "")));
+    $roadCandidate = map_sync_sanitize_glb_name($rawRoadnetFile);
+    if ($roadCandidate) {
+      $roadnetFile = "roadnet_" . $roadCandidate . ".json";
+      $roadnetPath = $paths["overlayDir"] . "/" . $roadnetFile;
+    }
+
+    if (!$roadnetPath || !file_exists($roadnetPath)) {
+      $fallbackRoadnetFile = "roadnet_" . $modelFile . ".json";
+      $fallbackRoadnetPath = $paths["overlayDir"] . "/" . $fallbackRoadnetFile;
+      if (file_exists($fallbackRoadnetPath)) {
+        $roadnetFile = $fallbackRoadnetFile;
+        $roadnetPath = $fallbackRoadnetPath;
+      } else {
+        $roadnetFile = null;
+        $roadnetPath = null;
+      }
+    }
+
     $rawRoutesFile = str_replace("routes_", "", preg_replace('/\.json$/i', "", (string)($liveJson["routesFile"] ?? "")));
     $candidate = map_sync_sanitize_glb_name($rawRoutesFile);
     if ($candidate) {
@@ -117,6 +142,8 @@ function map_sync_resolve_public_model(string $root): array {
     "defaultJson" => $defaultJson,
     "modelFile" => $modelFile,
     "modelPath" => $modelFile ? ($modelDir . "/" . $modelFile) : null,
+    "roadnetFile" => $roadnetFile,
+    "roadnetPath" => $roadnetPath,
     "routesFile" => $routesFile,
     "routesPath" => $routesPath,
     "guidesFile" => $guidesFile,
@@ -182,15 +209,27 @@ function map_sync_route_key(string $name): string {
   return mb_strtolower(trim($name));
 }
 
+function map_sync_normalize_building_uid(?string $uid): string {
+  return map_identity_normalize_uid($uid);
+}
+
+function map_sync_building_identity_key(?string $uid, string $name = ""): string {
+  $safeUid = map_sync_normalize_building_uid($uid);
+  if ($safeUid !== "") return "uid:" . $safeUid;
+  $safeName = map_sync_route_key($name);
+  return $safeName !== "" ? "name:" . $safeName : "";
+}
+
 function map_sync_guide_token(string $value): string {
   $value = mb_strtolower(trim($value));
   return preg_replace('/\s+/', '_', $value);
 }
 
-function map_sync_build_guide_key(string $type, string $buildingName, string $roomName = ""): string {
+function map_sync_build_guide_key(string $type, string $buildingName, string $roomName = "", string $buildingUid = ""): string {
   $safeType = map_sync_guide_token($type);
   if ($safeType === "") $safeType = "building";
-  $buildingToken = map_sync_guide_token($buildingName);
+  $safeUid = map_sync_normalize_building_uid($buildingUid);
+  $buildingToken = $safeUid !== "" ? ("uid_" . map_sync_guide_token($safeUid)) : map_sync_guide_token($buildingName);
   $roomToken = map_sync_guide_token($roomName);
   if ($safeType === "room") {
     return "room::" . $buildingToken . "::" . $roomToken;
@@ -198,14 +237,24 @@ function map_sync_build_guide_key(string $type, string $buildingName, string $ro
   return $safeType . "::" . $buildingToken;
 }
 
-function map_sync_rename_route_entry(string $root, string $modelFile, string $oldName, string $newName): bool {
+function map_sync_route_entry_identity_key($entry, string $fallbackKey = ""): string {
+  $uid = "";
+  if (is_array($entry)) {
+    $uid = map_sync_normalize_building_uid((string)($entry["buildingUid"] ?? $entry["destinationUid"] ?? $entry["uid"] ?? ""));
+  }
+  $name = is_array($entry) ? trim((string)($entry["name"] ?? $fallbackKey)) : trim($fallbackKey);
+  return map_sync_building_identity_key($uid, $name);
+}
+
+function map_sync_rename_route_entry(string $root, string $modelFile, string $oldName, string $newName, ?string $buildingUid = null): bool {
   $safeModel = map_sync_sanitize_glb_name($modelFile);
   if ($safeModel === null) return false;
 
   $oldName = trim($oldName);
   $newName = trim($newName);
   if ($oldName === "" || $newName === "") return false;
-  if ($oldName === $newName) return true;
+  $safeUid = map_sync_normalize_building_uid($buildingUid);
+  if ($oldName === $newName && $safeUid === "") return true;
 
   $paths = map_sync_paths($root);
   $routesPath = $paths["overlayDir"] . "/routes_" . $safeModel . ".json";
@@ -217,15 +266,22 @@ function map_sync_rename_route_entry(string $root, string $modelFile, string $ol
   if (!$routes) return true;
 
   $oldKey = map_sync_route_key($oldName);
-  $newKey = map_sync_route_key($newName);
+  $targetKey = $safeUid !== "" ? $safeUid : map_sync_route_key($newName);
+  $expectedIdentity = map_sync_building_identity_key($safeUid, $oldName);
   $foundKey = null;
 
-  if (array_key_exists($oldKey, $routes)) {
+  if ($safeUid !== "" && array_key_exists($safeUid, $routes)) {
+    $foundKey = $safeUid;
+  } elseif (array_key_exists($oldKey, $routes)) {
     $foundKey = $oldKey;
   } elseif (array_key_exists($oldName, $routes)) {
     $foundKey = $oldName;
   } else {
     foreach ($routes as $key => $entry) {
+      if ($expectedIdentity !== "" && map_sync_route_entry_identity_key($entry, (string)$key) === $expectedIdentity) {
+        $foundKey = (string)$key;
+        break;
+      }
       $entryName = is_array($entry) ? trim((string)($entry["name"] ?? "")) : "";
       if (map_sync_route_key((string)$key) === $oldKey || ($entryName !== "" && map_sync_route_key($entryName) === $oldKey)) {
         $foundKey = (string)$key;
@@ -239,7 +295,8 @@ function map_sync_rename_route_entry(string $root, string $modelFile, string $ol
   $entry = is_array($routes[$foundKey]) ? $routes[$foundKey] : [];
   unset($routes[$foundKey]);
   $entry["name"] = $newName;
-  $routes[$newKey !== "" ? $newKey : $newName] = $entry;
+  if ($safeUid !== "") $entry["buildingUid"] = $safeUid;
+  $routes[$targetKey !== "" ? $targetKey : $newName] = $entry;
 
   $payload["model"] = $safeModel;
   $payload["updated"] = time();
@@ -247,14 +304,15 @@ function map_sync_rename_route_entry(string $root, string $modelFile, string $ol
   return map_sync_atomic_write_json($routesPath, $payload);
 }
 
-function map_sync_rename_guide_entries(string $root, string $modelFile, string $oldName, string $newName): bool {
+function map_sync_rename_guide_entries(string $root, string $modelFile, string $oldName, string $newName, ?string $buildingUid = null): bool {
   $safeModel = map_sync_sanitize_glb_name($modelFile);
   if ($safeModel === null) return false;
 
   $oldName = trim($oldName);
   $newName = trim($newName);
   if ($oldName === "" || $newName === "") return false;
-  if ($oldName === $newName) return true;
+  $safeUid = map_sync_normalize_building_uid($buildingUid);
+  if ($oldName === $newName && $safeUid === "") return true;
 
   $paths = map_sync_paths($root);
   $guidesPath = $paths["overlayDir"] . "/guides_" . $safeModel . ".json";
@@ -266,6 +324,7 @@ function map_sync_rename_guide_entries(string $root, string $modelFile, string $
   if (!$entries) return true;
 
   $oldRouteKey = map_sync_route_key($oldName);
+  $oldIdentity = map_sync_building_identity_key($safeUid, $oldName);
   $updatedEntries = [];
   $changed = false;
 
@@ -274,14 +333,19 @@ function map_sync_rename_guide_entries(string $root, string $modelFile, string $
     $destinationType = trim((string)($entry["destinationType"] ?? $entry["type"] ?? "building"));
     if ($destinationType === "") $destinationType = "building";
     $buildingName = trim((string)($entry["buildingName"] ?? $entry["name"] ?? ""));
+    $entryUid = map_sync_normalize_building_uid((string)($entry["buildingUid"] ?? $entry["destinationUid"] ?? ""));
     $roomName = trim((string)($entry["roomName"] ?? ""));
 
     $matchesOldBuilding =
-      $buildingName !== "" && map_sync_route_key($buildingName) === $oldRouteKey;
+      ($oldIdentity !== "" && map_sync_building_identity_key($entryUid, $buildingName) === $oldIdentity)
+      || ($buildingName !== "" && map_sync_route_key($buildingName) === $oldRouteKey);
 
     if ($matchesOldBuilding) {
       $buildingName = $newName;
       $entry["buildingName"] = $newName;
+       if ($safeUid !== "") {
+        $entry["buildingUid"] = $safeUid;
+      }
       if (isset($entry["routeName"]) && map_sync_route_key((string)$entry["routeName"]) === $oldRouteKey) {
         $entry["routeName"] = $newName;
       }
@@ -298,7 +362,7 @@ function map_sync_rename_guide_entries(string $root, string $modelFile, string $
       $changed = true;
     }
 
-    $targetKey = map_sync_build_guide_key($destinationType, $buildingName, $roomName);
+    $targetKey = map_sync_build_guide_key($destinationType, $buildingName, $roomName, (string)($entry["buildingUid"] ?? $entryUid));
     $entry["key"] = $targetKey;
     $updatedEntries[$targetKey !== "" ? $targetKey : (string)$rawKey] = $entry;
   }
@@ -309,6 +373,66 @@ function map_sync_rename_guide_entries(string $root, string $modelFile, string $
   $payload["updated"] = time();
   $payload["entries"] = $updatedEntries;
   return map_sync_atomic_write_json($guidesPath, $payload);
+}
+
+function map_sync_rename_roadnet_links(string $root, string $modelFile, string $oldName, string $newName, ?string $buildingUid = null): bool {
+  $safeModel = map_sync_sanitize_glb_name($modelFile);
+  if ($safeModel === null) return false;
+
+  $oldName = trim($oldName);
+  $newName = trim($newName);
+  if ($oldName === "" || $newName === "") return false;
+  $safeUid = map_sync_normalize_building_uid($buildingUid);
+
+  $paths = map_sync_paths($root);
+  $roadnetPath = $paths["overlayDir"] . "/roadnet_" . $safeModel . ".json";
+  if (!file_exists($roadnetPath)) return true;
+
+  $payload = map_sync_read_json_file($roadnetPath);
+  if (!is_array($payload)) return false;
+  $roads = isset($payload["roads"]) && is_array($payload["roads"]) ? $payload["roads"] : [];
+  if (!$roads) return true;
+
+  $oldKey = map_sync_route_key($oldName);
+  $oldIdentity = map_sync_building_identity_key($safeUid, $oldName);
+  $changed = false;
+
+  foreach ($roads as $roadIndex => $road) {
+    if (!is_array($road)) continue;
+    $metaArr = isset($road["pointMeta"]) && is_array($road["pointMeta"]) ? $road["pointMeta"] : null;
+    if ($metaArr === null) continue;
+
+    foreach ($metaArr as $metaIndex => $meta) {
+      if (!is_array($meta)) continue;
+      $building = isset($meta["building"]) && is_array($meta["building"]) ? $meta["building"] : null;
+      if (!$building) continue;
+
+      $buildingName = trim((string)($building["name"] ?? ""));
+      $entryUid = map_sync_normalize_building_uid((string)($building["uid"] ?? ""));
+      $matches = ($oldIdentity !== "" && map_sync_building_identity_key($entryUid, $buildingName) === $oldIdentity)
+        || ($buildingName !== "" && map_sync_route_key($buildingName) === $oldKey);
+      if (!$matches) continue;
+
+      $side = trim((string)($building["side"] ?? ""));
+      $building["name"] = $newName;
+      if ($safeUid !== "") $building["uid"] = $safeUid;
+      $meta["building"] = $building;
+      if ($side !== "") {
+        $meta["label"] = $newName . "_" . $side;
+      } elseif (isset($meta["label"]) && map_sync_route_key((string)$meta["label"]) === $oldKey) {
+        $meta["label"] = $newName;
+      }
+      $roads[$roadIndex]["pointMeta"][$metaIndex] = $meta;
+      $changed = true;
+    }
+  }
+
+  if (!$changed) return true;
+
+  $payload["model"] = $safeModel;
+  $payload["updated"] = time();
+  $payload["roads"] = $roads;
+  return map_sync_atomic_write_json($roadnetPath, $payload);
 }
 
 function map_sync_retarget_room_guide_entries(
@@ -386,7 +510,7 @@ function map_sync_retarget_room_guide_entries(
       $changed = true;
     }
 
-    $targetKey = map_sync_build_guide_key($destinationType, $buildingName, $roomName);
+    $targetKey = map_sync_build_guide_key($destinationType, $buildingName, $roomName, (string)($entry["buildingUid"] ?? ""));
     $entry["key"] = $targetKey;
     $updatedEntries[$targetKey !== "" ? $targetKey : (string)$rawKey] = $entry;
   }

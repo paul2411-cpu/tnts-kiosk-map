@@ -3,6 +3,8 @@ require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_sync.php";
+require_once __DIR__ . "/inc/building_identity.php";
+app_logger_set_default_subsystem("building_admin");
 
 $MODEL_DIR = __DIR__ . "/../models";
 $ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
@@ -17,6 +19,13 @@ if (empty($_SESSION["building_editor_csrf"])) {
 $BUILDING_EDITOR_CSRF = (string)$_SESSION["building_editor_csrf"];
 
 function bld_fail(int $status, string $msg): void {
+  app_log_http_problem($status, $msg, [
+    "action" => trim((string)($_GET["action"] ?? "")),
+    "modelFile" => trim((string)($_GET["model"] ?? "")),
+  ], [
+    "subsystem" => "building_admin",
+    "event" => "http_error",
+  ]);
   http_response_code($status);
   echo json_encode(["ok" => false, "error" => $msg], JSON_PRETTY_PRINT);
   exit;
@@ -99,6 +108,7 @@ function bld_ensure_schema(mysqli $conn): void {
   if (!bld_col($conn, "buildings", "is_present_in_latest")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
   if (!bld_col($conn, "buildings", "last_edited_at")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!bld_col($conn, "buildings", "last_edited_by_admin_id")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
+  map_identity_ensure_schema($conn);
 }
 
 function bld_version_id(mysqli $conn, string $modelFile, string $modelHash, ?int $adminId): int {
@@ -126,26 +136,46 @@ function bld_version_id(mysqli $conn, string $modelFile, string $modelHash, ?int
   return $id;
 }
 
-function bld_sync_linked_room_names(mysqli $conn, int $buildingId, string $oldName, string $newName, string $modelFile): void {
+function bld_sync_linked_room_names(mysqli $conn, int $buildingId, string $buildingUid, string $oldName, string $newName, string $modelFile): void {
   if (!bld_col($conn, "rooms", "building_name")) return;
+  $hasBuildingUid = bld_col($conn, "rooms", "building_uid");
+  $safeUid = map_identity_normalize_uid($buildingUid);
 
   if (bld_col($conn, "rooms", "building_id")) {
-    $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_id = ?");
-    if (!$stmt) throw new RuntimeException("Failed to prepare linked room sync");
-    $stmt->bind_param("si", $newName, $buildingId);
+    if ($hasBuildingUid) {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ?, building_uid = ? WHERE building_id = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare linked room sync");
+      $stmt->bind_param("ssi", $newName, $safeUid, $buildingId);
+    } else {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_id = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare linked room sync");
+      $stmt->bind_param("si", $newName, $buildingId);
+    }
     if (!$stmt->execute()) throw new RuntimeException("Failed to sync linked room names");
     $stmt->close();
     return;
   }
 
   if (bld_col($conn, "rooms", "source_model_file")) {
-    $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_name = ? AND source_model_file = ?");
-    if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
-    $stmt->bind_param("sss", $newName, $oldName, $modelFile);
+    if ($hasBuildingUid) {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ?, building_uid = ? WHERE building_name = ? AND source_model_file = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
+      $stmt->bind_param("ssss", $newName, $safeUid, $oldName, $modelFile);
+    } else {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_name = ? AND source_model_file = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
+      $stmt->bind_param("sss", $newName, $oldName, $modelFile);
+    }
   } else {
-    $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_name = ?");
-    if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
-    $stmt->bind_param("ss", $newName, $oldName);
+    if ($hasBuildingUid) {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ?, building_uid = ? WHERE building_name = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
+      $stmt->bind_param("sss", $newName, $safeUid, $oldName);
+    } else {
+      $stmt = $conn->prepare("UPDATE rooms SET building_name = ? WHERE building_name = ?");
+      if (!$stmt) throw new RuntimeException("Failed to prepare fallback room sync");
+      $stmt->bind_param("ss", $newName, $oldName);
+    }
   }
   if (!$stmt->execute()) throw new RuntimeException("Failed to sync fallback room names");
   $stmt->close();
@@ -308,8 +338,10 @@ if (isset($_GET["action"])) {
 
     $projectRoot = dirname(__DIR__);
     $overlayDir = map_sync_paths($projectRoot)["overlayDir"];
+    $roadnetPath = $overlayDir . "/roadnet_" . $modelFile . ".json";
     $routesPath = $overlayDir . "/routes_" . $modelFile . ".json";
     $guidesPath = $overlayDir . "/guides_" . $modelFile . ".json";
+    $roadnetBackup = file_exists($roadnetPath) ? @file_get_contents($roadnetPath) : null;
     $routesBackup = file_exists($routesPath) ? @file_get_contents($routesPath) : null;
     $guidesBackup = file_exists($guidesPath) ? @file_get_contents($guidesPath) : null;
 
@@ -324,9 +356,11 @@ if (isset($_GET["action"])) {
       $versionId = bld_version_id($conn, $modelFile, $hash, $adminId);
 
       $id = 0;
+      $buildingUid = "";
+      $buildingObjectName = $oldName;
       $lookups = [
-        ["SELECT building_id FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $oldName]],
-        ["SELECT building_id FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $newName]],
+        ["SELECT building_id, building_uid, model_object_name FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $oldName]],
+        ["SELECT building_id, building_uid, model_object_name FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $newName]],
       ];
       foreach ($lookups as $q) {
         if ($id > 0) break;
@@ -337,45 +371,76 @@ if (isset($_GET["action"])) {
         if (!$stmt->execute()) throw new RuntimeException("Failed building lookup");
         $res = $stmt->get_result();
         $row = $res ? $res->fetch_assoc() : null;
-        if ($row && isset($row["building_id"])) $id = (int)$row["building_id"];
+        if ($row && isset($row["building_id"])) {
+          $id = (int)$row["building_id"];
+          $buildingUid = map_identity_normalize_uid((string)($row["building_uid"] ?? ""));
+          $buildingObjectName = trim((string)($row["model_object_name"] ?? $buildingObjectName));
+        }
         $stmt->close();
+      }
+
+      if ($oldName !== $newName) {
+        $dupStmt = $conn->prepare("SELECT building_id FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1");
+        if (!$dupStmt) throw new RuntimeException("Failed to prepare duplicate building check");
+        $dupStmt->bind_param("ss", $modelFile, $newName);
+        if (!$dupStmt->execute()) {
+          $dupStmt->close();
+          throw new RuntimeException("Failed to check duplicate building names");
+        }
+        $dupRes = $dupStmt->get_result();
+        $dupRow = $dupRes ? $dupRes->fetch_assoc() : null;
+        $dupStmt->close();
+        $dupId = $dupRow ? (int)($dupRow["building_id"] ?? 0) : 0;
+        if ($dupId > 0 && $dupId !== $id) {
+          throw new RuntimeException("Another building in this model already uses that name.");
+        }
+      }
+
+      if ($buildingUid === "") {
+        $buildingUid = map_identity_resolve_uid($conn, $oldName !== "" ? $oldName : $newName, $modelFile);
+      }
+      if ($buildingObjectName === "") {
+        $buildingObjectName = $oldName !== "" ? $oldName : $newName;
       }
 
       $inserted = false;
       if ($id > 0) {
         if ($adminId === null) {
-          $stmt = $conn->prepare("UPDATE buildings SET building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE building_id=?");
+          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE building_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssii", $newName, $description, $imagePath, $modelFile, $versionId, $id);
+          $stmt->bind_param("ssssssii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $id);
         } else {
-          $stmt = $conn->prepare("UPDATE buildings SET building_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE building_id=?");
+          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE building_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssiii", $newName, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
+          $stmt->bind_param("ssssssiii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to update building");
         $stmt->close();
       } else {
         $inserted = true;
         if ($adminId === null) {
-          $stmt = $conn->prepare("INSERT INTO buildings (building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
+          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssii", $newName, $description, $imagePath, $modelFile, $versionId, $versionId);
+          $stmt->bind_param("ssssssii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $versionId);
         } else {
-          $stmt = $conn->prepare("INSERT INTO buildings (building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
+          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssiii", $newName, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
+          $stmt->bind_param("ssssssiii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to insert building");
         $id = (int)$stmt->insert_id;
         $stmt->close();
       }
 
-      bld_sync_linked_room_names($conn, $id, $oldName, $newName, $modelFile);
+      bld_sync_linked_room_names($conn, $id, $buildingUid, $oldName, $newName, $modelFile);
 
-      if ($oldName !== $newName && !map_sync_rename_route_entry($projectRoot, $modelFile, $oldName, $newName)) {
+      if ($oldName !== $newName && !map_sync_rename_roadnet_links($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
+        throw new RuntimeException("Failed to sync published road links for renamed building");
+      }
+      if ($oldName !== $newName && !map_sync_rename_route_entry($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
         throw new RuntimeException("Failed to sync published routes for renamed building");
       }
-      if ($oldName !== $newName && !map_sync_rename_guide_entries($projectRoot, $modelFile, $oldName, $newName)) {
+      if ($oldName !== $newName && !map_sync_rename_guide_entries($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
         throw new RuntimeException("Failed to sync published text guides for renamed building");
       }
 
@@ -389,6 +454,19 @@ if (isset($_GET["action"])) {
       $meta->close();
 
       $conn->commit();
+      app_log("info", "Building saved", [
+        "action" => $action,
+        "modelFile" => $modelFile,
+        "buildingId" => $id,
+        "buildingUid" => $buildingUid,
+        "oldName" => $oldName,
+        "newName" => $newName,
+        "inserted" => $inserted,
+        "versionId" => $versionId,
+      ], [
+        "subsystem" => "building_admin",
+        "event" => "save_building",
+      ]);
       echo json_encode([
         "ok" => true,
         "buildingId" => $id,
@@ -403,6 +481,12 @@ if (isset($_GET["action"])) {
       $backupRaw = @file_get_contents($backupPath);
       if (is_string($backupRaw) && bld_valid_glb($backupRaw)) {
         bld_atomic_write($modelPath, $backupRaw);
+      }
+      if (is_string($roadnetBackup)) {
+        $decodedRoadnet = json_decode($roadnetBackup, true);
+        if (is_array($decodedRoadnet)) {
+          map_sync_atomic_write_json($roadnetPath, $decodedRoadnet);
+        }
       }
       if (is_string($routesBackup)) {
         $decodedRoutes = json_decode($routesBackup, true);

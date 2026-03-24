@@ -2,6 +2,8 @@
 require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
+require_once __DIR__ . "/inc/building_identity.php";
+app_logger_set_default_subsystem("map_import");
 
 $MODEL_DIR = __DIR__ . "/../models";
 $ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
@@ -16,6 +18,13 @@ if (empty($_SESSION["map_import_csrf"])) {
 $MAP_IMPORT_CSRF = (string)$_SESSION["map_import_csrf"];
 
 function import_json_error(int $status, string $message): void {
+  app_log_http_problem($status, $message, [
+    "action" => trim((string)($_GET["action"] ?? "")),
+    "modelFile" => trim((string)($_GET["model"] ?? "")),
+  ], [
+    "subsystem" => "map_import",
+    "event" => "http_error",
+  ]);
   http_response_code($status);
   echo json_encode(["ok" => false, "error" => $message], JSON_PRETTY_PRINT);
   exit;
@@ -254,6 +263,8 @@ function import_ensure_schema(mysqli $conn): void {
   if (!import_column_exists($conn, "buildings", "last_edited_by_admin_id")) {
     import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
   }
+
+  map_identity_ensure_schema($conn);
 }
 
 function import_get_or_create_version_id(
@@ -465,6 +476,15 @@ if (isset($_GET["action"])) {
       import_json_error(500, "Failed to restore model from backup");
     }
 
+    app_log("info", "Model restored from backup", [
+      "action" => $action,
+      "modelFile" => $safeName,
+      "restoredFrom" => $backupRaw,
+      "preRestoreBackup" => $preRestoreBackupName,
+    ], [
+      "subsystem" => "map_import",
+      "event" => "restore_backup",
+    ]);
     echo json_encode([
       "ok" => true,
       "file" => $safeName,
@@ -622,21 +642,21 @@ if (isset($_GET["action"])) {
         WHERE source_model_file = ?
       ");
       $selectBuildingStmt = $conn->prepare("
-        SELECT building_id
+        SELECT building_id, building_uid, building_name, model_object_name
         FROM buildings
-        WHERE source_model_file = ? AND building_name = ?
+        WHERE source_model_file = ? AND model_object_name = ?
         LIMIT 1
       ");
       $selectBuildingTemplateStmt = $conn->prepare("
-        SELECT description, image_path, last_edited_at, last_edited_by_admin_id
+        SELECT building_uid, building_name, model_object_name, description, image_path, last_edited_at, last_edited_by_admin_id
         FROM buildings
-        WHERE building_name = ?
+        WHERE model_object_name = ?
         ORDER BY building_id DESC
         LIMIT 1
       ");
       $insertBuildingStmt = $conn->prepare("
-        INSERT INTO buildings (building_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateBuildingSeenStmt = $conn->prepare("
         UPDATE buildings
@@ -656,12 +676,12 @@ if (isset($_GET["action"])) {
         LIMIT 1
       ");
       $insertRoomStmt = $conn->prepare("
-        INSERT INTO rooms (building_id, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO rooms (building_id, building_uid, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateRoomSeenStmt = $conn->prepare("
         UPDATE rooms
-        SET building_id = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1
+        SET building_id = ?, building_uid = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1
         WHERE room_id = ?
       ");
       $countMissingBuildingsStmt = $conn->prepare("SELECT COUNT(*) AS cnt FROM buildings WHERE source_model_file = ? AND is_present_in_latest = 0");
@@ -706,19 +726,39 @@ if (isset($_GET["action"])) {
         $buildingResult = $selectBuildingStmt->get_result();
         $existing = $buildingResult ? $buildingResult->fetch_assoc() : null;
         $buildingId = 0;
+        $buildingUid = "";
+        $buildingDisplayName = $buildingName;
 
         if ($existing && isset($existing["building_id"])) {
           $buildingId = (int)$existing["building_id"];
+          $buildingUid = map_identity_normalize_uid((string)($existing["building_uid"] ?? ""));
+          $buildingDisplayName = import_clean_building_name((string)($existing["building_name"] ?? $buildingName));
+          if ($buildingDisplayName === "") $buildingDisplayName = $buildingName;
+          if ($buildingUid === "") {
+            $buildingUid = map_identity_resolve_uid($conn, $buildingName, $modelFile);
+            $repairUidStmt = $conn->prepare("UPDATE buildings SET building_uid = ? WHERE building_id = ?");
+            if (!$repairUidStmt) {
+              throw new RuntimeException("Failed to prepare building UID repair");
+            }
+            $repairUidStmt->bind_param("si", $buildingUid, $buildingId);
+            if (!$repairUidStmt->execute()) {
+              $repairUidStmt->close();
+              throw new RuntimeException("Failed to repair building UID: " . $buildingName);
+            }
+            $repairUidStmt->close();
+          }
           $summary["buildingsExisting"]++;
           $updateBuildingSeenStmt->bind_param("ii", $versionId, $buildingId);
           if (!$updateBuildingSeenStmt->execute()) {
             throw new RuntimeException("Failed to update building sync markers: " . $buildingName);
           }
         } else {
+          $buildingDisplayName = $buildingName;
           $buildingDescription = "";
           $buildingImagePath = "";
           $buildingEditedAt = null;
           $buildingEditedBy = null;
+          $buildingUid = "";
           $selectBuildingTemplateStmt->bind_param("s", $buildingName);
           if (!$selectBuildingTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query building template");
@@ -726,13 +766,19 @@ if (isset($_GET["action"])) {
           $templateRes = $selectBuildingTemplateStmt->get_result();
           $templateRow = $templateRes ? $templateRes->fetch_assoc() : null;
           if ($templateRow) {
+            $buildingUid = map_identity_normalize_uid((string)($templateRow["building_uid"] ?? ""));
+            $templateDisplayName = import_clean_building_name((string)($templateRow["building_name"] ?? ""));
+            if ($templateDisplayName !== "") $buildingDisplayName = $templateDisplayName;
             $buildingDescription = import_copy_text($templateRow["description"] ?? "");
             $buildingImagePath = import_copy_text($templateRow["image_path"] ?? "");
             $buildingEditedAt = isset($templateRow["last_edited_at"]) ? (string)$templateRow["last_edited_at"] : null;
             $buildingEditedBy = isset($templateRow["last_edited_by_admin_id"]) ? (int)$templateRow["last_edited_by_admin_id"] : null;
           }
+          if ($buildingUid === "") {
+            $buildingUid = map_identity_resolve_uid($conn, $buildingName, $modelFile);
+          }
 
-          $insertBuildingStmt->bind_param("ssssiisi", $buildingName, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
+          $insertBuildingStmt->bind_param("ssssssiisi", $buildingUid, $buildingDisplayName, $buildingName, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
           if (!$insertBuildingStmt->execute()) {
             throw new RuntimeException("Failed to insert building: " . $buildingName);
           }
@@ -778,7 +824,7 @@ if (isset($_GET["action"])) {
         foreach ($roomsInDeduped as $roomKey => $roomName) {
           if (isset($existingRoomsByName[$roomKey])) {
             $existingRoomId = (int)$existingRoomsByName[$roomKey];
-            $updateRoomSeenStmt->bind_param("isii", $buildingId, $buildingName, $versionId, $existingRoomId);
+            $updateRoomSeenStmt->bind_param("issii", $buildingId, $buildingUid, $buildingDisplayName, $versionId, $existingRoomId);
             if (!$updateRoomSeenStmt->execute()) {
               throw new RuntimeException("Failed to update room sync markers: " . $roomName);
             }
@@ -794,7 +840,7 @@ if (isset($_GET["action"])) {
           $roomImagePath = "";
           $roomEditedAt = null;
           $roomEditedBy = null;
-          $selectRoomTemplateStmt->bind_param("ss", $roomName, $buildingName);
+          $selectRoomTemplateStmt->bind_param("ss", $roomName, $buildingDisplayName);
           if (!$selectRoomTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query room template");
           }
@@ -812,13 +858,14 @@ if (isset($_GET["action"])) {
           }
 
           $insertRoomStmt->bind_param(
-            "isssssssssiisi",
+            "issssssssssiisi",
             $buildingId,
+            $buildingUid,
             $roomName,
             $roomNumber,
             $roomType,
             $floorNumber,
-            $buildingName,
+            $buildingDisplayName,
             $roomDescription,
             $roomIndoorGuideText,
             $roomImagePath,
@@ -858,6 +905,14 @@ if (isset($_GET["action"])) {
       import_json_error(500, "Import failed: " . $e->getMessage());
     }
 
+    app_log("info", "Entities imported", [
+      "action" => $action,
+      "modelFile" => $modelFile,
+      "summary" => $summary,
+    ], [
+      "subsystem" => "map_import",
+      "event" => "import_entities",
+    ]);
     echo json_encode([
       "ok" => true,
       "modelFile" => $modelFile,
@@ -1013,6 +1068,17 @@ let restoreBusy = false;
 function setStatus(msg, color = "#334155") {
   statusEl.textContent = msg;
   statusEl.style.color = color;
+}
+
+function reportUiError(kind, err, extra = {}) {
+  console.error(err);
+  window.tntsReportClientError?.(kind, err?.message || String(err || kind), {
+    error: {
+      message: String(err?.message || err || ""),
+      stack: String(err?.stack || ""),
+    },
+    ...extra,
+  });
 }
 
 function escapeHtml(s) {
@@ -1505,7 +1571,7 @@ async function scanModel() {
       "#0f766e"
     );
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_scan_failed", err, { source: "scan_model_live" });
     scannedModelFile = "";
     scannedFromBackup = false;
     scannedBackupFile = "";
@@ -1572,7 +1638,7 @@ async function scanBackupModel() {
       "#0f766e"
     );
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_scan_failed", err, { source: "scan_model_backup" });
     scannedModelFile = "";
     scannedFromBackup = false;
     scannedBackupFile = "";
@@ -1681,7 +1747,7 @@ async function applyNameFixesToModel() {
     await loadBackupList().catch(() => {});
     await scanModel();
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_save_name_fixes_failed", err);
     setStatus(`Failed to save name fixes: ${err?.message || err}`, "#b42318");
   } finally {
     saveBusy = false;
@@ -1742,7 +1808,7 @@ async function importToDatabase() {
       "#0f766e"
     );
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_entities_failed", err, { modelFile: scannedModelFile || selectedModelFile });
     setStatus(`Import failed: ${err?.message || err}`, "#b42318");
   } finally {
     importBusy = false;
@@ -1806,7 +1872,7 @@ async function restoreLastBackup() {
     roomAuditItems = [];
     await scanModel();
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_restore_failed", err, { modelFile: selectedModelFile, backupFile: selectedBackupFile });
     setStatus(`Restore failed: ${err?.message || err}`, "#b42318");
   } finally {
     restoreBusy = false;
@@ -1836,7 +1902,7 @@ modelSelect.addEventListener("change", () => {
   fixNamesBtn.disabled = true;
   setStatus("Model changed. Scan again.", "#334155");
   loadBackupList().catch((err) => {
-    console.error(err);
+    reportUiError("map_import_backup_list_failed", err, { modelFile: selectedModelFile });
     setStatus(`Failed to load backups: ${err?.message || err}`, "#b42318");
   });
 });
@@ -1846,7 +1912,7 @@ reloadModelsBtn.addEventListener("click", async () => {
     await loadModelList();
     setStatus("Model list refreshed.");
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_model_list_failed", err);
     setStatus(`Failed to load models: ${err?.message || err}`, "#b42318");
   }
 });
@@ -1863,7 +1929,7 @@ reloadBackupsBtn?.addEventListener("click", async () => {
     await loadBackupList();
     setStatus("Backup list refreshed.");
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_backup_list_failed", err, { modelFile: selectedModelFile });
     setStatus(`Failed to load backups: ${err?.message || err}`, "#b42318");
   }
 });
@@ -1893,7 +1959,7 @@ undoBtn.addEventListener("click", () => {
     await loadModelList();
     setStatus("Ready. Select model and scan.");
   } catch (err) {
-    console.error(err);
+    reportUiError("map_import_init_failed", err);
     setStatus(`Failed to initialize: ${err?.message || err}`, "#b42318");
   }
 })();

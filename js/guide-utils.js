@@ -7,13 +7,17 @@ function normalizeToken(value) {
 
 export function buildGuideKey(type, data = {}) {
   const safeType = normalizeToken(type) || "building";
+  const buildingUid = String(data.buildingUid || data.uid || data.destinationUid || "").trim();
   const buildingName = String(data.buildingName || data.name || "").trim();
   const roomName = String(data.roomName || "").trim();
+  const buildingToken = buildingUid
+    ? `uid_${normalizeToken(buildingUid)}`
+    : normalizeToken(buildingName);
 
   if (safeType === "room") {
-    return `room::${normalizeToken(buildingName)}::${normalizeToken(roomName)}`;
+    return `room::${buildingToken}::${normalizeToken(roomName)}`;
   }
-  return `${safeType}::${normalizeToken(buildingName)}`;
+  return `${safeType}::${buildingToken}`;
 }
 
 export function toGuidePoint(raw) {

@@ -1,4 +1,6 @@
 <?php
+require_once __DIR__ . "/../admin/inc/app_logger.php";
+app_logger_bootstrap(["subsystem" => "public_feedback"]);
 if (session_status() === PHP_SESSION_NONE) {
   session_start();
 }
@@ -167,6 +169,14 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     );
 
     if (!$stmt) {
+      app_log("error", "Public feedback statement preparation failed", [
+        "dbError" => $conn->error,
+        "category" => $form["category"],
+        "sourcePage" => $form["source_page"],
+      ], [
+        "subsystem" => "public_feedback",
+        "event" => "prepare_failed",
+      ]);
       $errors[] = "Feedback could not be prepared right now. Please try again.";
     } else {
       $stmt->bind_param(
@@ -182,6 +192,15 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
       );
 
       if ($stmt->execute()) {
+        app_log("info", "Public feedback saved", [
+          "category" => $form["category"],
+          "rating" => $form["rating"],
+          "sourcePage" => $form["source_page"],
+          "mapVersion" => $form["map_version"],
+        ], [
+          "subsystem" => "public_feedback",
+          "event" => "feedback_saved",
+        ]);
         $_SESSION["public_feedback_flash"] = [
           "ok" => true,
           "rating" => $ratingOptions[$form["rating"]]["label"],
@@ -191,6 +210,15 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         exit;
       }
 
+      app_log("error", "Public feedback save failed", [
+        "dbError" => $stmt->error,
+        "category" => $form["category"],
+        "rating" => $form["rating"],
+        "sourcePage" => $form["source_page"],
+      ], [
+        "subsystem" => "public_feedback",
+        "event" => "execute_failed",
+      ]);
       $errors[] = "Feedback could not be saved right now. Please try again.";
       $stmt->close();
     }

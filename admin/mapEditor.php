@@ -2,14 +2,50 @@
 require_once __DIR__ . "/inc/auth.php";
 require_admin();
 require_once __DIR__ . "/inc/db.php";
+require_once __DIR__ . "/inc/building_identity.php";
+app_logger_set_default_subsystem("map_editor");
 
 $ASSET_DIR = __DIR__ . "/assets_map";
 $OVERLAY_PATH = __DIR__ . "/overlays/map_overlay.json";
 $MODEL_DIR = __DIR__ . "/../models";
+$DRAFT_STATE_DIR = __DIR__ . "/overlays/drafts";
+$DRAFT_MODEL_DIR = __DIR__ . "/../models/drafts";
 $DEFAULT_MODEL_PATH = __DIR__ . "/overlays/default_model.json";
 $LIVE_MAP_PATH = __DIR__ . "/overlays/map_live.json";
 $RELEASES_PATH = __DIR__ . "/overlays/map_releases.json";
 $ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
+
+function editor_normalize_model_file_name(string $name): string {
+  $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', trim($name));
+  if ($safe === "" || $safe === "." || $safe === "..") return "";
+  if (!preg_match('/\.glb$/i', $safe)) {
+    $safe .= ".glb";
+  }
+  return $safe;
+}
+
+function editor_get_draft_glb_file_name(string $modelFile): string {
+  $safe = editor_normalize_model_file_name($modelFile);
+  if ($safe === "") return "";
+  return "draft_" . $safe;
+}
+
+function editor_get_draft_state_path(string $modelFile): string {
+  global $DRAFT_STATE_DIR;
+  $safe = editor_normalize_model_file_name($modelFile);
+  return $safe === "" ? "" : ($DRAFT_STATE_DIR . "/draft_" . $safe . ".json");
+}
+
+function editor_get_draft_glb_path(string $modelFile): string {
+  global $DRAFT_MODEL_DIR;
+  $file = editor_get_draft_glb_file_name($modelFile);
+  return $file === "" ? "" : ($DRAFT_MODEL_DIR . "/" . $file);
+}
+
+function editor_get_draft_glb_url(string $modelFile): string {
+  $file = editor_get_draft_glb_file_name($modelFile);
+  return $file === "" ? "" : ("../models/drafts/" . rawurlencode($file));
+}
 
 if (empty($_SESSION["map_editor_csrf"])) {
   try {
@@ -38,6 +74,13 @@ if (empty($_SESSION["map_import_csrf"])) {
 $MAP_IMPORT_CSRF = (string)$_SESSION["map_import_csrf"];
 
 function json_error_and_exit(int $status, string $message): void {
+  app_log_http_problem($status, $message, [
+    "action" => trim((string)($_GET["action"] ?? "")),
+    "queryModel" => trim((string)($_GET["name"] ?? $_GET["file"] ?? "")),
+  ], [
+    "subsystem" => "map_editor",
+    "event" => "http_error",
+  ]);
   http_response_code($status);
   echo json_encode(["ok" => false, "error" => $message], JSON_PRETTY_PRINT);
   exit;
@@ -348,6 +391,54 @@ function validate_guides_payload($data, ?string &$error = null): bool {
   return true;
 }
 
+function validate_draft_payload($data, ?string &$error = null): bool {
+  if (!is_array($data)) {
+    $error = "Draft payload must be an object";
+    return false;
+  }
+
+  $overlay = $data["overlay"] ?? ["version" => 2, "items" => []];
+  if (!is_array($overlay) || !isset($overlay["items"]) || !is_array($overlay["items"])) {
+    $error = "Draft payload must include overlay.items[]";
+    return false;
+  }
+  foreach ($overlay["items"] as $idx => $item) {
+    $itemError = null;
+    if (!validate_overlay_item($item, $itemError)) {
+      $error = "overlay.items[{$idx}] invalid: " . ($itemError ?: "Malformed overlay item");
+      return false;
+    }
+  }
+
+  $roadsPayload = ["roads" => is_array($data["roads"] ?? null) ? $data["roads"] : null];
+  if (!validate_roadnet_payload($roadsPayload, $error)) {
+    return false;
+  }
+
+  $routesPayload = ["routes" => is_array($data["routes"] ?? null) ? $data["routes"] : null];
+  if (!validate_routes_payload($routesPayload, $error)) {
+    return false;
+  }
+
+  $guidesPayload = is_array($data["guides"] ?? null)
+    ? $data["guides"]
+    : ["entries" => null];
+  if (!validate_guides_payload($guidesPayload, $error)) {
+    return false;
+  }
+
+  if (isset($data["hasBaseDraft"]) && !is_bool($data["hasBaseDraft"])) {
+    $error = "Draft payload hasBaseDraft must be true or false";
+    return false;
+  }
+  if (isset($data["baseDraftFile"]) && !is_string($data["baseDraftFile"])) {
+    $error = "Draft payload baseDraftFile must be a string";
+    return false;
+  }
+
+  return true;
+}
+
 function is_valid_glb_binary(string $raw): bool {
   if (strlen($raw) < 12) return false;
   $hdr = unpack("a4magic/Vversion/Vlength", substr($raw, 0, 12));
@@ -402,6 +493,7 @@ function editor_ensure_snapshot_schema(mysqli $conn): void {
   if (!editor_db_col($conn, "rooms", "is_present_in_latest")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
   if (!editor_db_col($conn, "rooms", "last_edited_at")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!editor_db_col($conn, "rooms", "last_edited_by_admin_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
+  map_identity_ensure_schema($conn);
 }
 
 function editor_get_or_create_version_id(mysqli $conn, string $modelFile, string $modelHash): int {
@@ -441,7 +533,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
   if ($sourceModel === "" || $targetModel === "" || $sourceModel === $targetModel) return;
 
   $buildingSql = "
-    SELECT building_id, building_name, description, image_path, last_edited_at, last_edited_by_admin_id
+    SELECT building_id, building_uid, building_name, model_object_name, description, image_path, last_edited_at, last_edited_by_admin_id
     FROM buildings
     WHERE source_model_file = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
     ORDER BY building_id ASC
@@ -460,7 +552,9 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
 
   $insertBuildingStmt = $conn->prepare("
     INSERT INTO buildings (
+      building_uid,
       building_name,
+      model_object_name,
       description,
       image_path,
       source_model_file,
@@ -470,13 +564,14 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       last_edited_at,
       last_edited_by_admin_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   ");
   if (!$insertBuildingStmt) throw new RuntimeException("Failed to prepare cloned building insert");
 
   $insertRoomStmt = $conn->prepare("
     INSERT INTO rooms (
       building_id,
+      building_uid,
       room_name,
       room_number,
       room_type,
@@ -492,12 +587,12 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       last_edited_at,
       last_edited_by_admin_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   ");
   if (!$insertRoomStmt) throw new RuntimeException("Failed to prepare cloned room insert");
 
   $roomQueryStmt = $conn->prepare("
-    SELECT room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
+    SELECT room_name, room_number, room_type, floor_number, building_name, building_uid, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
     FROM rooms
     WHERE source_model_file = ? AND building_id = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
     ORDER BY room_id ASC
@@ -508,16 +603,24 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
     $sourceBuildingId = (int)($building["building_id"] ?? 0);
     if ($sourceBuildingId <= 0) continue;
 
+    $buildingUid = map_identity_normalize_uid((string)($building["building_uid"] ?? ""));
+    if ($buildingUid === "") {
+      $buildingUid = map_identity_resolve_uid($conn, (string)($building["building_name"] ?? ""), $sourceModel);
+    }
     $buildingName = trim((string)($building["building_name"] ?? ""));
-    if ($buildingName === "") continue;
+    $buildingObjectName = trim((string)($building["model_object_name"] ?? ""));
+    if ($buildingObjectName === "") $buildingObjectName = $buildingName;
+    if ($buildingName === "" || $buildingObjectName === "") continue;
     $buildingDescription = trim((string)($building["description"] ?? ""));
     $buildingImagePath = trim((string)($building["image_path"] ?? ""));
     $buildingEditedAt = isset($building["last_edited_at"]) ? (string)$building["last_edited_at"] : null;
     $buildingEditedBy = isset($building["last_edited_by_admin_id"]) ? (int)$building["last_edited_by_admin_id"] : null;
 
     $insertBuildingStmt->bind_param(
-      "ssssiisi",
+      "ssssssiisi",
+      $buildingUid,
       $buildingName,
+      $buildingObjectName,
       $buildingDescription,
       $buildingImagePath,
       $targetModel,
@@ -537,6 +640,8 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
     while ($room = $roomRes->fetch_assoc()) {
       $roomName = trim((string)($room["room_name"] ?? ""));
       if ($roomName === "") continue;
+      $roomBuildingUid = map_identity_normalize_uid((string)($room["building_uid"] ?? ""));
+      if ($roomBuildingUid === "") $roomBuildingUid = $buildingUid;
       $roomNumber = trim((string)($room["room_number"] ?? ""));
       $roomType = trim((string)($room["room_type"] ?? ""));
       $floorNumber = trim((string)($room["floor_number"] ?? ""));
@@ -548,8 +653,9 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       $roomEditedBy = isset($room["last_edited_by_admin_id"]) ? (int)$room["last_edited_by_admin_id"] : null;
 
       $insertRoomStmt->bind_param(
-        "isssssssssiisi",
+        "issssssssssiisi",
         $newBuildingId,
+        $roomBuildingUid,
         $roomName,
         $roomNumber,
         $roomType,
@@ -575,9 +681,12 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
 
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
+  header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  header("Pragma: no-cache");
+  header("Expires: 0");
   $action = (string)$_GET["action"];
 
-  if (in_array($action, ["save_routes", "save_roadnet", "save_guides", "save_navigation_bundle", "set_default_model", "publish_map", "save_overlay", "export_glb"], true)) {
+  if (in_array($action, ["save_routes", "save_roadnet", "save_guides", "save_navigation_bundle", "save_draft_state", "save_draft_glb", "set_default_model", "publish_map", "save_overlay", "export_glb"], true)) {
     verify_csrf_or_origin();
   }
 
@@ -891,7 +1000,185 @@ if (isset($_GET["action"])) {
       json_error_and_exit(500, "Failed to save navigation bundle: " . $e->getMessage());
     }
 
+    app_log("info", "Navigation bundle saved", [
+      "action" => $action,
+      "modelFile" => $safe,
+      "roadCount" => count(is_array($roadnetOut["roads"]) ? $roadnetOut["roads"] : []),
+      "routeCount" => is_array($routesOut["routes"]) ? count($routesOut["routes"]) : 0,
+      "guideCount" => is_array($guidesOut["entries"] ?? null) ? count($guidesOut["entries"]) : 0,
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "save_navigation_bundle",
+    ]);
     echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "load_draft_state") {
+    $safe = editor_normalize_model_file_name(isset($_GET["name"]) ? trim((string)$_GET["name"]) : "");
+    if ($safe === "") {
+      echo json_encode(["ok" => true, "exists" => false, "model" => ""], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $path = editor_get_draft_state_path($safe);
+    if ($path === "" || !file_exists($path)) {
+      echo json_encode(["ok" => true, "exists" => false, "model" => $safe], JSON_PRETTY_PRINT);
+      exit;
+    }
+
+    $json = json_decode((string)file_get_contents($path), true);
+    if (!is_array($json)) {
+      json_error_and_exit(500, "Draft state file is invalid JSON");
+    }
+
+    $overlay = (isset($json["overlay"]) && is_array($json["overlay"]))
+      ? $json["overlay"]
+      : ["version" => 2, "items" => []];
+    if (!isset($overlay["items"]) || !is_array($overlay["items"])) {
+      $overlay["items"] = [];
+    }
+
+    $roads = isset($json["roads"]) && is_array($json["roads"]) ? $json["roads"] : [];
+    $routes = isset($json["routes"]) && is_array($json["routes"]) ? $json["routes"] : [];
+    $guides = isset($json["guides"]) && is_array($json["guides"]) ? $json["guides"] : ["entries" => []];
+    if (!isset($guides["entries"]) || !is_array($guides["entries"])) {
+      $guides["entries"] = [];
+    }
+
+    $baseDraftFile = basename((string)($json["baseDraftFile"] ?? ""));
+    if ($baseDraftFile === "") {
+      $baseDraftFile = editor_get_draft_glb_file_name($safe);
+    }
+    $baseDraftPath = $baseDraftFile !== "" ? ($DRAFT_MODEL_DIR . "/" . $baseDraftFile) : "";
+    $hasBaseDraft = !empty($json["hasBaseDraft"]) && $baseDraftPath !== "" && file_exists($baseDraftPath);
+
+    echo json_encode([
+      "ok" => true,
+      "exists" => true,
+      "model" => $safe,
+      "savedAt" => isset($json["savedAt"]) ? (int)$json["savedAt"] : (filemtime($path) ?: time()),
+      "hasBaseDraft" => $hasBaseDraft,
+      "baseDraftFile" => $hasBaseDraft ? $baseDraftFile : "",
+      "baseDraftUrl" => $hasBaseDraft ? ("../models/drafts/" . rawurlencode($baseDraftFile)) : "",
+      "overlay" => $overlay,
+      "roads" => $roads,
+      "routes" => $routes,
+      "guides" => $guides
+    ], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "save_draft_state") {
+    $safe = editor_normalize_model_file_name(isset($_GET["name"]) ? trim((string)$_GET["name"]) : "");
+    if ($safe === "") {
+      json_error_and_exit(400, "Invalid name");
+    }
+
+    $raw = file_get_contents("php://input");
+    $data = json_decode($raw, true);
+    if (!validate_draft_payload($data, $payloadError)) {
+      json_error_and_exit(400, $payloadError ?: "Invalid draft payload");
+    }
+
+    if (!is_dir($DRAFT_STATE_DIR) && !mkdir($DRAFT_STATE_DIR, 0775, true) && !is_dir($DRAFT_STATE_DIR)) {
+      json_error_and_exit(500, "Failed to initialize draft state directory");
+    }
+
+    $overlay = is_array($data["overlay"] ?? null) ? $data["overlay"] : ["version" => 2, "items" => []];
+    $overlay["version"] = (int)($overlay["version"] ?? 2) ?: 2;
+    $overlay["items"] = is_array($overlay["items"] ?? null) ? $overlay["items"] : [];
+
+    $hasBaseDraft = !empty($data["hasBaseDraft"]);
+    $baseDraftFile = basename((string)($data["baseDraftFile"] ?? ""));
+    if ($hasBaseDraft && $baseDraftFile === "") {
+      $baseDraftFile = editor_get_draft_glb_file_name($safe);
+    }
+    if (!$hasBaseDraft) {
+      $baseDraftFile = "";
+    }
+
+    $payload = [
+      "ok" => true,
+      "model" => $safe,
+      "savedAt" => time(),
+      "hasBaseDraft" => $hasBaseDraft,
+      "baseDraftFile" => $baseDraftFile,
+      "overlay" => $overlay,
+      "roads" => is_array($data["roads"] ?? null) ? $data["roads"] : [],
+      "routes" => is_array($data["routes"] ?? null) ? $data["routes"] : [],
+      "guides" => is_array($data["guides"] ?? null) ? $data["guides"] : ["entries" => []]
+    ];
+
+    $path = editor_get_draft_state_path($safe);
+    if ($path === "" || !safe_atomic_write_json($path, $payload)) {
+      json_error_and_exit(500, "Failed to save draft state");
+    }
+
+    app_log("info", "Draft state saved", [
+      "action" => $action,
+      "modelFile" => $safe,
+      "hasBaseDraft" => $hasBaseDraft,
+      "overlayItemCount" => count($overlay["items"]),
+      "roadCount" => count($payload["roads"]),
+      "routeCount" => count($payload["routes"]),
+      "guideCount" => is_array($payload["guides"]["entries"] ?? null) ? count($payload["guides"]["entries"]) : 0,
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "save_draft_state",
+    ]);
+    echo json_encode([
+      "ok" => true,
+      "model" => $safe,
+      "savedAt" => $payload["savedAt"],
+      "hasBaseDraft" => $hasBaseDraft,
+      "baseDraftFile" => $baseDraftFile,
+      "baseDraftUrl" => $hasBaseDraft ? editor_get_draft_glb_url($safe) : ""
+    ], JSON_PRETTY_PRINT);
+    exit;
+  }
+
+  if ($action === "save_draft_glb") {
+    $safe = editor_normalize_model_file_name(isset($_GET["name"]) ? trim((string)$_GET["name"]) : "");
+    if ($safe === "") {
+      json_error_and_exit(400, "Invalid name");
+    }
+
+    $raw = file_get_contents("php://input");
+    $contentType = strtolower((string)($_SERVER["CONTENT_TYPE"] ?? ""));
+    if ($contentType !== "" && strpos($contentType, "model/gltf-binary") === false && strpos($contentType, "application/octet-stream") === false) {
+      json_error_and_exit(415, "Unsupported content type");
+    }
+    if ($raw === false || !is_valid_glb_binary($raw)) {
+      json_error_and_exit(400, "Empty or invalid GLB");
+    }
+
+    if (!is_dir($DRAFT_MODEL_DIR) && !mkdir($DRAFT_MODEL_DIR, 0775, true) && !is_dir($DRAFT_MODEL_DIR)) {
+      json_error_and_exit(500, "Failed to initialize draft model directory");
+    }
+
+    $file = editor_get_draft_glb_file_name($safe);
+    $path = editor_get_draft_glb_path($safe);
+    if ($file === "" || $path === "" || !safe_atomic_write_bytes($path, $raw)) {
+      json_error_and_exit(500, "Failed to save draft GLB");
+    }
+
+    app_log("info", "Draft GLB saved", [
+      "action" => $action,
+      "modelFile" => $safe,
+      "draftFile" => $file,
+      "byteLength" => strlen($raw),
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "save_draft_glb",
+    ]);
+    echo json_encode([
+      "ok" => true,
+      "model" => $safe,
+      "savedAt" => time(),
+      "file" => $file,
+      "url" => editor_get_draft_glb_url($safe)
+    ], JSON_PRETTY_PRINT);
     exit;
   }
 
@@ -924,6 +1211,41 @@ if (isset($_GET["action"])) {
     }
     echo json_encode(["ok" => true, "models" => $items], JSON_PRETTY_PRINT);
     exit;
+  }
+
+  if ($action === "load_model_buildings") {
+    $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
+    $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
+    if ($safe === "" || $safe === "." || $safe === "..") {
+      echo json_encode(["ok" => true, "model" => "", "buildings" => []], JSON_PRETTY_PRINT);
+      exit;
+    }
+    if (!preg_match('/\.glb$/i', $safe)) {
+      $safe .= ".glb";
+    }
+
+    try {
+      editor_ensure_snapshot_schema($conn);
+      $rows = map_identity_fetch_model_buildings($conn, $safe, true);
+      $items = [];
+      foreach ($rows as $row) {
+        $name = trim((string)($row["building_name"] ?? ""));
+        if ($name === "") continue;
+        $items[] = [
+          "id" => isset($row["building_id"]) ? (int)$row["building_id"] : null,
+          "buildingUid" => map_identity_normalize_uid((string)($row["building_uid"] ?? "")),
+          "name" => $name,
+          "objectName" => trim((string)($row["model_object_name"] ?? $name)),
+          "description" => trim((string)($row["description"] ?? "")),
+          "imagePath" => trim((string)($row["image_path"] ?? "")),
+          "modelFile" => trim((string)($row["source_model_file"] ?? $safe))
+        ];
+      }
+      echo json_encode(["ok" => true, "model" => $safe, "buildings" => $items], JSON_PRETTY_PRINT);
+      exit;
+    } catch (Throwable $e) {
+      json_error_and_exit(500, "Failed to load model building catalog: " . $e->getMessage());
+    }
   }
 
   if ($action === "get_default_model") {
@@ -968,6 +1290,13 @@ if (isset($_GET["action"])) {
     if (!safe_atomic_write_json($DEFAULT_MODEL_PATH, $payload)) {
       json_error_and_exit(500, "Failed to update default model");
     }
+    app_log("info", "Default model updated", [
+      "action" => $action,
+      "modelFile" => $file,
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "set_default_model",
+    ]);
     echo json_encode(["ok" => true, "file" => $file], JSON_PRETTY_PRINT);
     exit;
   }
@@ -993,10 +1322,13 @@ if (isset($_GET["action"])) {
     $overlayDir = dirname($LIVE_MAP_PATH);
     if (!is_dir($overlayDir)) mkdir($overlayDir, 0775, true);
 
+    $roadnetFile = "roadnet_" . $file . ".json";
+    $roadnetPath = $overlayDir . "/" . $roadnetFile;
     $routesFile = "routes_" . $file . ".json";
     $routesPath = $overlayDir . "/" . $routesFile;
     $guidesFile = "guides_" . $file . ".json";
     $guidesPath = $overlayDir . "/" . $guidesFile;
+    $roadnetBackup = file_exists($roadnetPath) ? file_get_contents($roadnetPath) : null;
     $liveBackup = file_exists($LIVE_MAP_PATH) ? file_get_contents($LIVE_MAP_PATH) : null;
     $defaultBackup = file_exists($DEFAULT_MODEL_PATH) ? file_get_contents($DEFAULT_MODEL_PATH) : null;
     $releasesBackup = file_exists($RELEASES_PATH) ? file_get_contents($RELEASES_PATH) : null;
@@ -1006,12 +1338,25 @@ if (isset($_GET["action"])) {
     $manifest = [
       "ok" => true,
       "modelFile" => $file,
+      "roadnetFile" => $roadnetFile,
       "routesFile" => $routesFile,
       "guidesFile" => $guidesFile,
       "version" => $version,
       "publishedAt" => $publishedAt
     ];
     try {
+      if (!file_exists($roadnetPath)) {
+        $emptyRoadnet = [
+          "ok" => true,
+          "model" => $file,
+          "updated" => time(),
+          "roads" => []
+        ];
+        if (!safe_atomic_write_json($roadnetPath, $emptyRoadnet)) {
+          throw new RuntimeException("Failed to initialize roadnet file");
+        }
+      }
+
       if (!file_exists($routesPath)) {
         $emptyRoutes = [
           "ok" => true,
@@ -1052,6 +1397,7 @@ if (isset($_GET["action"])) {
       }
       array_unshift($history, [
         "file" => $file,
+        "roadnetFile" => $roadnetFile,
         "routesFile" => $routesFile,
         "guidesFile" => $guidesFile,
         "version" => $version,
@@ -1062,12 +1408,25 @@ if (isset($_GET["action"])) {
         throw new RuntimeException("Failed to update publish history");
       }
     } catch (Throwable $e) {
+      restore_file_from_backup($roadnetPath, $roadnetBackup);
       restore_file_from_backup($LIVE_MAP_PATH, $liveBackup);
       restore_file_from_backup($DEFAULT_MODEL_PATH, $defaultBackup);
       restore_file_from_backup($RELEASES_PATH, $releasesBackup);
       json_error_and_exit(500, "Publish failed: " . $e->getMessage());
     }
 
+    app_log("info", "Map published", [
+      "action" => $action,
+      "modelFile" => $file,
+      "version" => $version,
+      "publishedAt" => $publishedAt,
+      "roadnetFile" => $roadnetFile,
+      "routesFile" => $routesFile,
+      "guidesFile" => $guidesFile,
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "publish_map",
+    ]);
     echo json_encode(["ok" => true, "published" => $manifest], JSON_PRETTY_PRINT);
     exit;
   }
@@ -1105,6 +1464,13 @@ if (isset($_GET["action"])) {
     if (!safe_atomic_write_json($OVERLAY_PATH, $data)) {
       json_error_and_exit(500, "Failed to save overlay file");
     }
+    app_log("info", "Overlay saved", [
+      "action" => $action,
+      "itemCount" => count($data["items"]),
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "save_overlay",
+    ]);
     echo json_encode(["ok" => true]);
     exit;
   }
@@ -1176,6 +1542,16 @@ if (isset($_GET["action"])) {
       $snapshotWarning = $e->getMessage();
     }
 
+    app_log("info", "GLB exported", [
+      "action" => $action,
+      "sourceModel" => $sourceModel,
+      "exportedFile" => $finalName,
+      "snapshotWarning" => $snapshotWarning,
+      "byteLength" => strlen($raw),
+    ], [
+      "subsystem" => "map_editor",
+      "event" => "export_glb",
+    ]);
     echo json_encode([
       "ok" => true,
       "file" => $finalName,
@@ -2200,6 +2576,8 @@ function apiFetch(url, options = {}) {
   const method = String(opts.method || "GET").toUpperCase();
   if (method !== "GET" && method !== "HEAD") {
     opts.headers = withCsrfHeaders(opts.headers);
+  } else if (typeof opts.cache === "undefined") {
+    opts.cache = "no-store";
   }
   return fetch(url, opts);
 }
@@ -2225,6 +2603,19 @@ function apiFetch(url, options = {}) {
 
 function showError(title, err) {
   console.error(err);
+  if (typeof window.tntsReportClientError === "function") {
+    const payload = {
+      error: {
+        message: String(err?.message || err || ""),
+        stack: String(err?.stack || ""),
+      }
+    };
+    if (err && typeof err === "object") {
+      if (err.details && typeof err.details === "object") payload.details = err.details;
+      if (err.context && typeof err.context === "object") payload.context = err.context;
+    }
+    window.tntsReportClientError("map_editor_ui", title, payload);
+  }
   setStatus(title);
   const pre = document.createElement("pre");
   pre.style.whiteSpace = "pre-wrap";
@@ -2350,12 +2741,89 @@ function routeKey(name) {
 }
 
 function setSavedRoutes(routes) {
-  savedRoutes = (routes && typeof routes === "object") ? routes : {};
+  savedRoutes = normalizeSavedRoutesPayload(routes);
 }
 
-function getSavedRouteEntry(name) {
-  const key = routeKey(name);
-  return savedRoutes?.[key] || savedRoutes?.[name] || null;
+function buildBuildingIdentityCandidateKeys({ buildingUid = "", buildingName = "", objectName = "" } = {}) {
+  const resolved = resolveBuildingIdentity({ buildingUid, buildingName, objectName });
+  const keys = new Set([
+    buildBuildingIdentityKey(resolved),
+    normalizeBuildingUid(resolved.buildingUid),
+    normalizeBuildingObjectName(resolved.objectName),
+    routeKey(resolved.buildingName),
+    routeKey(resolved.objectName),
+    routeKey(buildingName),
+    normalizeBuildingObjectName(objectName)
+  ].filter(Boolean));
+  return Array.from(keys);
+}
+
+function buildBuildingIdentityAliasLookup(entries = []) {
+  const lookup = new Map();
+  for (const rawEntry of (Array.isArray(entries) ? entries : [])) {
+    if (!rawEntry || typeof rawEntry !== "object") continue;
+    const resolved = resolveBuildingIdentity({
+      buildingUid: rawEntry?.buildingUid || rawEntry?.uid || "",
+      buildingName: rawEntry?.buildingName || rawEntry?.name || "",
+      objectName: rawEntry?.objectName || rawEntry?.modelObjectName || rawEntry?.name || ""
+    });
+    const entry = {
+      ...rawEntry,
+      buildingUid: resolved.buildingUid,
+      buildingName: String(rawEntry?.buildingName || rawEntry?.name || resolved.buildingName || "").trim(),
+      objectName: String(rawEntry?.objectName || rawEntry?.modelObjectName || resolved.objectName || "").trim()
+    };
+    for (const key of buildBuildingIdentityCandidateKeys(entry)) {
+      if (!lookup.has(key)) lookup.set(key, entry);
+    }
+  }
+  return lookup;
+}
+
+function findBuildingIdentityLookupMatch(lookup, identity = {}) {
+  const candidateKeys = buildBuildingIdentityCandidateKeys(identity);
+  for (const key of candidateKeys) {
+    if (lookup?.has(key)) {
+      return {
+        matched: true,
+        matchedKey: key,
+        candidateKeys,
+        entry: lookup.get(key) || null
+      };
+    }
+  }
+  return {
+    matched: false,
+    matchedKey: "",
+    candidateKeys,
+    entry: null
+  };
+}
+
+function getSavedRouteEntry(name, opts = {}) {
+  const candidateKeys = buildBuildingIdentityCandidateKeys({
+    buildingUid: opts?.buildingUid || "",
+    buildingName: name,
+    objectName: opts?.objectName || name
+  });
+
+  for (const key of candidateKeys) {
+    if (savedRoutes?.[key]) return savedRoutes[key];
+  }
+
+  for (const [rawKey, rawEntry] of Object.entries(savedRoutes || {})) {
+    const entry = normalizeRouteEntry(rawKey, rawEntry);
+    const entryKeys = new Set(buildBuildingIdentityCandidateKeys({
+      buildingUid: entry.buildingUid,
+      buildingName: entry.name,
+      objectName: entry.objectName || rawKey
+    }));
+    for (const key of candidateKeys) {
+      if (entryKeys.has(key)) return entry;
+    }
+  }
+
+  return null;
 }
 
 function hasLiveRoadData() {
@@ -2367,7 +2835,7 @@ function getGuideWorkingEntryForSelection(routes = null) {
   const working = buildGuideWorkingEntries({
     routes: routes && typeof routes === "object"
       ? routes
-      : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes)
+      : buildEditorPreviewRoutes()
   });
   return working[guideSelectionKey] || null;
 }
@@ -2381,6 +2849,8 @@ function ensureGuideRawEntryForSelection(entry = null) {
   }
   rawEntries[workingEntry.key].destinationType = workingEntry.destinationType;
   rawEntries[workingEntry.key].buildingName = workingEntry.buildingName;
+  rawEntries[workingEntry.key].buildingUid = String(workingEntry.buildingUid || "").trim();
+  rawEntries[workingEntry.key].objectName = String(workingEntry.objectName || "").trim();
   rawEntries[workingEntry.key].roomName = workingEntry.roomName;
   return rawEntries[workingEntry.key];
 }
@@ -2504,8 +2974,13 @@ function collectRouteNameMap(routes) {
   if (!routes || typeof routes !== "object") return out;
 
   for (const [fallbackKey, entry] of Object.entries(routes)) {
-    const raw = String(entry?.name || fallbackKey || "").trim();
-    const key = routeKey(raw || fallbackKey);
+    const normalizedEntry = normalizeRouteEntry(fallbackKey, entry);
+    const raw = String(normalizedEntry?.name || fallbackKey || "").trim();
+    const key = buildBuildingIdentityKey({
+      buildingUid: normalizedEntry?.buildingUid,
+      buildingName: raw,
+      objectName: normalizedEntry?.objectName
+    }) || routeKey(raw || fallbackKey);
     if (!key || out.has(key)) continue;
     out.set(key, raw || fallbackKey);
   }
@@ -2529,24 +3004,105 @@ function getBaseObjectBuildingNames(obj) {
   return sortedUniqueStrings(names);
 }
 
+function getSceneBuildingIdentityMap(opts = {}) {
+  const entries = new Map();
+  const excludeObjects = normalizeObjectSet(opts.excludeObjects);
+  if (!campusRoot) return entries;
+
+  campusRoot.traverse((obj) => {
+    if (!obj) return;
+    if (obj.userData?.isPlaced) return;
+    if (isGroundLikeName(obj.name)) return;
+    const root = getTopLevelNamedAncestor(obj);
+    if (!root || !root.name) return;
+    if (excludeObjects.has(obj) || excludeObjects.has(root)) return;
+
+    const resolved = resolveBuildingIdentity({
+      buildingName: root.name,
+      objectName: root.name
+    });
+    const key = buildBuildingIdentityKey({
+      buildingUid: resolved.buildingUid,
+      buildingName: resolved.buildingName,
+      objectName: root.name
+    });
+    if (!key || entries.has(key)) return;
+    entries.set(key, {
+      ...resolved,
+      objectName: root.name
+    });
+  });
+
+  return entries;
+}
+
+function getSceneDuplicateBuildingNames(opts = {}) {
+  const counts = new Map();
+  const labels = new Map();
+  for (const entry of getSceneBuildingIdentityMap(opts).values()) {
+    const displayName = String(entry?.buildingName || "").trim();
+    const key = routeKey(displayName);
+    if (!key) continue;
+    if (!labels.has(key)) labels.set(key, displayName);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const duplicates = [];
+  for (const [key, count] of counts.entries()) {
+    if (count > 1) duplicates.push(labels.get(key) || key);
+  }
+  return duplicates;
+}
+
 function buildRoutingDiagnostics(opts = {}) {
   const routes = (opts.routes && typeof opts.routes === "object") ? opts.routes : computeSavedRoutes(opts);
   const routeMap = collectRouteNameMap(routes);
-  const entranceNames = getEntranceBuildingNames(opts);
+  const entranceEntries = getEntranceBuildingLinks(opts);
   const kioskPoints = findKioskStartPoints(opts);
   const entranceMap = new Map();
-  for (const name of entranceNames) {
-    const key = routeKey(name);
-    if (key && !entranceMap.has(key)) entranceMap.set(key, name);
+  const entranceDetails = [];
+  for (const entry of entranceEntries) {
+    const key = buildBuildingIdentityKey(entry);
+    const name = String(entry?.buildingName || entry?.objectName || "").trim();
+    if (key && name && !entranceMap.has(key)) entranceMap.set(key, name);
+    entranceDetails.push({
+      buildingUid: String(entry?.buildingUid || "").trim(),
+      buildingName: name,
+      objectName: String(entry?.objectName || "").trim(),
+      candidateKeys: buildBuildingIdentityCandidateKeys(entry)
+    });
   }
 
-  const sceneBuildingMap = getSceneBuildingNameMap(opts);
+  const sceneBuildingMap = getSceneBuildingIdentityMap(opts);
+  const sceneBuildingLookup = buildBuildingIdentityAliasLookup(Array.from(sceneBuildingMap.values()));
   const orphanedNames = [];
   const unreachableNames = [];
+  const orphanedDetails = [];
+  const unreachableDetails = [];
+  const duplicateBuildingNames = getSceneDuplicateBuildingNames(opts);
 
-  for (const [key, name] of entranceMap.entries()) {
-    if (!sceneBuildingMap.has(key)) orphanedNames.push(name);
-    if (!routeMap.has(key)) unreachableNames.push(name);
+  for (const entry of entranceEntries) {
+    const name = String(entry?.buildingName || entry?.objectName || "").trim();
+    const sceneMatch = findBuildingIdentityLookupMatch(sceneBuildingLookup, entry);
+    const routeEntry = getGuideRouteEntry(routes, name, entry?.buildingUid || "", entry?.objectName || "");
+
+    if (!sceneMatch.matched) {
+      orphanedNames.push(name);
+      orphanedDetails.push({
+        buildingUid: String(entry?.buildingUid || "").trim(),
+        buildingName: name,
+        objectName: String(entry?.objectName || "").trim(),
+        candidateKeys: sceneMatch.candidateKeys
+      });
+    }
+    if (!routeEntry) {
+      unreachableNames.push(name);
+      unreachableDetails.push({
+        buildingUid: String(entry?.buildingUid || "").trim(),
+        buildingName: name,
+        objectName: String(entry?.objectName || "").trim(),
+        candidateKeys: buildBuildingIdentityCandidateKeys(entry)
+      });
+    }
   }
 
   return {
@@ -2556,9 +3112,13 @@ function buildRoutingDiagnostics(opts = {}) {
     routeCount: routeMap.size,
     entranceNames: Array.from(entranceMap.values()),
     entranceMap,
+    entranceDetails,
     anchorCount: entranceMap.size,
     orphanedNames: sortedUniqueStrings(orphanedNames),
+    orphanedDetails,
     unreachableNames: sortedUniqueStrings(unreachableNames),
+    unreachableDetails,
+    duplicateBuildingNames: sortedUniqueStrings(duplicateBuildingNames),
     hasKiosk: kioskPoints.length > 0,
     kioskCount: kioskPoints.length,
     roadCount: getRoadObjects(opts).length
@@ -2589,6 +3149,11 @@ function buildRoutingPersistReport(actionLabel, opts = {}) {
   if (diagnostics.orphanedNames.length) {
     bumpSeverity("critical");
     lines.push(`Road links point to missing ${pluralize(diagnostics.orphanedNames.length, "building")}: ${formatNameList(diagnostics.orphanedNames)}.`);
+  }
+
+  if (diagnostics.duplicateBuildingNames.length) {
+    bumpSeverity("critical");
+    lines.push(`Duplicate building names exist in the current model: ${formatNameList(diagnostics.duplicateBuildingNames)}.`);
   }
 
   if (unreachableNames.length) {
@@ -2638,6 +3203,35 @@ function reviewRoutingPersist(actionLabel, opts = {}) {
   };
 }
 
+function buildRoutingReviewLogPayload(review = {}) {
+  const report = review?.report && typeof review.report === "object" ? review.report : review;
+  const diagnostics = report?.diagnostics && typeof report.diagnostics === "object" ? report.diagnostics : {};
+  const pickList = (value, limit = 10) => (Array.isArray(value) ? value.slice(0, limit) : []);
+  return {
+    severity: String(report?.severity || "").trim(),
+    lines: pickList(report?.lines, 10),
+    routeCount: Number(diagnostics.routeCount || 0),
+    anchorCount: Number(diagnostics.anchorCount || 0),
+    kioskCount: Number(diagnostics.kioskCount || 0),
+    roadCount: Number(diagnostics.roadCount || 0),
+    orphanedNames: pickList(diagnostics.orphanedNames, 10),
+    orphanedDetails: pickList(diagnostics.orphanedDetails, 10),
+    unreachableNames: pickList(diagnostics.unreachableNames, 10),
+    unreachableDetails: pickList(diagnostics.unreachableDetails, 10),
+    duplicateBuildingNames: pickList(diagnostics.duplicateBuildingNames, 10),
+    lostFromSavedNames: pickList(report?.lostFromSavedNames, 10)
+  };
+}
+
+function createRoutingReviewError(review = {}, actionLabel = "Routing validation") {
+  const err = new Error(String(review?.message || `${actionLabel} failed`).trim() || `${actionLabel} failed`);
+  err.details = {
+    action: actionLabel,
+    routingReview: buildRoutingReviewLogPayload(review)
+  };
+  return err;
+}
+
 function analyzeDeleteImpact(obj) {
   const impact = {
     severity: "normal",
@@ -2674,8 +3268,15 @@ function analyzeDeleteImpact(obj) {
     const deletedBuildingNames = getBaseObjectBuildingNames(obj);
     if (!deletedBuildingNames.length) return impact;
 
-    const deletedKeys = new Set(deletedBuildingNames.map(name => routeKey(name)));
-    const linkedRouteNames = getEntranceBuildingNames().filter(name => deletedKeys.has(routeKey(name)));
+    const deletedKeys = new Set(
+      deletedBuildingNames
+        .map((name) => buildBuildingIdentityKey({ buildingName: name, objectName: name }))
+        .filter(Boolean)
+    );
+    const linkedRouteNames = getEntranceBuildingLinks()
+      .filter((entry) => deletedKeys.has(buildBuildingIdentityKey(entry)))
+      .map((entry) => String(entry?.buildingName || entry?.objectName || "").trim())
+      .filter(Boolean);
 
     if (linkedRouteNames.length) {
       impact.severity = "warning";
@@ -2757,6 +3358,167 @@ deleteConfirmYesBtn?.addEventListener("click", () => {
 
 function normalizeBuildingName(name) {
   return String(name || "").trim().toLowerCase();
+}
+
+function normalizeBuildingUid(uid) {
+  return String(uid || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "");
+}
+
+function normalizeBuildingObjectName(name) {
+  const normalized = normalizeExportBuildingName(name);
+  return normalizeBuildingName(normalized || name);
+}
+
+function resetModelBuildingCatalog() {
+  modelBuildingCatalog = [];
+  modelBuildingsByUid = new Map();
+  modelBuildingsByNameKey = new Map();
+  modelBuildingsByObjectKey = new Map();
+}
+
+function registerModelBuildingCatalogEntry(rawEntry = {}) {
+  const entry = {
+    id: rawEntry?.id ?? null,
+    buildingUid: normalizeBuildingUid(rawEntry?.buildingUid),
+    name: String(rawEntry?.name || "").trim(),
+    objectName: String(rawEntry?.objectName || rawEntry?.name || "").trim(),
+    description: String(rawEntry?.description || "").trim(),
+    imagePath: String(rawEntry?.imagePath || "").trim(),
+    modelFile: String(rawEntry?.modelFile || "").trim()
+  };
+  if (!entry.name && !entry.objectName && !entry.buildingUid) return null;
+
+  modelBuildingCatalog.push(entry);
+  if (entry.buildingUid && !modelBuildingsByUid.has(entry.buildingUid)) {
+    modelBuildingsByUid.set(entry.buildingUid, entry);
+  }
+
+  const nameKey = normalizeBuildingName(entry.name);
+  if (nameKey && !modelBuildingsByNameKey.has(nameKey)) {
+    modelBuildingsByNameKey.set(nameKey, entry);
+  }
+
+  const objectKey = normalizeBuildingObjectName(entry.objectName);
+  if (objectKey && !modelBuildingsByObjectKey.has(objectKey)) {
+    modelBuildingsByObjectKey.set(objectKey, entry);
+  }
+
+  return entry;
+}
+
+function setModelBuildingCatalog(entries = []) {
+  resetModelBuildingCatalog();
+  for (const rawEntry of (Array.isArray(entries) ? entries : [])) {
+    registerModelBuildingCatalogEntry(rawEntry);
+  }
+}
+
+async function loadModelBuildingCatalog(modelName) {
+  if (!modelName) {
+    resetModelBuildingCatalog();
+    return [];
+  }
+
+  try {
+    const res = await apiFetch(`mapEditor.php?action=load_model_buildings&name=${encodeURIComponent(modelName)}&_=${Date.now()}`);
+    const data = await res.json();
+    const buildings = Array.isArray(data?.buildings) ? data.buildings : [];
+    setModelBuildingCatalog(buildings);
+  } catch (_) {
+    resetModelBuildingCatalog();
+  }
+  return modelBuildingCatalog;
+}
+
+function getModelBuildingCatalogEntry({ buildingUid = "", buildingName = "", objectName = "" } = {}) {
+  const safeUid = normalizeBuildingUid(buildingUid);
+  if (safeUid && modelBuildingsByUid.has(safeUid)) {
+    return modelBuildingsByUid.get(safeUid) || null;
+  }
+
+  for (const candidate of [objectName, buildingName]) {
+    const objectKey = normalizeBuildingObjectName(candidate);
+    if (objectKey && modelBuildingsByObjectKey.has(objectKey)) {
+      return modelBuildingsByObjectKey.get(objectKey) || null;
+    }
+  }
+
+  for (const candidate of [buildingName, objectName]) {
+    const nameKey = normalizeBuildingName(candidate);
+    if (nameKey && modelBuildingsByNameKey.has(nameKey)) {
+      return modelBuildingsByNameKey.get(nameKey) || null;
+    }
+  }
+
+  return null;
+}
+
+function resolveBuildingIdentity({ buildingUid = "", buildingName = "", objectName = "" } = {}) {
+  const entry = getModelBuildingCatalogEntry({ buildingUid, buildingName, objectName });
+  return {
+    buildingUid: normalizeBuildingUid(buildingUid || entry?.buildingUid || ""),
+    buildingName: String(buildingName || entry?.name || objectName || entry?.objectName || "").trim(),
+    objectName: String(objectName || entry?.objectName || buildingName || entry?.name || "").trim(),
+    catalogEntry: entry || null
+  };
+}
+
+function buildBuildingIdentityKey({ buildingUid = "", buildingName = "", objectName = "" } = {}) {
+  const resolved = resolveBuildingIdentity({ buildingUid, buildingName, objectName });
+  if (resolved.buildingUid) return resolved.buildingUid;
+  const objectKey = normalizeBuildingObjectName(resolved.objectName);
+  if (objectKey) return objectKey;
+  return routeKey(resolved.buildingName);
+}
+
+function normalizeRouteEntry(rawKey, rawEntry = {}) {
+  const fallbackName = String(rawEntry?.name || rawKey || "").trim();
+  const resolved = resolveBuildingIdentity({
+    buildingUid: rawEntry?.buildingUid || rawEntry?.destinationUid || rawEntry?.uid || "",
+    buildingName: rawEntry?.name || rawEntry?.buildingName || rawEntry?.destinationName || fallbackName,
+    objectName: rawEntry?.objectName || rawEntry?.modelObjectName || ""
+  });
+  return {
+    ...rawEntry,
+    name: resolved.buildingName || fallbackName,
+    buildingUid: resolved.buildingUid,
+    objectName: resolved.objectName,
+    points: Array.isArray(rawEntry?.points) ? rawEntry.points : []
+  };
+}
+
+function normalizeSavedRoutesPayload(routes) {
+  const normalized = {};
+  if (!routes || typeof routes !== "object") return normalized;
+
+  for (const [rawKey, rawValue] of Object.entries(routes)) {
+    if (!rawValue || typeof rawValue !== "object") continue;
+    const entry = normalizeRouteEntry(rawKey, rawValue);
+    const key = buildBuildingIdentityKey({
+      buildingUid: entry.buildingUid,
+      buildingName: entry.name,
+      objectName: entry.objectName
+    }) || routeKey(rawKey);
+    if (!key) continue;
+    normalized[key] = entry;
+  }
+
+  return normalized;
+}
+
+function buildEditorPreviewRoutes(routes = null) {
+  const liveRoutes = (routes && typeof routes === "object")
+    ? normalizeSavedRoutesPayload(routes)
+    : (hasLiveRoadData() ? computeSavedRoutes() : {});
+  const bakedRoutes = normalizeSavedRoutesPayload(savedRoutes);
+  if (!hasLiveRoadData()) return bakedRoutes;
+  return {
+    ...bakedRoutes,
+    ...liveRoutes
+  };
 }
 
 const EXPORT_ENTITY_KIOSK_ROUTE_RE = /^KIOSK_START(?:\.\d+|\d+)?$/i;
@@ -2987,15 +3749,27 @@ function normalizeLoadedGuideEntry(rawKey, rawEntry = {}) {
     ""
   ).trim();
   const roomName = String(rawEntry?.roomName || "").trim();
+  const resolved = resolveBuildingIdentity({
+    buildingUid: rawEntry?.buildingUid || rawEntry?.destinationUid || rawEntry?.uid || "",
+    buildingName,
+    objectName: rawEntry?.objectName || rawEntry?.modelObjectName || ""
+  });
   const guideMode = String(rawEntry?.guideMode || "").trim().toLowerCase();
   let manualText = String(rawEntry?.manualText || "").replace(/\r\n/g, "\n").trim();
   if (!manualText && (guideMode === "manual" || guideMode === "mixed") && Array.isArray(rawEntry?.finalSteps)) {
     manualText = guideStepsToText(rawEntry.finalSteps);
   }
+  const computedKey = buildGuideKey(destinationType, {
+    buildingName: resolved.buildingName || buildingName,
+    buildingUid: resolved.buildingUid,
+    roomName
+  });
   return {
-    key: String(rawEntry?.key || rawKey || buildGuideKey(destinationType, { buildingName, roomName })),
+    key: String(computedKey || rawEntry?.key || rawKey || ""),
     destinationType,
-    buildingName,
+    buildingName: resolved.buildingName || buildingName,
+    buildingUid: resolved.buildingUid,
+    objectName: resolved.objectName,
     roomName,
     manualText,
     sourceRouteSignature: String(rawEntry?.sourceRouteSignature || "").trim()
@@ -3028,6 +3802,8 @@ function buildGuideRawSnapshotValue() {
       key: String(entry?.key || "").trim(),
       destinationType: String(entry?.destinationType || "building").trim() || "building",
       buildingName: String(entry?.buildingName || "").trim(),
+      buildingUid: String(entry?.buildingUid || "").trim(),
+      objectName: String(entry?.objectName || "").trim(),
       roomName: String(entry?.roomName || "").trim(),
       manualText: String(entry?.manualText || "").replace(/\r\n/g, "\n").trim(),
       sourceRouteSignature: String(entry?.sourceRouteSignature || "").trim()
@@ -3070,14 +3846,26 @@ function formatGuideDistance(distance) {
   return `${Math.round(safe)} units`;
 }
 
-function getGuideRouteEntry(routes, buildingName) {
-  const key = routeKey(buildingName);
-  if (routes?.[key]) return routes[key];
-  if (routes?.[buildingName]) return routes[buildingName];
-  for (const [rawKey, rawEntry] of Object.entries(routes || {})) {
-    const name = String(rawEntry?.name || rawKey || "").trim();
-    if (routeKey(name) === key) return rawEntry;
+function getGuideRouteEntry(routes, buildingName, buildingUid = "", objectName = "") {
+  const normalizedRoutes = normalizeSavedRoutesPayload(routes);
+  const candidateKeys = new Set(buildBuildingIdentityCandidateKeys({ buildingUid, buildingName, objectName }));
+
+  for (const key of candidateKeys) {
+    if (normalizedRoutes?.[key]) return normalizedRoutes[key];
   }
+
+  for (const [rawKey, rawEntry] of Object.entries(normalizedRoutes || {})) {
+    const entry = normalizeRouteEntry(rawKey, rawEntry);
+    const entryKeys = new Set(buildBuildingIdentityCandidateKeys({
+      buildingUid: entry.buildingUid,
+      buildingName: entry.name,
+      objectName: entry.objectName || rawKey
+    }));
+    for (const key of candidateKeys) {
+      if (entryKeys.has(key)) return entry;
+    }
+  }
+
   return null;
 }
 
@@ -3085,13 +3873,25 @@ function buildGuideDestinationCatalog(routes = savedRoutes) {
   const byBuilding = new Map();
   const extraction = buildExportEntityExtraction(campusRoot);
   for (const building of (Array.isArray(extraction) ? extraction : [])) {
-    const buildingName = String(building?.name || "").trim();
-    if (!buildingName) continue;
-    const key = routeKey(buildingName);
+    const rawObjectName = String(building?.name || "").trim();
+    if (!rawObjectName) continue;
+    const resolved = resolveBuildingIdentity({
+      buildingName: rawObjectName,
+      objectName: rawObjectName
+    });
+    const buildingName = String(resolved.buildingName || rawObjectName).trim();
+    const objectName = String(resolved.objectName || rawObjectName).trim();
+    const key = buildBuildingIdentityKey({
+      buildingUid: resolved.buildingUid,
+      buildingName,
+      objectName
+    });
     if (!key) continue;
     if (!byBuilding.has(key)) {
       byBuilding.set(key, {
         buildingName,
+        buildingUid: resolved.buildingUid,
+        objectName,
         classification: String(building?.classification || "building").trim() || "building",
         rooms: []
       });
@@ -3103,14 +3903,22 @@ function buildGuideDestinationCatalog(routes = savedRoutes) {
     entry.rooms = sortedUniqueStrings([...entry.rooms, ...roomNames]);
   }
 
-  for (const routeName of Array.from(collectRouteNameMap(routes).values())) {
-    const buildingName = String(routeName || "").trim();
+  for (const [rawKey, rawEntry] of Object.entries(normalizeSavedRoutesPayload(routes))) {
+    const entry = normalizeRouteEntry(rawKey, rawEntry);
+    const buildingName = String(entry?.name || rawKey || "").trim();
     if (!buildingName) continue;
-    const key = routeKey(buildingName);
+    const objectName = String(entry?.objectName || buildingName).trim();
+    const key = buildBuildingIdentityKey({
+      buildingUid: entry?.buildingUid,
+      buildingName,
+      objectName
+    });
     if (!key) continue;
     if (!byBuilding.has(key)) {
       byBuilding.set(key, {
         buildingName,
+        buildingUid: String(entry?.buildingUid || "").trim(),
+        objectName,
         classification: "building",
         rooms: []
       });
@@ -3121,17 +3929,21 @@ function buildGuideDestinationCatalog(routes = savedRoutes) {
   const buildings = Array.from(byBuilding.values()).sort((a, b) => a.buildingName.localeCompare(b.buildingName));
   for (const building of buildings) {
     const destinationType = building.classification === "unclassified" ? "site" : "building";
-    destinations.push({
-      destinationType,
-      buildingName: building.buildingName,
-      roomName: "",
-      destinationName: building.buildingName,
-      usesBuildingRoute: false
+      destinations.push({
+        destinationType,
+        buildingName: building.buildingName,
+        buildingUid: building.buildingUid,
+        objectName: building.objectName,
+        roomName: "",
+        destinationName: building.buildingName,
+        usesBuildingRoute: false
     });
     for (const roomName of sortedUniqueStrings(building.rooms)) {
       destinations.push({
         destinationType: "room",
         buildingName: building.buildingName,
+        buildingUid: building.buildingUid,
+        objectName: building.objectName,
         roomName,
         destinationName: `${building.buildingName} / ${roomName}`,
         usesBuildingRoute: true
@@ -3218,7 +4030,7 @@ function buildGuideRouteSummary(entry) {
 function buildGuideWorkingEntries(opts = {}) {
   const routes = (opts.routes && typeof opts.routes === "object")
     ? opts.routes
-    : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+    : buildEditorPreviewRoutes();
   const rawEntries = getLoadedGuideRawEntries();
   const destinations = buildGuideDestinationCatalog(routes);
   const landmarks = buildGuideLandmarks();
@@ -3228,10 +4040,11 @@ function buildGuideWorkingEntries(opts = {}) {
   for (const destination of destinations) {
     const key = buildGuideKey(destination.destinationType, {
       buildingName: destination.buildingName,
+      buildingUid: destination.buildingUid,
       roomName: destination.roomName
     });
     const raw = normalizeLoadedGuideEntry(key, rawEntries[key] || destination);
-    const routeEntry = getGuideRouteEntry(routes, destination.buildingName);
+    const routeEntry = getGuideRouteEntry(routes, destination.buildingName, destination.buildingUid, destination.objectName);
     const routeSignature = routeEntry ? buildRouteSignature(routeEntry.points, routeEntry.distance) : "";
     const autoSteps = routeEntry
       ? buildGuideStepsFromPoints(routeEntry.points, {
@@ -3254,6 +4067,8 @@ function buildGuideWorkingEntries(opts = {}) {
       key,
       destinationType: destination.destinationType,
       buildingName: destination.buildingName,
+      buildingUid: destination.buildingUid,
+      objectName: destination.objectName,
       roomName: destination.roomName,
       destinationName: destination.destinationName,
       routeName: String(routeEntry?.name || destination.buildingName || "").trim(),
@@ -3280,6 +4095,8 @@ function buildGuideWorkingEntries(opts = {}) {
       key: rawKey,
       destinationType: raw.destinationType,
       buildingName: raw.buildingName,
+      buildingUid: raw.buildingUid,
+      objectName: raw.objectName,
       roomName: raw.roomName,
       destinationName: raw.roomName ? `${raw.buildingName} / ${raw.roomName}` : raw.buildingName,
       routeName: raw.buildingName,
@@ -3351,7 +4168,11 @@ function syncGuideSelection(entries) {
   if (selected && !selected.userData?.isPlaced) {
     const selectedName = normalizeExportBuildingName(getBuildingLabelForObject(selected) || selected.name || "");
     if (selectedName) {
-      preferred = buildGuideKey("building", { buildingName: selectedName });
+      const resolved = resolveBuildingIdentity({ buildingName: selectedName, objectName: selectedName });
+      preferred = buildGuideKey("building", {
+        buildingName: resolved.buildingName || selectedName,
+        buildingUid: resolved.buildingUid
+      });
     }
   }
   if (preferred && entryMap.has(preferred)) {
@@ -3365,7 +4186,7 @@ function syncGuideSelection(entries) {
 function renderGuideEditorPanel(opts = {}) {
   const routes = (opts.routes && typeof opts.routes === "object")
     ? opts.routes
-    : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+    : buildEditorPreviewRoutes();
   const entriesMap = buildGuideWorkingEntries({ routes });
   const entries = sortGuideEntries(Object.values(entriesMap));
   syncGuideSelection(entries);
@@ -3435,16 +4256,20 @@ function buildGuidesPayloadForModel(modelName, opts = {}) {
   const routes = (opts.routes && typeof opts.routes === "object")
     ? opts.routes
     : (hasLiveRoadData() ? computeSavedRoutes() : savedRoutes);
+  const includeOrphaned = opts.includeOrphaned !== false;
   const workingEntries = buildGuideWorkingEntries({ routes });
   const payloadEntries = {};
 
   for (const entry of sortGuideEntries(Object.values(workingEntries))) {
+    if (!includeOrphaned && entry.status === "orphaned") continue;
     const manualText = String(entry.manualText || "").replace(/\r\n/g, "\n").trim();
     const finalSteps = manualText ? parseManualGuideText(manualText) : (Array.isArray(entry.autoSteps) ? entry.autoSteps : []);
     payloadEntries[entry.key] = {
       key: entry.key,
       destinationType: entry.destinationType,
       buildingName: entry.buildingName,
+      buildingUid: entry.buildingUid,
+      objectName: entry.objectName,
       roomName: entry.roomName,
       destinationName: entry.destinationName,
       routeName: entry.routeName,
@@ -3784,9 +4609,43 @@ function findKioskStartPointId() {
   return points[0]?.id || null;
 }
 
-function findBuildingEntrancePoints(buildingName, opts = {}) {
-  const target = normalizeBuildingName(buildingName);
-  if (!target) return [];
+function getRoadMetaBuildingIdentity(meta) {
+  if (!meta || isKioskMeta(meta)) return null;
+  const building = (meta.building && typeof meta.building === "object") ? meta.building : {};
+  const resolved = resolveBuildingIdentity({
+    buildingUid: building.uid || meta.buildingUid || meta.destinationUid || "",
+    buildingName: building.name || meta.buildingName || meta.name || "",
+    objectName: building.objectName || meta.objectName || meta.modelObjectName || ""
+  });
+  const key = buildBuildingIdentityKey(resolved);
+  if (!key) return null;
+  return {
+    ...resolved,
+    side: String(building.side || "").trim(),
+    key
+  };
+}
+
+function getEntranceBuildingLinks(opts = {}) {
+  const entries = new Map();
+  for (const obj of getRoadObjects(opts)) {
+    ensureRoadPointMetaArrays(obj);
+    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
+    for (const meta of metaArr) {
+      const identity = getRoadMetaBuildingIdentity(meta);
+      if (!identity || !identity.key || entries.has(identity.key)) continue;
+      entries.set(identity.key, identity);
+    }
+  }
+  return Array.from(entries.values());
+}
+
+function findBuildingEntrancePoints(targetBuilding, opts = {}) {
+  const resolvedTarget = typeof targetBuilding === "string"
+    ? resolveBuildingIdentity({ buildingName: targetBuilding, objectName: targetBuilding })
+    : resolveBuildingIdentity(targetBuilding || {});
+  const targetKey = buildBuildingIdentityKey(resolvedTarget);
+  if (!targetKey) return [];
   const points = [];
 
   for (const obj of getRoadObjects(opts)) {
@@ -3798,9 +4657,8 @@ function findBuildingEntrancePoints(buildingName, opts = {}) {
     obj.updateMatrixWorld(true);
     for (let i = 0; i < metaArr.length; i++) {
       const meta = metaArr[i];
-      if (!meta || isKioskMeta(meta)) continue;
-      const name = normalizeBuildingName(meta?.building?.name);
-      if (!name || name !== target) continue;
+      const identity = getRoadMetaBuildingIdentity(meta);
+      if (!identity || identity.key !== targetKey) continue;
       const local = ptsLocal[i] || null;
       const world = local ? obj.localToWorld(local.clone()) : null;
       points.push({ id: idArr[i] || meta?.id || null, world });
@@ -3820,19 +4678,9 @@ function findBuildingEntrancePointIds(buildingName) {
 }
 
 function getEntranceBuildingNames(opts = {}) {
-  const names = new Map(); // normalized -> original
-  for (const obj of getRoadObjects(opts)) {
-    ensureRoadPointMetaArrays(obj);
-    const metaArr = Array.isArray(obj.userData?.road?.pointMeta) ? obj.userData.road.pointMeta : [];
-    for (const meta of metaArr) {
-      if (!meta || isKioskMeta(meta)) continue;
-      const raw = String(meta?.building?.name || "").trim();
-      if (!raw) continue;
-      const key = routeKey(raw);
-      if (!names.has(key)) names.set(key, raw);
-    }
-  }
-  return Array.from(names.values());
+  return getEntranceBuildingLinks(opts)
+    .map((entry) => String(entry?.buildingName || entry?.objectName || "").trim())
+    .filter(Boolean);
 }
 
 function computeSavedRoutes(opts = {}) {
@@ -3848,11 +4696,11 @@ function computeSavedRoutes(opts = {}) {
   });
 
   const routes = {};
-  const buildingNames = getEntranceBuildingNames(opts);
+  const buildingLinks = getEntranceBuildingLinks(opts);
 
-  for (const name of buildingNames) {
-    const key = routeKey(name);
-    const targetPoints = findBuildingEntrancePoints(name, opts);
+  for (const buildingLink of buildingLinks) {
+    const key = buildBuildingIdentityKey(buildingLink);
+    const targetPoints = findBuildingEntrancePoints(buildingLink, opts);
     const targetNodeIds = resolveCandidateNodeIds(graph, targetPoints);
     if (!targetNodeIds.length) continue;
 
@@ -3880,7 +4728,9 @@ function computeSavedRoutes(opts = {}) {
     if (points.length < 2) continue;
 
     routes[key] = {
-      name,
+      name: String(buildingLink?.buildingName || buildingLink?.objectName || "").trim(),
+      buildingUid: String(buildingLink?.buildingUid || "").trim(),
+      objectName: String(buildingLink?.objectName || "").trim(),
       distance: best.dist,
       points,
       updated: Date.now()
@@ -3893,7 +4743,7 @@ function computeSavedRoutes(opts = {}) {
 async function loadRoutesForModel(modelName) {
   if (!modelName) return;
   try {
-    const res = await apiFetch(`mapEditor.php?action=load_routes&name=${encodeURIComponent(modelName)}`);
+    const res = await apiFetch(`mapEditor.php?action=load_routes&name=${encodeURIComponent(modelName)}&_=${Date.now()}`);
     const data = await res.json();
     if (data && data.routes && typeof data.routes === "object") {
       setSavedRoutes(data.routes);
@@ -3933,7 +4783,7 @@ async function loadRoadnetForModel(modelName, opts = {}) {
   let exists = false;
   let roads = [];
   try {
-    const res = await apiFetch(`mapEditor.php?action=load_roadnet&name=${encodeURIComponent(modelName)}`);
+    const res = await apiFetch(`mapEditor.php?action=load_roadnet&name=${encodeURIComponent(modelName)}&_=${Date.now()}`);
     const data = await res.json();
     exists = !!data?.exists;
     roads = Array.isArray(data?.roads) ? data.roads : [];
@@ -3978,7 +4828,7 @@ async function loadGuidesForModel(modelName) {
     return;
   }
   try {
-    const res = await apiFetch(`mapEditor.php?action=load_guides&name=${encodeURIComponent(modelName)}`);
+    const res = await apiFetch(`mapEditor.php?action=load_guides&name=${encodeURIComponent(modelName)}&_=${Date.now()}`);
     const data = await res.json();
     setLoadedGuidesPayload({
       model: modelName,
@@ -4010,7 +4860,12 @@ async function saveRoadDataForModel(modelName, opts = {}) {
 
   const roads = Array.isArray(opts.roads) ? opts.roads : serializeRoadnet();
   const routes = (opts.routes && typeof opts.routes === "object") ? opts.routes : computeSavedRoutes();
-  const guides = (opts.guides && typeof opts.guides === "object") ? opts.guides : buildGuidesPayloadForModel(modelName, { routes });
+  const guides = (opts.guides && typeof opts.guides === "object")
+    ? opts.guides
+    : buildGuidesPayloadForModel(modelName, {
+        routes,
+        includeOrphaned: opts.includeOrphaned !== false
+      });
   const shouldUpdateLocalState = opts.updateLocalState !== false && modelName === currentModelName;
   const bundleOk = await saveNavigationBundleForModel(modelName, {
     roads,
@@ -4090,27 +4945,31 @@ function routeToBuilding(buildingName) {
   const key = routeKey(name);
   setGuideSelectionForBuilding(name);
 
-  if (!hasLiveRoadData()) {
+  const drawSavedRouteFallback = (reason = "") => {
     const saved = getSavedRouteEntry(name);
     const savedPointsArr = Array.isArray(saved?.points) ? saved.points : [];
-    if (savedPointsArr.length >= 2) {
-      const pts = savedPointsArr.map(p => Array.isArray(p) ? vec3FromArray(p) : p).filter(Boolean);
-      const ok = drawRouteFromWorldPoints(pts);
-      if (ok) {
-        let dist = Number(saved?.distance);
-        if (!Number.isFinite(dist)) {
-          dist = 0;
-          for (let i = 1; i < pts.length; i++) {
-            const a = pts[i - 1], b = pts[i];
-            dist += Math.hypot((b.x - a.x), (b.z - a.z));
-          }
-        }
-        setRouteBanner(`Route to ${name} \u2022 ${dist.toFixed(0)} units`);
-      } else {
-        setRouteBanner(`No route found to ${name}`);
+    if (savedPointsArr.length < 2) return false;
+
+    const pts = savedPointsArr.map((p) => Array.isArray(p) ? vec3FromArray(p) : p).filter(Boolean);
+    const ok = drawRouteFromWorldPoints(pts);
+    if (!ok) return false;
+
+    let dist = Number(saved?.distance);
+    if (!Number.isFinite(dist)) {
+      dist = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        dist += Math.hypot((b.x - a.x), (b.z - a.z));
       }
-      return;
     }
+
+    const suffix = reason ? ` (${reason})` : "";
+    setRouteBanner(`Route to ${name} \u2022 ${dist.toFixed(0)} units${suffix}`);
+    return true;
+  };
+
+  if (!hasLiveRoadData()) {
+    if (drawSavedRouteFallback()) return;
     clearRouteLine();
     setRouteBanner(`No pathway for ${name} (no saved route)`);
     return;
@@ -4134,12 +4993,14 @@ function routeToBuilding(buildingName) {
 
   const targetPoints = findBuildingEntrancePoints(name);
   if (!targetPoints.length) {
+    if (drawSavedRouteFallback("saved route fallback")) return;
     clearRouteLine();
     setRouteBanner(`No pathway for ${name} (no entrance point)`);
     return;
   }
   const validTargets = resolveCandidateNodeIds(graph, targetPoints);
   if (!validTargets.length) {
+    if (drawSavedRouteFallback("saved route fallback")) return;
     clearRouteLine();
     setRouteBanner(`No pathway for ${name} (entrance not connected)`);
     return;
@@ -4158,6 +5019,7 @@ function routeToBuilding(buildingName) {
   }
 
   if (!best || !Number.isFinite(best.dist)) {
+    if (drawSavedRouteFallback("saved route fallback")) return;
     clearRouteLine();
     setRouteBanner(`No route found to ${name}`);
     return;
@@ -4170,6 +5032,7 @@ function routeToBuilding(buildingName) {
       setRouteBanner(`Kiosk is at ${name}`);
       return;
     }
+    if (drawSavedRouteFallback("saved route fallback")) return;
     clearRouteLine();
     setRouteBanner(`No route found to ${name}`);
     return;
@@ -4177,6 +5040,7 @@ function routeToBuilding(buildingName) {
 
   const ok = drawRouteLine(path, nodes);
   if (!ok) {
+    if (drawSavedRouteFallback("saved route fallback")) return;
     setRouteBanner(`No route found to ${name}`);
     return;
   }
@@ -4313,6 +5177,10 @@ const ORIGINAL_MODEL_NAME = "tnts_navigation.glb";
 let currentModelName = ORIGINAL_MODEL_NAME;
 let assetsLoaded = false;
 let isModelSwitching = false;
+let modelBuildingCatalog = [];
+let modelBuildingsByUid = new Map();
+let modelBuildingsByNameKey = new Map();
+let modelBuildingsByObjectKey = new Map();
 
 const loader = new GLTFLoader();
 
@@ -4331,11 +5199,42 @@ let baseBaselineSnapshot = null;
 let dirtyRefreshTimer = null;
 let loadedGuidePayload = { model: "", entries: {} };
 let guideSelectionKey = "";
+let currentDraftSession = {
+  model: ORIGINAL_MODEL_NAME,
+  exists: false,
+  active: false,
+  savedAt: 0,
+  hasBaseDraft: false,
+  baseDraftFile: "",
+  baseDraftUrl: ""
+};
 
 function roundSnapshotNumber(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   return Number(v.toFixed(6));
+}
+function normalizeDraftSavedAt(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n < 1000000000000 ? n * 1000 : n;
+}
+function setCurrentDraftSession(meta = {}) {
+  currentDraftSession = {
+    model: String(meta?.model || currentModelName || "").trim(),
+    exists: !!meta?.exists,
+    active: !!meta?.active,
+    savedAt: normalizeDraftSavedAt(meta?.savedAt),
+    hasBaseDraft: !!meta?.hasBaseDraft,
+    baseDraftFile: String(meta?.baseDraftFile || "").trim(),
+    baseDraftUrl: String(meta?.baseDraftUrl || "").trim()
+  };
+}
+function isDraftSessionActive() {
+  return !!(currentDraftSession?.active && currentDraftSession?.model === currentModelName);
+}
+function hasSavedDraftForCurrentModel() {
+  return !!(currentDraftSession?.exists && currentDraftSession?.model === currentModelName);
 }
 function isOverlaySaveAllowed() {
   return currentModelName === ORIGINAL_MODEL_NAME;
@@ -4348,9 +5247,9 @@ function updateOverlaySaveAvailability() {
   const canSave = isRoadnetSaveAllowed();
   toolSave.disabled = !canSave;
   toolSave.style.opacity = canSave ? "1" : "0.6";
-  toolSave.title = isOverlaySaveAllowed()
-    ? "Save Overlay + Roads"
-    : "Save Roads for this model (overlay assets save stays original-model only).";
+  toolSave.textContent = "Save Draft";
+  toolSave.dataset.short = "Dr";
+  toolSave.title = "Save the current draft without overwriting the loaded committed model.";
 }
 function buildOverlaySnapshot() {
   const out = [];
@@ -4418,20 +5317,24 @@ function updateDirtyIndicator() {
   const state = getUnsavedChangeState();
   if (dirtyIndicatorEl) {
     if (!state.any) {
-      dirtyIndicatorEl.textContent = "Saved";
-      dirtyIndicatorEl.style.color = "#6b7280";
+      if (isDraftSessionActive()) {
+        dirtyIndicatorEl.textContent = "Draft saved";
+        dirtyIndicatorEl.style.color = "#2563eb";
+      } else if (hasSavedDraftForCurrentModel()) {
+        dirtyIndicatorEl.textContent = "Committed version loaded (draft available)";
+        dirtyIndicatorEl.style.color = "#6b7280";
+      } else {
+        dirtyIndicatorEl.textContent = "Committed version loaded";
+        dirtyIndicatorEl.style.color = "#6b7280";
+      }
     } else if (state.overlay && state.base) {
-      dirtyIndicatorEl.textContent = isOverlaySaveAllowed()
-        ? "Unsaved changes: overlay + base model"
-        : "Unsaved changes: roads + base model";
+      dirtyIndicatorEl.textContent = "Unsaved draft changes: navigation + base model";
       dirtyIndicatorEl.style.color = "#b45309";
     } else if (state.overlay) {
-      dirtyIndicatorEl.textContent = isOverlaySaveAllowed()
-        ? "Unsaved overlay changes"
-        : "Unsaved road changes";
+      dirtyIndicatorEl.textContent = "Unsaved draft changes: navigation";
       dirtyIndicatorEl.style.color = "#b45309";
     } else {
-      dirtyIndicatorEl.textContent = "Unsaved base-model changes";
+      dirtyIndicatorEl.textContent = "Unsaved draft changes: base model";
       dirtyIndicatorEl.style.color = "#b45309";
     }
   }
@@ -4454,18 +5357,12 @@ function getUnsavedSwitchWarning() {
   const state = getUnsavedChangeState();
   if (!state.any) return "";
   if (state.overlay && state.base) {
-    if (!isOverlaySaveAllowed()) {
-      return "You have unsaved road edits and unsaved base-model edits.\n\nUse Save to persist road edits and Export GLB for base-model edits.\n\nContinue switching models?";
-    }
-    return "You have unsaved overlay edits and unsaved base-model edits.\n\nUse Save Overlay for overlay edits and Export GLB for base-model edits.\n\nContinue switching models?";
+    return "You have unsaved draft navigation edits and unsaved base-model edits.\n\nUse Save Draft to keep this workspace, or Export GLB to turn it into a committed child version.\n\nContinue switching models?";
   }
   if (state.overlay) {
-    if (!isOverlaySaveAllowed()) {
-      return "You have unsaved road edits.\n\nUse Save to persist road edits for this model.\n\nContinue switching models?";
-    }
-    return "You have unsaved overlay edits.\n\nUse Save Overlay to persist them before switching models.\n\nContinue switching models?";
+    return "You have unsaved draft navigation edits.\n\nUse Save Draft to keep them before switching models.\n\nContinue switching models?";
   }
-  return "You have unsaved base-model edits.\n\nUse Export GLB to persist them before switching models.\n\nContinue switching models?";
+  return "You have unsaved draft base-model edits.\n\nUse Save Draft to keep them, then Export GLB when you want a committed child version.\n\nContinue switching models?";
 }
 function withBaseEditExportHint(msg, obj) {
   if (!obj) return msg;
@@ -4768,6 +5665,31 @@ function cloneRoadPointMeta(metaArr) {
     const b = (m.building && typeof m.building === "object") ? { ...m.building } : null;
     return { ...m, building: b };
   });
+}
+
+function normalizeRoadPointMeta(meta, pointId = null) {
+  if (!meta || typeof meta !== "object") return null;
+  if (isKioskMeta(meta)) return normalizeKioskMeta(meta, pointId);
+
+  const building = (meta.building && typeof meta.building === "object") ? meta.building : {};
+  const resolved = resolveBuildingIdentity({
+    buildingUid: building.uid || meta.buildingUid || meta.destinationUid || "",
+    buildingName: building.name || meta.buildingName || meta.name || "",
+    objectName: building.objectName || meta.objectName || meta.modelObjectName || ""
+  });
+  const normalizedBuilding = {};
+  if (resolved.buildingName) normalizedBuilding.name = resolved.buildingName;
+  if (resolved.objectName) normalizedBuilding.objectName = resolved.objectName;
+  if (resolved.buildingUid) normalizedBuilding.uid = resolved.buildingUid;
+  if (String(building.side || "").trim()) normalizedBuilding.side = String(building.side || "").trim();
+
+  return {
+    ...meta,
+    id: meta.id || pointId || null,
+    label: String(meta.label || "").trim() || (resolved.buildingName && normalizedBuilding.side ? `${resolved.buildingName}_${normalizedBuilding.side}` : (resolved.buildingName || null)),
+    building: Object.keys(normalizedBuilding).length ? normalizedBuilding : null,
+    linkedAt: meta.linkedAt || Date.now()
+  };
 }
 
 function ensureRoadPointMetaArrays(roadObj) {
@@ -5238,12 +6160,22 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
 }
 
 function makeBuildingLinkMeta(buildingName, side, pointId) {
-  const name = String(buildingName || "").trim();
+  const resolved = resolveBuildingIdentity({
+    buildingName,
+    objectName: buildingName
+  });
+  const name = String(resolved.buildingName || buildingName || "").trim();
+  const objectName = String(resolved.objectName || buildingName || "").trim();
   const s = String(side || "").trim();
+  const building = {};
+  if (name) building.name = name;
+  if (objectName) building.objectName = objectName;
+  if (resolved.buildingUid) building.uid = resolved.buildingUid;
+  if (s) building.side = s;
   return {
     id: pointId || null,
     label: (name && s) ? `${name}_${s}` : (name || null),
-    building: (name && s) ? { name, side: s } : (name ? { name } : null),
+    building: Object.keys(building).length ? building : null,
     linkedAt: Date.now(),
   };
 }
@@ -7909,15 +8841,26 @@ function isEmptyGroup(obj) {
 
 function updateBuildingSelected(obj) {
   if (!buildingSelectedEl) return;
-  if (obj && obj.name) buildingSelectedEl.textContent = `Selected: ${obj.name}`;
+  if (obj && obj.name) {
+    const resolved = resolveBuildingIdentity({ buildingName: obj.name, objectName: obj.name });
+    buildingSelectedEl.textContent = `Selected: ${resolved.buildingName || obj.name}`;
+  }
   else buildingSelectedEl.textContent = "Selected: None";
 }
 
 function setGuideSelectionForBuilding(buildingName, roomName = "") {
-  const cleanBuilding = String(buildingName || "").trim();
-  if (!cleanBuilding) return;
+  const resolved = resolveBuildingIdentity({
+    buildingName,
+    objectName: buildingName
+  });
+  const cleanBuilding = String(resolved.buildingName || buildingName || "").trim();
+  if (!cleanBuilding && !resolved.buildingUid) return;
   const type = roomName ? "room" : "building";
-  guideSelectionKey = buildGuideKey(type, { buildingName: cleanBuilding, roomName });
+  guideSelectionKey = buildGuideKey(type, {
+    buildingName: cleanBuilding,
+    buildingUid: resolved.buildingUid,
+    roomName
+  });
   renderGuideEditorPanel();
 }
 
@@ -7943,18 +8886,34 @@ function refreshBuildingList() {
 
   const filter = (buildingFilterEl?.value || "").trim().toLowerCase();
   const items = Array.from(byName.entries())
-    .filter(([name]) => !filter || name.toLowerCase().includes(filter))
-    .sort((a, b) => a[0].localeCompare(b[0]));
+    .map(([name, obj]) => {
+      const resolved = resolveBuildingIdentity({ buildingName: name, objectName: name });
+      return {
+        objectName: name,
+        displayName: String(resolved.buildingName || name).trim(),
+        obj
+      };
+    })
+    .filter(({ objectName, displayName }) => {
+      const haystack = `${displayName} ${objectName}`.toLowerCase();
+      return !filter || haystack.includes(filter);
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName) || a.objectName.localeCompare(b.objectName));
 
   if (!items.length) {
     buildingListEl.innerHTML = "<div style=\"color:#6b7280;font-weight:700;\">No matches</div>";
     return;
   }
 
-  for (const [name, obj] of items) {
+  for (const item of items) {
+    const name = item.objectName;
+    const obj = item.obj;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.textContent = name;
+    btn.textContent = item.displayName || name;
+    btn.title = item.displayName && item.displayName !== name
+      ? `${item.displayName} (${name})`
+      : (item.displayName || name);
     btn.style.padding = "8px 10px";
     btn.style.borderRadius = "10px";
     btn.style.border = "1px solid #e5e7eb";
@@ -8248,10 +9207,7 @@ function commitSelected() {
 
 function persistLockStateChangeFor(obj) {
   if (!obj?.userData?.isPlaced) return;
-  if (currentModelName !== ORIGINAL_MODEL_NAME) return;
-  saveOverlay({ silent: true, skipRoutingReview: true }).catch((err) => {
-    console.warn("LOCK SAVE ERROR", err);
-  });
+  scheduleDirtyRefresh();
 }
 
  function uncommitSelected() {
@@ -9026,7 +9982,9 @@ function serializeOverlay() {
         width: Number(road.width || ROAD_DEFAULT_WIDTH),
         points: Array.isArray(road.points) ? road.points : [],
         pointIds: Array.isArray(road.pointIds) ? road.pointIds : [],
-        pointMeta: Array.isArray(road.pointMeta) ? road.pointMeta : []
+        pointMeta: Array.isArray(road.pointMeta)
+          ? road.pointMeta.map((meta, index) => normalizeRoadPointMeta(meta, Array.isArray(road.pointIds) ? road.pointIds[index] : null))
+          : []
       });
       return;
     }
@@ -9063,10 +10021,185 @@ function serializeRoadnet() {
       width: Number(road.width || ROAD_DEFAULT_WIDTH),
       points: Array.isArray(road.points) ? clonePointsArray(road.points) : [],
       pointIds: Array.isArray(road.pointIds) ? road.pointIds.slice() : [],
-      pointMeta: Array.isArray(road.pointMeta) ? cloneRoadPointMeta(road.pointMeta) : []
+      pointMeta: Array.isArray(road.pointMeta)
+        ? cloneRoadPointMeta(road.pointMeta).map((meta, index) => normalizeRoadPointMeta(meta, Array.isArray(road.pointIds) ? road.pointIds[index] : null))
+        : []
     });
   }
   return roads;
+}
+
+function buildDraftOverlayPayload() {
+  const serialized = serializeOverlay();
+  return {
+    version: 2,
+    items: (Array.isArray(serialized?.items) ? serialized.items : []).filter((item) => item && item.type !== "road")
+  };
+}
+
+function buildWorkingRoutesSnapshot() {
+  return hasLiveRoadData() ? computeSavedRoutes() : savedRoutes;
+}
+
+function exportNodesToGlbBinary(nodes) {
+  const exporter = new GLTFExporter();
+  return new Promise((resolve, reject) => {
+    exporter.parse(
+      Array.isArray(nodes) ? nodes : [],
+      (glb) => resolve(glb),
+      (err) => reject(err),
+      { binary: true }
+    );
+  });
+}
+
+async function loadDraftStateForModel(modelName) {
+  if (!modelName) {
+    return {
+      exists: false,
+      model: "",
+      savedAt: 0,
+      hasBaseDraft: false,
+      baseDraftFile: "",
+      baseDraftUrl: "",
+      overlay: { version: 2, items: [] },
+      roads: [],
+      routes: {},
+      guides: { entries: {} }
+    };
+  }
+
+  try {
+    const res = await apiFetch(`mapEditor.php?action=load_draft_state&name=${encodeURIComponent(modelName)}`);
+    const data = await res.json();
+    if (!data?.ok || !data?.exists) {
+      return {
+        exists: false,
+        model: modelName,
+        savedAt: 0,
+        hasBaseDraft: false,
+        baseDraftFile: "",
+        baseDraftUrl: "",
+        overlay: { version: 2, items: [] },
+        roads: [],
+        routes: {},
+        guides: { entries: {} }
+      };
+    }
+
+    return {
+      exists: true,
+      model: String(data?.model || modelName || "").trim(),
+      savedAt: normalizeDraftSavedAt(data?.savedAt),
+      hasBaseDraft: !!data?.hasBaseDraft,
+      baseDraftFile: String(data?.baseDraftFile || "").trim(),
+      baseDraftUrl: String(data?.baseDraftUrl || "").trim(),
+      overlay: (data?.overlay && typeof data.overlay === "object") ? data.overlay : { version: 2, items: [] },
+      roads: Array.isArray(data?.roads) ? data.roads : [],
+      routes: (data?.routes && typeof data.routes === "object") ? data.routes : {},
+      guides: (data?.guides && typeof data.guides === "object") ? data.guides : { entries: {} }
+    };
+  } catch (_) {
+    return {
+      exists: false,
+      model: modelName,
+      savedAt: 0,
+      hasBaseDraft: false,
+      baseDraftFile: "",
+      baseDraftUrl: "",
+      overlay: { version: 2, items: [] },
+      roads: [],
+      routes: {},
+      guides: { entries: {} }
+    };
+  }
+}
+
+async function saveDraftBaseModelForCurrentModel() {
+  if (!campusRoot || !currentModelName) throw new Error("No base model loaded");
+  campusRoot.updateMatrixWorld(true);
+  const glb = await exportNodesToGlbBinary([...campusRoot.children]);
+  const res = await apiFetch(`mapEditor.php?action=save_draft_glb&name=${encodeURIComponent(currentModelName)}`, {
+    method: "POST",
+    headers: { "Content-Type": "model/gltf-binary" },
+    body: glb
+  });
+  const data = await res.json();
+  if (!data?.ok) throw new Error(data?.error || "Failed to save draft base model");
+  return {
+    savedAt: normalizeDraftSavedAt(data?.savedAt),
+    hasBaseDraft: true,
+    baseDraftFile: String(data?.file || "").trim(),
+    baseDraftUrl: String(data?.url || "").trim()
+  };
+}
+
+async function saveCurrentDraftState() {
+  if (!currentModelName) throw new Error("No current model selected");
+  if (!campusRoot) throw new Error("Base model not loaded yet");
+
+  const state = getUnsavedChangeState();
+  if (!state.any) {
+    if (isDraftSessionActive()) {
+      setStatus("Draft already saved");
+      return true;
+    }
+    setStatus("No draft changes to save");
+    return false;
+  }
+
+  const routes = buildWorkingRoutesSnapshot();
+  const roads = serializeRoadnet();
+  const guides = buildGuidesPayloadForModel(currentModelName, {
+    routes,
+    includeOrphaned: true
+  });
+  let draftMeta = {
+    savedAt: currentDraftSession?.savedAt || 0,
+    hasBaseDraft: !!currentDraftSession?.hasBaseDraft,
+    baseDraftFile: String(currentDraftSession?.baseDraftFile || "").trim(),
+    baseDraftUrl: String(currentDraftSession?.baseDraftUrl || "").trim()
+  };
+
+  if (state.base) {
+    setStatus("Saving draft base model...");
+    draftMeta = {
+      ...draftMeta,
+      ...(await saveDraftBaseModelForCurrentModel())
+    };
+  }
+
+  setStatus("Saving draft workspace...");
+  const res = await apiFetch(`mapEditor.php?action=save_draft_state&name=${encodeURIComponent(currentModelName)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      overlay: buildDraftOverlayPayload(),
+      roads,
+      routes,
+      guides,
+      hasBaseDraft: !!draftMeta.hasBaseDraft,
+      baseDraftFile: draftMeta.baseDraftFile || ""
+    })
+  });
+  const data = await res.json();
+  if (!data?.ok) throw new Error(data?.error || "Draft save failed");
+
+  setSavedRoutes(routes);
+  setLoadedGuidesPayload({ model: currentModelName, entries: guides.entries || {} });
+  renderGuideEditorPanel({ routes });
+  setCurrentDraftSession({
+    model: currentModelName,
+    exists: true,
+    active: true,
+    savedAt: normalizeDraftSavedAt(data?.savedAt || draftMeta.savedAt),
+    hasBaseDraft: !!data?.hasBaseDraft,
+    baseDraftFile: String(data?.baseDraftFile || draftMeta.baseDraftFile || "").trim(),
+    baseDraftUrl: String(data?.baseDraftUrl || draftMeta.baseDraftUrl || "").trim()
+  });
+  captureDirtyBaselines({ overlay: true, base: true });
+  setStatus(`Draft saved (${currentModelName})`);
+  return true;
 }
 
 async function saveOverlay(opts = {}) {
@@ -9084,7 +10217,7 @@ async function saveOverlay(opts = {}) {
   if (!skipRoutingReview) {
     const review = reviewRoutingPersist("Save", { routes, mode: "warn" });
     if (!review.proceed) {
-      if (review.blocked) throw new Error(review.message);
+      if (review.blocked) throw createRoutingReviewError(review, "Save");
       setStatus("Save canceled");
       return false;
     }
@@ -9106,22 +10239,7 @@ async function saveOverlay(opts = {}) {
 
 toolSave?.addEventListener("click", async () => {
   try {
-    if (isOverlaySaveAllowed()) {
-      await saveOverlay();
-      return;
-    }
-
-    const routes = computeSavedRoutes();
-    const review = reviewRoutingPersist("Save", { routes, mode: "warn" });
-    if (!review.proceed) {
-      if (review.blocked) throw new Error(review.message);
-      setStatus("Save canceled");
-      return;
-    }
-
-    await saveRoadDataForModel(currentModelName, { routes });
-    captureDirtyBaselines({ overlay: true, base: false });
-    setStatus(`Saved roads (${currentModelName})`);
+    await saveCurrentDraftState();
   } catch (err) {
     showError("SAVE ERROR", err);
   }
@@ -9143,54 +10261,50 @@ function exportSceneAsGlb() {
   const fileName = nameInput.trim();
   if (!fileName) return Promise.resolve(false);
 
-  const routes = computeSavedRoutes();
+  const routes = buildWorkingRoutesSnapshot();
   const review = reviewRoutingPersist("Export", { routes, mode: "warn" });
   if (!review.proceed) {
-    if (review.blocked) return Promise.reject(new Error(review.message));
+    if (review.blocked) return Promise.reject(createRoutingReviewError(review, "Export"));
     setStatus("Export canceled");
     return Promise.resolve(false);
   }
 
-  const exporter = new GLTFExporter();
-
   campusRoot.updateMatrixWorld(true);
   overlayRoot.updateMatrixWorld(true);
 
-  setStatus("Exporting GLBÃ¢â‚¬Â¦");
+  setStatus("Exporting GLB...");
 
   return new Promise((resolve, reject) => {
-    const exportNodes = [
+    exportNodesToGlbBinary([
       ...campusRoot.children,
       ...overlayRoot.children
-    ];
-    exporter.parse(
-      exportNodes,
-      async (glb) => {
-        try {
-          const res = await apiFetch(`mapEditor.php?action=export_glb&name=${encodeURIComponent(fileName)}&sourceModel=${encodeURIComponent(currentModelName || "")}`, {
-            method: "POST",
-            headers: { "Content-Type": "model/gltf-binary" },
-            body: glb
-          });
-          const data = await res.json();
-          if (!data.ok) throw new Error(data.error || "Export failed");
-          await syncModelEntitiesToDatabase(data.file, campusRoot);
-          const roads = serializeRoadnet();
-          await saveRoadDataForModel(data.file, { roads, routes });
-          captureDirtyBaselines({ overlay: false, base: true });
-          setStatus(`Exported: ${data.file}`);
-          if (baseModelSelect) {
-            await loadModelList();
-            baseModelSelect.value = currentModelName;
-          }
-          resolve(true);
-        } catch (err) {
-          reject(err);
+    ]).then(async (glb) => {
+      try {
+        const res = await apiFetch(`mapEditor.php?action=export_glb&name=${encodeURIComponent(fileName)}&sourceModel=${encodeURIComponent(currentModelName || "")}`, {
+          method: "POST",
+          headers: { "Content-Type": "model/gltf-binary" },
+          body: glb
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "Export failed");
+        await syncModelEntitiesToDatabase(data.file, campusRoot);
+        const roads = serializeRoadnet();
+        await saveRoadDataForModel(data.file, {
+          roads,
+          routes,
+          includeOrphaned: false,
+          updateLocalState: false
+        });
+        setStatus(`Exported child version: ${data.file}`);
+        if (baseModelSelect) {
+          await loadModelList();
+          baseModelSelect.value = currentModelName;
         }
-      },
-      (err) => reject(err),
-      { binary: true }
-    );
+        resolve(true);
+      } catch (err) {
+        reject(err);
+      }
+    }).catch((err) => reject(err));
   });
 }
 
@@ -9202,69 +10316,40 @@ async function publishCurrentMap() {
   if (!currentModelName) throw new Error("No current model selected");
 
   const state = getUnsavedChangeState();
-  const hasRoadData = hasLiveRoadData();
-  const publishRoads = hasRoadData ? serializeRoadnet() : [];
-  const publishRoutes = hasRoadData ? computeSavedRoutes() : {};
-  let shouldPersistRoadDataForPublish = hasRoadData;
-  let shouldSaveOverlayBeforePublish = false;
-  let shouldSaveRoadsBeforePublish = false;
-  let roadDataAlreadySaved = false;
-
-  if (state.base) {
-    const ok = confirm("You have unsaved base-model edits. Publish uses saved model files only.\n\nUse Export GLB first to include base edits.\n\nContinue publishing anyway?");
-    if (!ok) return false;
-  }
-  if (state.overlay) {
-    if (isOverlaySaveAllowed()) {
-      const saveNow = confirm("You have unsaved overlay edits. Save Overlay before publish?");
-      if (saveNow) {
-        shouldSaveOverlayBeforePublish = true;
-      } else {
-        shouldPersistRoadDataForPublish = false;
-      }
-    } else {
-      const saveNow = confirm("You have unsaved road edits on this model.\n\nSave roads before publish?");
-      if (saveNow) {
-        shouldSaveRoadsBeforePublish = true;
-      } else {
-        const ok = confirm("Continue publishing without saving road edits?");
-        if (!ok) return false;
-        shouldPersistRoadDataForPublish = false;
-      }
-    }
-  }
-
-  if (shouldPersistRoadDataForPublish) {
-    const review = reviewRoutingPersist("Publish", { routes: publishRoutes, mode: "strict" });
-    if (!review.proceed) {
-      if (review.blocked) throw new Error(review.message);
-      setStatus("Publish canceled");
+  const publishRoutes = buildWorkingRoutesSnapshot();
+  if (isDraftSessionActive()) {
+    const loadCommittedNow = confirm(
+      `You are viewing a saved draft for ${currentModelName}.\n\nPublish only works on committed model versions.\n\nLoad the committed version now?`
+    );
+    if (loadCommittedNow) {
+      await loadBaseModel(currentModelName, {
+        loadOverlay: currentModelName === ORIGINAL_MODEL_NAME,
+        forceCommitted: true
+      });
+      setStatus(`Committed version loaded for ${currentModelName}. Review it, then publish again.`);
       return false;
     }
+    throw new Error(
+      `Publish only works on committed model versions.\n\nLoad the committed version for ${currentModelName} or export the draft into a new child version first.`
+    );
+  }
+  if (state.any) {
+    throw new Error(
+      `You have unsaved draft edits on ${currentModelName}.\n\nUse Save Draft to keep the workspace, then Export GLB to create a publishable child version, or reload the committed version before publishing.`
+    );
   }
 
-  if (shouldSaveOverlayBeforePublish) {
-    const saved = await saveOverlay({
-      silent: true,
-      skipRoutingReview: true,
-      routes: publishRoutes,
-      roads: publishRoads
-    });
-    if (!saved) return false;
-    roadDataAlreadySaved = true;
+  const review = reviewRoutingPersist("Publish", {
+    routes: publishRoutes,
+    mode: "strict"
+  });
+  if (!review.proceed) {
+    if (review.blocked) throw createRoutingReviewError(review, "Publish");
+    setStatus("Publish canceled");
+    return false;
   }
 
-  if (shouldSaveRoadsBeforePublish) {
-    await saveRoadDataForModel(currentModelName, { roads: publishRoads, routes: publishRoutes });
-    captureDirtyBaselines({ overlay: true, base: false });
-    roadDataAlreadySaved = true;
-  }
-
-  if (shouldPersistRoadDataForPublish && !roadDataAlreadySaved) {
-    await saveRoadDataForModel(currentModelName, { roads: publishRoads, routes: publishRoutes });
-  }
-
-   await syncModelEntitiesToDatabase(currentModelName, state.base ? null : campusRoot);
+  await syncModelEntitiesToDatabase(currentModelName, null);
 
   const res = await apiFetch("mapEditor.php?action=publish_map", {
     method: "POST",
@@ -9335,7 +10420,9 @@ function spawnSerializedRoadObject(it) {
     width,
     points: safePoints,
     pointIds: Array.isArray(it.pointIds) ? it.pointIds.slice() : undefined,
-    pointMeta: Array.isArray(it.pointMeta) ? cloneRoadPointMeta(it.pointMeta) : undefined,
+    pointMeta: Array.isArray(it.pointMeta)
+      ? it.pointMeta.map((meta, index) => normalizeRoadPointMeta(meta, Array.isArray(it.pointIds) ? it.pointIds[index] : null))
+      : undefined,
   };
   ensureRoadPointMetaArrays(group);
 
@@ -9391,7 +10478,21 @@ async function loadOverlay() {
     return;
   }
 
-  setSavedRoutes((data && typeof data.routes === "object") ? data.routes : {});
+  await applyOverlayPayload(data, {
+    applyRoutes: true,
+    statusMessage: "Overlay loaded"
+  });
+}
+
+async function applyOverlayPayload(data = {}, opts = {}) {
+  const {
+    applyRoutes = true,
+    statusMessage = ""
+  } = opts;
+
+  if (applyRoutes) {
+    setSavedRoutes((data && typeof data.routes === "object") ? data.routes : {});
+  }
   clearRoadDraft();
   clearRoadHandles();
   roadEditRoot.visible = false;
@@ -9454,16 +10555,41 @@ async function loadOverlay() {
   undoStack = [];
   redoStack = [];
 
-  setStatus("Overlay loaded Ã¢Å“â€œ");
+  updateSpecialPointsPanel();
+  if (statusMessage) {
+    setStatus(statusMessage);
+  }
+}
+
+async function applyDraftWorkspaceState(draftState = {}) {
+  await applyOverlayPayload(draftState?.overlay || { version: 2, items: [] }, {
+    applyRoutes: false,
+    statusMessage: ""
+  });
+
+  clearRoadObjectsFromOverlay();
+  const roads = Array.isArray(draftState?.roads) ? draftState.roads : [];
+  for (const roadItem of roads) {
+    spawnSerializedRoadObject(roadItem);
+  }
+
+  const routes = (draftState?.routes && typeof draftState.routes === "object") ? draftState.routes : {};
+  const guides = (draftState?.guides && typeof draftState.guides === "object") ? draftState.guides : { entries: {} };
+  setSavedRoutes(routes);
+  setLoadedGuidesPayload({
+    model: currentModelName,
+    entries: guides.entries || {}
+  });
+  renderGuideEditorPanel({ routes });
   updateSpecialPointsPanel();
 }
 
 function updateBaseModelNote(name) {
   if (!baseModelNote) return;
   if (name === ORIGINAL_MODEL_NAME) {
-    baseModelNote.textContent = "Original map. Overlay assets load from map_overlay.json; roads load from per-model roadnet.";
+    baseModelNote.textContent = "Original map. Overlay assets load from map_overlay.json; current edits stay in draft until you export a new version.";
   } else if (name) {
-    baseModelNote.textContent = "Exported map. Overlay assets are skipped; roads load from per-model roadnet and can be saved/edited.";
+    baseModelNote.textContent = "Exported map. Overlay assets are skipped; current edits stay in draft until you export the next child version.";
   } else {
     baseModelNote.textContent = "No base models found.";
   }
@@ -9493,6 +10619,7 @@ function resetEditorState() {
   setRouteBanner("");
   setSavedRoutes({});
   setLoadedGuidesPayload({ model: "", entries: {} });
+  resetModelBuildingCatalog();
   guideSelectionKey = "";
   updateCommitButtons();
   updateRoadControls();
@@ -9621,12 +10748,44 @@ async function switchBaseModel(nextName) {
 
 async function loadBaseModel(modelName, opts = {}) {
   const shouldLoadOverlay = opts.loadOverlay !== false;
-  const modelUrl = `${MODEL_DIR}${modelName}`;
+  const availableDraft = await loadDraftStateForModel(modelName);
+  let resumeDraft = false;
+  if (availableDraft.exists) {
+    if (opts.resumeDraft === true) {
+      resumeDraft = true;
+    } else if (opts.forceCommitted === true) {
+      resumeDraft = false;
+    } else {
+      const lines = [`A saved draft exists for ${modelName}.`];
+      const savedAt = normalizeDraftSavedAt(availableDraft.savedAt);
+      if (savedAt) {
+        lines.push("", `Saved: ${new Date(savedAt).toLocaleString()}`);
+      }
+      if (availableDraft.hasBaseDraft) {
+        lines.push("This draft includes base-model edits.");
+      }
+      lines.push("", "OK = resume the draft", "Cancel = load the committed model");
+      resumeDraft = confirm(lines.join("\n"));
+    }
+  }
+  const modelUrl = (resumeDraft && availableDraft.hasBaseDraft && availableDraft.baseDraftUrl)
+    ? `${availableDraft.baseDraftUrl}${availableDraft.baseDraftUrl.includes("?") ? "&" : "?"}v=${Date.now()}`
+    : `${MODEL_DIR}${modelName}`;
 
-  setStatus("Loading base modelÃ¢â‚¬Â¦");
+  setStatus(resumeDraft ? "Loading saved draft..." : "Loading base model...");
   resetEditorState();
+  currentModelName = modelName;
+  setCurrentDraftSession({
+    model: modelName,
+    exists: !!availableDraft.exists,
+    active: false,
+    savedAt: availableDraft.savedAt,
+    hasBaseDraft: !!availableDraft.hasBaseDraft,
+    baseDraftFile: availableDraft.baseDraftFile || "",
+    baseDraftUrl: availableDraft.baseDraftUrl || ""
+  });
 
-  if (!shouldLoadOverlay) {
+  if (!shouldLoadOverlay && !resumeDraft) {
     clearOverlayObjects();
   }
 
@@ -9642,6 +10801,7 @@ async function loadBaseModel(modelName, opts = {}) {
       async (gltf) => {
         campusRoot = gltf.scene;
         scene.add(campusRoot);
+        await loadModelBuildingCatalog(modelName);
         rebuildBaseColliders();
         refreshBuildingList();
         rebuildRoadSnapBuildingCache();
@@ -9678,7 +10838,13 @@ async function loadBaseModel(modelName, opts = {}) {
         }
 
         let roadnetInfo = { exists: false, loaded: 0 };
-        if (shouldLoadOverlay) {
+        if (resumeDraft) {
+          await applyDraftWorkspaceState(availableDraft);
+          roadnetInfo = {
+            exists: Array.isArray(availableDraft.roads) && availableDraft.roads.length > 0,
+            loaded: Array.isArray(availableDraft.roads) ? availableDraft.roads.length : 0
+          };
+        } else if (shouldLoadOverlay) {
           await loadOverlay();
           await loadRoutesForModel(modelName);
           roadnetInfo = await loadRoadnetForModel(modelName, {
@@ -9700,15 +10866,30 @@ async function loadBaseModel(modelName, opts = {}) {
         setActiveToolButton(null);
         updateToolIndicator();
 
-        currentModelName = modelName;
         updateBaseModelNote(currentModelName);
         if (baseModelSelect) baseModelSelect.value = currentModelName;
 
-        let readyStatus = "Ready âœ“ (hover + click select; press Move/Rotate/Scale to edit)";
-        if (!shouldLoadOverlay) {
+        setCurrentDraftSession({
+          model: modelName,
+          exists: !!availableDraft.exists,
+          active: resumeDraft,
+          savedAt: availableDraft.savedAt,
+          hasBaseDraft: !!availableDraft.hasBaseDraft,
+          baseDraftFile: availableDraft.baseDraftFile || "",
+          baseDraftUrl: availableDraft.baseDraftUrl || ""
+        });
+
+        let readyStatus = "Ready (hover + click select; press Move/Rotate/Scale to edit)";
+        if (resumeDraft) {
+          readyStatus = availableDraft.hasBaseDraft
+            ? "Draft resumed (saved base edits + navigation draft loaded)"
+            : "Draft resumed (saved navigation draft loaded)";
+        } else if (!shouldLoadOverlay) {
           readyStatus = roadnetInfo.exists
-            ? "Ready âœ“ (overlay assets not loaded; editable roads loaded)"
-            : "Ready âœ“ (overlay assets not loaded; no editable roadnet file yet)";
+            ? "Ready (overlay assets not loaded; editable roads loaded)"
+            : "Ready (overlay assets not loaded; no editable roadnet file yet)";
+        } else if (availableDraft.exists) {
+          readyStatus = "Ready (committed version loaded; saved draft still available)";
         }
         setStatus(readyStatus);
 

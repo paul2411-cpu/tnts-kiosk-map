@@ -6,6 +6,7 @@ header("Expires: 0");
 
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/map_sync.php";
+app_logger_set_default_subsystem("api.map_live");
 
 function build_web_root() {
   $scriptDir = str_replace("\\", "/", dirname($_SERVER["SCRIPT_NAME"] ?? ""));
@@ -24,6 +25,13 @@ $hasLiveManifest = (bool)$state["hasLiveManifest"];
 $modelFile = $state["modelFile"];
 
 if (!$modelFile) {
+  app_log("error", "No public model available", [
+    "liveManifestExists" => $hasLiveManifest,
+    "liveMapPath" => $LIVE_MAP_PATH,
+  ], [
+    "subsystem" => "api.map_live",
+    "event" => "no_model",
+  ]);
   http_response_code(500);
   echo json_encode(["ok" => false, "error" => "No model available"], JSON_PRETTY_PRINT);
   exit;
@@ -31,8 +39,18 @@ if (!$modelFile) {
 
 $routesFile = $state["routesFile"];
 $routesPath = $state["routesPath"];
+$roadnetFile = $state["roadnetFile"];
+$roadnetPath = $state["roadnetPath"];
 $guidesFile = $state["guidesFile"];
 $guidesPath = $state["guidesPath"];
+
+$roads = [];
+if ($roadnetPath && file_exists($roadnetPath)) {
+  $roadnetJson = json_decode(file_get_contents($roadnetPath), true);
+  if (is_array($roadnetJson) && isset($roadnetJson["roads"]) && is_array($roadnetJson["roads"])) {
+    $roads = $roadnetJson["roads"];
+  }
+}
 
 $routes = new stdClass();
 if ($routesPath && file_exists($routesPath)) {
@@ -58,6 +76,8 @@ $baseVersion = isset($liveJson["version"]) && $liveJson["version"] !== ""
 $stateVersion = substr(sha1(implode("|", [
   $modelFile,
   map_sync_file_signature($modelPath),
+  (string)($roadnetFile ?? ""),
+  map_sync_file_signature($roadnetPath),
   (string)($routesFile ?? ""),
   map_sync_file_signature($routesPath),
   (string)($guidesFile ?? ""),
@@ -68,6 +88,7 @@ $version = $baseVersion . ":" . $stateVersion;
 
 $webRoot = build_web_root();
 $modelUrl = $webRoot . "/models/" . rawurlencode($modelFile);
+$roadnetUrl = $roadnetFile ? ($webRoot . "/admin/overlays/" . rawurlencode($roadnetFile)) : null;
 $routesUrl = $routesFile ? ($webRoot . "/admin/overlays/" . rawurlencode($routesFile)) : null;
 $guidesUrl = $guidesFile ? ($webRoot . "/admin/overlays/" . rawurlencode($guidesFile)) : null;
 
@@ -76,12 +97,15 @@ echo json_encode([
   "published" => $hasLiveManifest,
   "modelFile" => $modelFile,
   "modelUrl" => $modelUrl,
+  "roadnetFile" => $roadnetFile,
+  "roadnetUrl" => $roadnetUrl,
   "routesFile" => $routesFile,
   "routesUrl" => $routesUrl,
   "guidesFile" => $guidesFile,
   "guidesUrl" => $guidesUrl,
   "version" => $version,
   "publishedAt" => $publishedAt,
+  "roads" => $roads,
   "routes" => $routes,
   "guides" => $guides
 ], JSON_PRETTY_PRINT);
