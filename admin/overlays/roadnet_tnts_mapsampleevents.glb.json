@@ -1,0 +1,109 @@
+{
+    "ok": true,
+    "model": "tnts_mapsampleevents.glb",
+    "updated": 1774335002,
+    "roads": [
+        {
+            "type": "road",
+            "id": "road_1774334980166_278",
+            "name": "road",
+            "position": [
+                178.0476784717606,
+                1.4310853248237336,
+                -4.23165625665959
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 6,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ]
+            ],
+            "pointIds": [
+                "rp_1774334980165_1"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774334980165_1",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774334980167
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774334985973_723",
+            "name": "road",
+            "position": [
+                178.0476784717606,
+                1.4310853248237336,
+                -4.23165625665959
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 6,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    -22.732270854573102,
+                    0,
+                    2.6645352591003757e-15
+                ]
+            ],
+            "pointIds": [
+                "rp_1774334980165_1",
+                "rp_1774334985973_3"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774334980165_1",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774334980167
+                },
+                {
+                    "id": "rp_1774334985973_3",
+                    "label": "AREA_QUADRANGLE_right",
+                    "entityType": "area",
+                    "building": {
+                        "name": "AREA_QUADRANGLE",
+                        "objectName": "AREA_QUADRANGLE",
+                        "uid": "bld_a032083a74b09972",
+                        "side": "right"
+                    },
+                    "linkedAt": 1774334985974
+                }
+            ]
+        }
+    ]
+}

@@ -21,6 +21,7 @@ function createAdminEventsMapPicker() {
   const yInput = document.getElementById("map_point_y");
   const zInput = document.getElementById("map_point_z");
   const modelFileInput = document.getElementById("map_model_file");
+  const anchorSelect = document.getElementById("specific_area_anchor_building_id");
 
   if (!configEl || !stage || !coordsEl || !statusEl || !clearBtn || !radiusInput || !xInput || !yInput || !zInput || !modelFileInput) {
     return null;
@@ -30,6 +31,71 @@ function createAdminEventsMapPicker() {
   try {
     config = JSON.parse(configEl.textContent || "{}");
   } catch (_) {}
+
+  const routeAnchors = Array.isArray(config.routeAnchors) ? config.routeAnchors : [];
+
+  function normalizeKey(value) {
+    return String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_]+/g, "");
+  }
+
+  function isRouteAnchorValue(value) {
+    const safeValue = String(value || "").trim();
+    if (!safeValue) return false;
+    return routeAnchors.some((anchor) => String(anchor?.id || "") === safeValue);
+  }
+
+  function findRouteAnchorByRootName(rootName) {
+    const normalized = normalizeKey(rootName);
+    if (!normalized) return null;
+    return routeAnchors.find((anchor) => {
+      const candidates = [
+        anchor?.objectName,
+        anchor?.name,
+        anchor?.buildingUid
+      ];
+      return candidates.some((candidate) => normalizeKey(candidate) === normalized);
+    }) || null;
+  }
+
+  function markAnchorSelectionMode(mode, anchorId = "") {
+    if (!anchorSelect) return;
+    anchorSelect.dataset.autoDetected = mode === "auto" ? "1" : "0";
+    anchorSelect.dataset.autoAnchorId = String(anchorId || "");
+  }
+
+  function setAnchorSelection(anchor) {
+    if (!anchorSelect) return false;
+    const anchorId = String(anchor?.id || "").trim();
+    if (!anchorId) return false;
+    const option = Array.from(anchorSelect.options || []).find((entry) => entry.value === anchorId);
+    if (!option) return false;
+    anchorSelect.value = anchorId;
+    markAnchorSelectionMode("auto", anchorId);
+    return true;
+  }
+
+  function clearAutoAnchorSelection() {
+    if (!anchorSelect) return;
+    if (anchorSelect.dataset.autoDetected !== "1") return;
+    anchorSelect.value = "";
+    markAnchorSelectionMode("manual", "");
+  }
+
+  function getTopLevelNamedRoot(object) {
+    let node = object || null;
+    let candidate = null;
+    while (node && node !== loadedModel) {
+      if (node.parent === loadedModel) {
+        return node;
+      }
+      if (node.name) candidate = node;
+      node = node.parent || null;
+    }
+    return candidate;
+  }
 
   if (!config.enabled || !config.modelUrl) {
     statusEl.textContent = "Map preview is unavailable until a public map is published.";
@@ -160,6 +226,7 @@ function createAdminEventsMapPicker() {
     zInput.value = "";
     updateCoordsLabel(null);
     if (areaGroup) areaGroup.visible = false;
+    clearAutoAnchorSelection();
     setStatus("Select a point on the map preview.");
   }
 
@@ -184,13 +251,24 @@ function createAdminEventsMapPicker() {
     updateCoordsLabel(point);
   }
 
-  function setAreaPoint(point) {
+  function setAreaPoint(point, hit = null) {
     xInput.value = point.x.toFixed(4);
     yInput.value = point.y.toFixed(4);
     zInput.value = point.z.toFixed(4);
     modelFileInput.value = String(config.modelFile || "");
     syncAreaMarker();
-    setStatus("Area pinned. Save the event to keep this highlight.");
+
+    const hitRoot = getTopLevelNamedRoot(hit?.object || null);
+    const matchedAnchor = hitRoot ? findRouteAnchorByRootName(hitRoot.name) : null;
+    const anchorApplied = matchedAnchor ? setAnchorSelection(matchedAnchor) : false;
+
+    if (anchorApplied) {
+      const anchorName = String(matchedAnchor?.name || hitRoot?.name || "linked destination").trim();
+      setStatus(`Area pinned and linked to ${anchorName}. Save the event to keep this highlight.`);
+    } else {
+      clearAutoAnchorSelection();
+      setStatus("Area pinned. Save the event to keep this highlight.");
+    }
   }
 
   function resize() {
@@ -240,11 +318,18 @@ function createAdminEventsMapPicker() {
   renderer.domElement.addEventListener("click", (event) => {
     const hit = pickSurface(event);
     if (!hit?.point) return;
-    setAreaPoint(hit.point);
+    setAreaPoint(hit.point, hit);
   });
 
   clearBtn.addEventListener("click", clearAreaSelection);
   radiusInput.addEventListener("input", syncAreaMarker);
+  anchorSelect?.addEventListener("change", () => {
+    if (!anchorSelect) return;
+    if (anchorSelect.dataset.autoDetected === "1" && anchorSelect.dataset.autoAnchorId === String(anchorSelect.value || "")) {
+      return;
+    }
+    markAnchorSelectionMode("manual", "");
+  });
 
   const resizeObserver = new ResizeObserver(() => {
     resize();

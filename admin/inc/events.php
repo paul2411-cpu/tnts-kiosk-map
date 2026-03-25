@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . "/map_sync.php";
+require_once __DIR__ . "/map_entities.php";
 
 function events_trimmed($value, int $maxLen): string {
   $text = trim((string)$value);
@@ -73,6 +74,58 @@ function events_normalize_location_mode(string $mode): string {
   return isset($options[$mode]) ? $mode : "text_only";
 }
 
+function events_normalize_time_value($value): string {
+  $value = trim((string)$value);
+  if ($value === "") return "";
+  if (!preg_match('/^\d{2}:\d{2}$/', $value)) return "";
+  $dt = DateTimeImmutable::createFromFormat("H:i", $value);
+  return $dt ? $dt->format("H:i") : "";
+}
+
+function events_normalize_entity_type(string $type): string {
+  $safe = trim(mb_strtolower($type));
+  return in_array($safe, ["building", "venue", "area", "landmark"], true) ? $safe : "building";
+}
+
+function events_route_anchor_entity_types(): array {
+  return ["building", "venue", "area"];
+}
+
+function events_is_route_anchor_entity_type(string $type): bool {
+  return in_array(events_normalize_entity_type($type), events_route_anchor_entity_types(), true);
+}
+
+function events_route_lookup_variants($value): array {
+  $variants = [];
+  $raw = trim((string)$value);
+  if ($raw !== "") {
+    $variants[] = events_normalize_lookup($raw);
+  }
+  return array_values(array_unique(array_filter($variants, static fn($item) => $item !== "")));
+}
+
+function events_build_route_target_keys(array $target): array {
+  $keys = [];
+  foreach ([
+    $target["buildingUid"] ?? "",
+    $target["objectName"] ?? "",
+    $target["buildingName"] ?? "",
+    $target["name"] ?? "",
+  ] as $value) {
+    foreach (events_route_lookup_variants($value) as $variant) {
+      $keys[$variant] = true;
+    }
+  }
+  return array_keys($keys);
+}
+
+function events_has_route_for_target(array $routeKeys, array $target): bool {
+  foreach (events_build_route_target_keys($target) as $candidate) {
+    if (isset($routeKeys[$candidate])) return true;
+  }
+  return false;
+}
+
 function events_ensure_schema(mysqli $conn): void {
   events_sql($conn, "
     CREATE TABLE IF NOT EXISTS events (
@@ -80,7 +133,9 @@ function events_ensure_schema(mysqli $conn): void {
       title VARCHAR(150) NOT NULL,
       description TEXT DEFAULT NULL,
       start_date DATE DEFAULT NULL,
+      start_time TIME DEFAULT NULL,
       end_date DATE DEFAULT NULL,
+      end_time TIME DEFAULT NULL,
       location VARCHAR(255) DEFAULT NULL,
       banner_path VARCHAR(255) DEFAULT NULL,
       date_added TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -105,6 +160,12 @@ function events_ensure_schema(mysqli $conn): void {
   }
   if (!events_has_column($conn, "events", "location_mode")) {
     events_sql($conn, "ALTER TABLE events ADD COLUMN location_mode ENUM('text_only','building','room','facility','specific_area') NOT NULL DEFAULT 'text_only' AFTER status");
+  }
+  if (!events_has_column($conn, "events", "start_time")) {
+    events_sql($conn, "ALTER TABLE events ADD COLUMN start_time TIME DEFAULT NULL AFTER start_date");
+  }
+  if (!events_has_column($conn, "events", "end_time")) {
+    events_sql($conn, "ALTER TABLE events ADD COLUMN end_time TIME DEFAULT NULL AFTER end_date");
   }
   if (!events_has_column($conn, "events", "building_id")) {
     events_sql($conn, "ALTER TABLE events ADD COLUMN building_id INT(11) DEFAULT NULL AFTER location_mode");
@@ -173,10 +234,17 @@ function events_public_route_keys(string $root): array {
     $routes = is_array($payload["routes"] ?? null) ? $payload["routes"] : [];
     foreach ($routes as $rawKey => $rawEntry) {
       $entry = is_array($rawEntry) ? $rawEntry : [];
-      $name = trim((string)($entry["buildingName"] ?? $entry["name"] ?? $entry["routeName"] ?? $entry["destinationName"] ?? $rawKey));
-      $normalized = events_normalize_lookup($name);
-      if ($normalized === "") continue;
-      $keys[$normalized] = $name;
+      $candidates = [
+        $rawKey,
+        $entry["buildingUid"] ?? $entry["destinationUid"] ?? $entry["uid"] ?? "",
+        $entry["objectName"] ?? $entry["modelObjectName"] ?? "",
+        $entry["buildingName"] ?? $entry["name"] ?? $entry["routeName"] ?? $entry["destinationName"] ?? "",
+      ];
+      foreach ($candidates as $candidate) {
+        foreach (events_route_lookup_variants($candidate) as $variant) {
+          $keys[$variant] = true;
+        }
+      }
     }
   }
 
@@ -265,8 +333,17 @@ function events_store_banner_upload(array $file, string $root): array {
 function events_fetch_building_by_id(mysqli $conn, int $buildingId): ?array {
   $hasSource = events_has_column($conn, "buildings", "source_model_file");
   $hasPresent = events_has_column($conn, "buildings", "is_present_in_latest");
+  $hasEntityType = events_has_column($conn, "buildings", "entity_type");
+  $hasUid = events_has_column($conn, "buildings", "building_uid");
+  $hasObjectName = events_has_column($conn, "buildings", "model_object_name");
   $stmt = $conn->prepare(
-    "SELECT building_id, building_name, description, image_path, "
+    "SELECT building_id, "
+    . ($hasUid ? "building_uid" : "NULL AS building_uid")
+    . ", building_name, "
+    . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
+    . ", description, image_path, "
+    . ($hasEntityType ? "entity_type" : "'building' AS entity_type")
+    . ", "
     . ($hasSource ? "source_model_file" : "NULL AS source_model_file")
     . ", " . ($hasPresent ? "is_present_in_latest" : "1 AS is_present_in_latest")
     . " FROM buildings WHERE building_id = ? LIMIT 1"
@@ -289,6 +366,8 @@ function events_fetch_room_by_id(mysqli $conn, int $roomId): ?array {
   $hasRoomBuildingName = events_has_column($conn, "rooms", "building_name");
   $hasBuildingSource = events_has_column($conn, "buildings", "source_model_file");
   $hasBuildingPresent = events_has_column($conn, "buildings", "is_present_in_latest");
+  $hasBuildingUid = events_has_column($conn, "buildings", "building_uid");
+  $hasBuildingObjectName = events_has_column($conn, "buildings", "model_object_name");
   $stmt = $conn->prepare(
     "SELECT
       r.room_id,
@@ -297,6 +376,8 @@ function events_fetch_room_by_id(mysqli $conn, int $roomId): ?array {
       r.room_type,
       r.floor_number,
       r.building_id,
+      " . ($hasBuildingUid ? "b.building_uid" : "NULL AS building_uid") . ",
+      " . ($hasBuildingObjectName ? "b.model_object_name" : "NULL AS building_object_name") . ",
       COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasRoomBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ") AS building_name,
       " . ($hasRoomSource ? "r.source_model_file" : ($hasBuildingSource ? "b.source_model_file" : "NULL")) . " AS source_model_file,
       " . ($hasRoomPresent ? "r.is_present_in_latest" : "1") . " AS room_present,
@@ -320,7 +401,9 @@ function events_fetch_room_by_id(mysqli $conn, int $roomId): ?array {
 
 function events_fetch_facility_by_id(mysqli $conn, int $facilityId): ?array {
   $stmt = $conn->prepare(
-    "SELECT facility_id, facility_name, description, logo_path, location, contact_info
+    "SELECT facility_id, facility_name, model_object_name, description, logo_path, location, contact_info,
+            " . (events_has_column($conn, "facilities", "source_model_file") ? "source_model_file" : "NULL AS source_model_file") . ",
+            " . (events_has_column($conn, "facilities", "is_present_in_latest") ? "is_present_in_latest" : "1 AS is_present_in_latest") . "
      FROM facilities
      WHERE facility_id = ?
      LIMIT 1"
@@ -350,17 +433,40 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
     ];
   }
 
+  $facilityName = trim((string)($facility["facility_name"] ?? ""));
+  $facilityObjectName = trim((string)($facility["model_object_name"] ?? ""));
+  $facilitySourceModel = trim((string)($facility["source_model_file"] ?? ""));
+  $facilityPresent = (string)($facility["is_present_in_latest"] ?? "1") !== "0";
+  if ($facilityName !== "" && $facilityObjectName !== "" && $facilityPresent && events_is_model_match($facilitySourceModel, $publicModel)) {
+    return [
+      "facility" => $facility,
+      "health" => "valid",
+      "canMap" => true,
+      "canRoute" => false,
+      "message" => "This facility resolves directly to a mapped facility destination.",
+      "resolvedTarget" => [
+        "type" => "facility",
+        "buildingName" => $facilityName,
+        "objectName" => $facilityObjectName,
+      ],
+    ];
+  }
+
   $hasRoomSource = events_has_column($conn, "rooms", "source_model_file");
   $hasRoomPresent = events_has_column($conn, "rooms", "is_present_in_latest");
   $hasRoomBuildingName = events_has_column($conn, "rooms", "building_name");
   $hasBuildingSource = events_has_column($conn, "buildings", "source_model_file");
   $hasBuildingPresent = events_has_column($conn, "buildings", "is_present_in_latest");
+  $hasBuildingUid = events_has_column($conn, "buildings", "building_uid");
+  $hasBuildingObjectName = events_has_column($conn, "buildings", "model_object_name");
   $sql = "
     SELECT
       r.room_id,
       r.room_name,
       r.room_number,
       r.building_id,
+      " . ($hasBuildingUid ? "b.building_uid" : "NULL AS building_uid") . ",
+      " . ($hasBuildingObjectName ? "b.model_object_name" : "NULL AS building_object_name") . ",
       COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasRoomBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ") AS building_name,
       " . ($hasRoomSource ? "r.source_model_file" : ($hasBuildingSource ? "b.source_model_file" : "NULL")) . " AS source_model_file,
       " . ($hasRoomPresent ? "r.is_present_in_latest" : "1") . " AS room_present,
@@ -457,7 +563,9 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
       "resolvedTarget" => [
         "type" => "room",
         "buildingId" => (int)($row["building_id"] ?? 0),
+        "buildingUid" => trim((string)($row["building_uid"] ?? "")),
         "buildingName" => trim((string)($row["building_name"] ?? "")),
+        "objectName" => trim((string)($row["building_object_name"] ?? "")),
         "roomId" => (int)($row["room_id"] ?? 0),
         "roomName" => trim((string)($row["room_name"] ?? "")),
         "roomNumber" => trim((string)($row["room_number"] ?? "")),
@@ -476,7 +584,9 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
       "resolvedTarget" => [
         "type" => "building",
         "buildingId" => (int)($row["building_id"] ?? 0),
+        "buildingUid" => trim((string)($row["building_uid"] ?? "")),
         "buildingName" => trim((string)($row["building_name"] ?? "")),
+        "objectName" => trim((string)($row["building_object_name"] ?? "")),
       ],
     ];
   }
@@ -491,42 +601,158 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
   ];
 }
 
+function events_resolve_interval(array $event): ?array {
+  $startDate = trim((string)($event["start_date"] ?? ""));
+  $endDate = trim((string)($event["end_date"] ?? "")) ?: $startDate;
+  if ($startDate === "" || $endDate === "") return null;
+
+  $startTime = events_normalize_time_value($event["start_time"] ?? "");
+  $endTime = events_normalize_time_value($event["end_time"] ?? "");
+  $timed = ($startTime !== "" && $endTime !== "");
+
+  $startStamp = $startDate . " " . ($timed ? $startTime . ":00" : "00:00:00");
+  $endStamp = $endDate . " " . ($timed ? $endTime . ":59" : "23:59:59");
+  $startAt = DateTimeImmutable::createFromFormat("Y-m-d H:i:s", $startStamp) ?: null;
+  $endAt = DateTimeImmutable::createFromFormat("Y-m-d H:i:s", $endStamp) ?: null;
+  if (!$startAt || !$endAt) return null;
+
+  return [
+    "start" => $startAt,
+    "end" => $endAt,
+    "timed" => $timed,
+    "startDate" => $startDate,
+    "endDate" => $endDate,
+    "startTime" => $startTime,
+    "endTime" => $endTime,
+  ];
+}
+
+function events_ranges_overlap(array $left, array $right): bool {
+  if (empty($left["start"]) || empty($left["end"]) || empty($right["start"]) || empty($right["end"])) return false;
+  return $left["start"] <= $right["end"] && $right["start"] <= $left["end"];
+}
+
+function events_conflict_scope(array $event): ?array {
+  $mode = events_normalize_location_mode((string)($event["location_mode"] ?? "text_only"));
+  if ($mode === "building" || $mode === "specific_area") {
+    $buildingId = (int)($event["building_id"] ?? 0);
+    if ($buildingId > 0) {
+      return ["kind" => "building", "id" => $buildingId];
+    }
+    return null;
+  }
+  if ($mode === "room") {
+    $roomId = (int)($event["room_id"] ?? 0);
+    return $roomId > 0 ? ["kind" => "room", "id" => $roomId] : null;
+  }
+  if ($mode === "facility") {
+    $facilityId = (int)($event["facility_id"] ?? 0);
+    return $facilityId > 0 ? ["kind" => "facility", "id" => $facilityId] : null;
+  }
+  return null;
+}
+
+function events_find_overlap_conflict(mysqli $conn, array $candidate, int $ignoreEventId = 0): ?array {
+  $interval = events_resolve_interval($candidate);
+  $scope = events_conflict_scope($candidate);
+  if (!$interval || !$scope) return null;
+
+  if ($scope["kind"] === "building") {
+    $stmt = $conn->prepare(
+      "SELECT * FROM events
+       WHERE event_id <> ?
+         AND status IN ('draft','published')
+         AND (
+           (location_mode = 'building' AND building_id = ?)
+           OR
+           (location_mode = 'specific_area' AND building_id = ?)
+         )
+       ORDER BY start_date ASC, event_id ASC"
+    );
+    if (!$stmt) return null;
+    $stmt->bind_param("iii", $ignoreEventId, $scope["id"], $scope["id"]);
+  } elseif ($scope["kind"] === "room") {
+    $stmt = $conn->prepare(
+      "SELECT * FROM events
+       WHERE event_id <> ?
+         AND status IN ('draft','published')
+         AND location_mode = 'room'
+         AND room_id = ?
+       ORDER BY start_date ASC, event_id ASC"
+    );
+    if (!$stmt) return null;
+    $stmt->bind_param("ii", $ignoreEventId, $scope["id"]);
+  } elseif ($scope["kind"] === "facility") {
+    $stmt = $conn->prepare(
+      "SELECT * FROM events
+       WHERE event_id <> ?
+         AND status IN ('draft','published')
+         AND location_mode = 'facility'
+         AND facility_id = ?
+       ORDER BY start_date ASC, event_id ASC"
+    );
+    if (!$stmt) return null;
+    $stmt->bind_param("ii", $ignoreEventId, $scope["id"]);
+  } else {
+    return null;
+  }
+
+  if (!$stmt->execute()) {
+    $stmt->close();
+    return null;
+  }
+  $res = $stmt->get_result();
+  $conflict = null;
+  if ($res instanceof mysqli_result) {
+    while ($row = $res->fetch_assoc()) {
+      $rowInterval = events_resolve_interval($row);
+      if (!$rowInterval) continue;
+      if (events_ranges_overlap($interval, $rowInterval)) {
+        $conflict = $row;
+        break;
+      }
+    }
+  }
+  $stmt->close();
+  return $conflict;
+}
+
 function events_classify_schedule(array $event): string {
   $status = events_normalize_status((string)($event["status"] ?? "draft"));
-  $start = trim((string)($event["start_date"] ?? ""));
-  $end = trim((string)($event["end_date"] ?? ""));
-  if ($start === "") return $status === "published" ? "unscheduled" : "draft";
-
-  $today = new DateTimeImmutable("today");
-  $startDate = DateTimeImmutable::createFromFormat("Y-m-d", $start) ?: null;
-  $endDate = $end !== "" ? (DateTimeImmutable::createFromFormat("Y-m-d", $end) ?: null) : null;
-  $finalEnd = $endDate ?: $startDate;
-  if (!$startDate || !$finalEnd) return $status === "published" ? "unscheduled" : "draft";
+  $interval = events_resolve_interval($event);
+  if (!$interval) return $status === "published" ? "unscheduled" : "draft";
 
   if ($status !== "published") return $status;
-  if ($finalEnd < $today) return "past";
-  if ($startDate > $today) return "upcoming";
-  if ($startDate == $today && $finalEnd == $today) return "today";
+  $now = new DateTimeImmutable("now");
+  $today = new DateTimeImmutable("today");
+  if ($interval["end"] < $now) return "past";
+  if ($interval["start"] > $now) {
+    return $interval["start"]->format("Y-m-d") === $today->format("Y-m-d") ? "today" : "upcoming";
+  }
+  if ($interval["start"]->format("Y-m-d") === $today->format("Y-m-d") && $interval["end"]->format("Y-m-d") === $today->format("Y-m-d")) {
+    return "today";
+  }
   return "ongoing";
 }
 
 function events_format_date_label(array $event): string {
-  $start = trim((string)($event["start_date"] ?? ""));
-  $end = trim((string)($event["end_date"] ?? ""));
-  if ($start === "") return "Date TBA";
+  $interval = events_resolve_interval($event);
+  if (!$interval) return "Date TBA";
 
-  $startTs = strtotime($start);
-  if ($startTs === false) return "Date TBA";
-  $label = date("M d, Y", $startTs);
-
-  if ($end !== "" && $end !== $start) {
-    $endTs = strtotime($end);
-    if ($endTs !== false) {
-      $label .= " to " . date("M d, Y", $endTs);
+  $start = $interval["start"];
+  $end = $interval["end"];
+  if (!$interval["timed"]) {
+    $label = $start->format("M d, Y");
+    if ($interval["endDate"] !== $interval["startDate"]) {
+      $label .= " to " . $end->format("M d, Y");
     }
+    return $label;
   }
 
-  return $label;
+  if ($interval["endDate"] === $interval["startDate"]) {
+    return $start->format("M d, Y g:i A") . " to " . $end->format("g:i A");
+  }
+  return $start->format("M d, Y g:i A") . " to " . $end->format("M d, Y g:i A");
 }
 
 function events_is_publicly_visible(array $event): bool {
@@ -569,6 +795,7 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     }
 
     $buildingName = trim((string)($building["building_name"] ?? ""));
+    $buildingType = trim((string)($building["entity_type"] ?? "building")) ?: "building";
     if ($displayLocation === "") $resolved["displayLocation"] = $buildingName;
 
     $present = (string)($building["is_present_in_latest"] ?? "1") !== "0";
@@ -580,9 +807,12 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
       return $resolved;
     }
 
-    $routeKey = events_normalize_lookup($buildingName);
     $resolved["canMap"] = true;
-    $resolved["canRoute"] = $routeKey !== "" && isset($routeKeys[$routeKey]);
+    $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
+      "buildingName" => $buildingName,
+      "objectName" => trim((string)($building["model_object_name"] ?? "")),
+    ]);
     $resolved["message"] = $resolved["canRoute"]
       ? "Directions are available for this building."
       : "This building can open on the map, but no published route is available right now.";
@@ -591,9 +821,11 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
       $resolved["healthLabel"] = events_health_labels()["limited"];
     }
     $resolved["resolvedTarget"] = [
-      "type" => "building",
+      "type" => $buildingType,
       "buildingId" => (int)$building["building_id"],
       "buildingName" => $buildingName,
+      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
+      "objectName" => trim((string)($building["model_object_name"] ?? "")),
     ];
     return $resolved;
   }
@@ -625,9 +857,12 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
       return $resolved;
     }
 
-    $routeKey = events_normalize_lookup($buildingName);
     $resolved["canMap"] = true;
-    $resolved["canRoute"] = $routeKey !== "" && isset($routeKeys[$routeKey]);
+    $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+      "buildingUid" => trim((string)($room["building_uid"] ?? "")),
+      "buildingName" => $buildingName,
+      "objectName" => trim((string)($room["building_object_name"] ?? "")),
+    ]);
     $resolved["message"] = $resolved["canRoute"]
       ? "Directions are available through the room's parent building."
       : "The room can open on the map, but no published route is available for its building right now.";
@@ -638,7 +873,9 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     $resolved["resolvedTarget"] = [
       "type" => "room",
       "buildingId" => (int)($room["building_id"] ?? 0),
+      "buildingUid" => trim((string)($room["building_uid"] ?? "")),
       "buildingName" => $buildingName,
+      "objectName" => trim((string)($room["building_object_name"] ?? "")),
       "roomId" => (int)($room["room_id"] ?? 0),
       "roomName" => $roomName,
       "roomNumber" => $roomNumber,
@@ -677,14 +914,21 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
         $targetBuildingName = trim((string)($resolved["resolvedTarget"]["buildingName"] ?? ""));
       } elseif ($targetType === "room") {
         $targetBuildingName = trim((string)($resolved["resolvedTarget"]["buildingName"] ?? ""));
+      } elseif ($targetType === "facility") {
+        $targetBuildingName = trim((string)($resolved["resolvedTarget"]["buildingName"] ?? ""));
       }
 
-      $routeKey = events_normalize_lookup($targetBuildingName);
-      $resolved["canRoute"] = $routeKey !== "" && isset($routeKeys[$routeKey]);
+      $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+        "buildingUid" => trim((string)($resolved["resolvedTarget"]["buildingUid"] ?? "")),
+        "buildingName" => $targetBuildingName,
+        "objectName" => trim((string)($resolved["resolvedTarget"]["objectName"] ?? "")),
+      ]);
       if ($resolved["canRoute"]) {
         $resolved["message"] = $targetType === "room"
           ? "Directions are available through the facility's linked room."
-          : "Directions are available through the facility's linked building.";
+          : ($targetType === "facility"
+            ? "Directions are available for this facility."
+            : "Directions are available through the facility's linked building.");
       } else {
         $resolved["message"] = "This facility can open on the map, but no published route is available for its linked destination right now.";
         if ($resolved["health"] === "valid") {
@@ -731,6 +975,58 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
       "radius" => (is_numeric($radius) && (float)$radius > 0) ? (float)$radius : 8.0,
       "modelFile" => $modelFile,
     ];
+
+    $anchorBuildingId = (int)($event["building_id"] ?? 0);
+    if ($anchorBuildingId > 0) {
+      $anchor = events_fetch_building_by_id($conn, $anchorBuildingId);
+      if (!$anchor) {
+        $resolved["health"] = "limited";
+        $resolved["healthLabel"] = events_health_labels()["limited"];
+        $resolved["message"] = "This event area highlight is valid, but its linked route anchor no longer exists.";
+        return $resolved;
+      }
+
+      $anchorType = events_normalize_entity_type((string)($anchor["entity_type"] ?? "building"));
+      if (!events_is_route_anchor_entity_type($anchorType)) {
+        $resolved["health"] = "limited";
+        $resolved["healthLabel"] = events_health_labels()["limited"];
+        $resolved["message"] = "This event area highlight is valid, but its linked route anchor cannot provide directions.";
+        return $resolved;
+      }
+
+      $anchorPresent = (string)($anchor["is_present_in_latest"] ?? "1") !== "0";
+      $anchorSourceModel = trim((string)($anchor["source_model_file"] ?? ""));
+      if (!$anchorPresent || !events_is_model_match($anchorSourceModel, $publicModel)) {
+        $resolved["health"] = "needs_review";
+        $resolved["healthLabel"] = events_health_labels()["needs_review"];
+        $resolved["message"] = "This event area highlight is valid, but its linked route anchor is not available in the current public map.";
+        return $resolved;
+      }
+
+      $anchorName = trim((string)($anchor["building_name"] ?? ""));
+      $resolved["resolvedTarget"]["buildingId"] = (int)($anchor["building_id"] ?? 0);
+      $resolved["resolvedTarget"]["buildingUid"] = trim((string)($anchor["building_uid"] ?? ""));
+      $resolved["resolvedTarget"]["buildingName"] = $anchorName;
+      $resolved["resolvedTarget"]["objectName"] = trim((string)($anchor["model_object_name"] ?? ""));
+      $resolved["resolvedTarget"]["anchorType"] = $anchorType;
+
+      if ($displayLocation === "") {
+        $resolved["displayLocation"] = trim($anchorName . " - Event area");
+      }
+
+      $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+        "buildingUid" => trim((string)($anchor["building_uid"] ?? "")),
+        "buildingName" => $anchorName,
+        "objectName" => trim((string)($anchor["model_object_name"] ?? "")),
+      ]);
+      if ($resolved["canRoute"]) {
+        $resolved["message"] = "Directions are available through the linked destination. The exact event spot will still open as a highlight.";
+      } else {
+        $resolved["health"] = "limited";
+        $resolved["healthLabel"] = events_health_labels()["limited"];
+        $resolved["message"] = "This event area highlight is valid, but no published route is available for its linked destination right now.";
+      }
+    }
     return $resolved;
   }
 
@@ -740,14 +1036,31 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
   return $resolved;
 }
 
-function events_load_building_options(mysqli $conn, string $publicModel): array {
+function events_load_building_options(mysqli $conn, string $publicModel, array $entityTypes = []): array {
   $hasPresent = events_has_column($conn, "buildings", "is_present_in_latest");
   $hasSource = events_has_column($conn, "buildings", "source_model_file");
+  $hasEntityType = events_has_column($conn, "buildings", "entity_type");
+  $hasUid = events_has_column($conn, "buildings", "building_uid");
+  $hasObjectName = events_has_column($conn, "buildings", "model_object_name");
   $sql = "SELECT building_id, building_name, description, image_path, "
+    . ($hasUid ? "building_uid" : "NULL AS building_uid")
+    . ", "
+    . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
+    . ", "
+    . ($hasEntityType ? "entity_type" : "'building' AS entity_type")
+    . ", "
     . ($hasSource ? "source_model_file" : "NULL AS source_model_file")
     . " FROM buildings WHERE building_name IS NOT NULL AND building_name <> ''";
   if ($hasPresent) {
     $sql .= " AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)";
+  }
+
+  $allowedTypes = array_values(array_unique(array_filter(array_map("events_normalize_entity_type", $entityTypes))));
+  if ($allowedTypes && $hasEntityType) {
+    $quotedTypes = array_map(static function (string $type) use ($conn): string {
+      return "'" . $conn->real_escape_string($type) . "'";
+    }, $allowedTypes);
+    $sql .= " AND entity_type IN (" . implode(", ", $quotedTypes) . ")";
   }
 
   $rows = [];
@@ -837,7 +1150,7 @@ function events_load_rows(mysqli $conn, bool $publicOnly = false): array {
   events_ensure_schema($conn);
   $sql = "SELECT * FROM events";
   if ($publicOnly) {
-    $sql .= " WHERE status = 'published' AND (COALESCE(end_date, start_date) IS NULL OR COALESCE(end_date, start_date) >= CURDATE())";
+    $sql .= " WHERE status = 'published'";
   }
   $sql .= " ORDER BY
     CASE
@@ -847,6 +1160,7 @@ function events_load_rows(mysqli $conn, bool $publicOnly = false): array {
       ELSE 2
     END ASC,
     start_date ASC,
+    COALESCE(start_time, '23:59:59') ASC,
     date_added DESC,
     event_id DESC";
 

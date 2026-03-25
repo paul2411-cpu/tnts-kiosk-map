@@ -7,6 +7,7 @@ header("Expires: 0");
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
+require_once $ROOT . "/admin/inc/map_entities.php";
 app_logger_set_default_subsystem("api.map_building_details");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
@@ -55,75 +56,18 @@ function sort_room_rows(array &$rows): void {
 }
 
 function fetch_building(mysqli $conn, string $modelFile, ?int $buildingId, string $buildingName): ?array {
-  $hasBuildingId = has_column($conn, "buildings", "building_id");
-  $hasBuildingPresent = has_column($conn, "buildings", "is_present_in_latest");
-  $hasBuildingSource = has_column($conn, "buildings", "source_model_file");
-  $hasBuildingUid = has_column($conn, "buildings", "building_uid");
-  $hasObjectName = has_column($conn, "buildings", "model_object_name");
-  $hasDescription = has_column($conn, "buildings", "description");
-  $hasImage = has_column($conn, "buildings", "image_path");
-
-  $sqlCols = ($hasBuildingId ? "building_id" : "NULL AS building_id")
-    . ", " . ($hasBuildingUid ? "building_uid" : "NULL AS building_uid")
-    . ", " . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
-    . ", building_name"
-    . ", " . ($hasDescription ? "description" : "NULL AS description")
-    . ", " . ($hasImage ? "image_path" : "NULL AS image_path")
-    . ", " . ($hasBuildingSource ? "source_model_file" : "NULL AS source_model_file");
-
-  $wherePresent = $hasBuildingPresent ? " AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)" : "";
-
-  if ($buildingId !== null && $hasBuildingId) {
-    if ($modelFile !== "" && $hasBuildingSource) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_id = ? AND source_model_file = ?{$wherePresent} LIMIT 1");
-      if (!$stmt) throw new RuntimeException("Failed to prepare building lookup");
-      $stmt->bind_param("is", $buildingId, $modelFile);
-      if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
-      $res = $stmt->get_result();
-      $row = $res ? $res->fetch_assoc() : null;
-      $stmt->close();
-      if ($row) return $row;
-      return null;
+  $destinations = map_entities_fetch_model_destinations($conn, $modelFile, true);
+  foreach ($destinations as $row) {
+    $rowId = isset($row["id"]) ? (int)$row["id"] : null;
+    $name = trim((string)($row["name"] ?? ""));
+    $objectName = trim((string)($row["objectName"] ?? ""));
+    if ($buildingId !== null && $rowId !== null && $rowId === $buildingId) {
+      return $row;
     }
-
-    $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_id = ?{$wherePresent} LIMIT 1");
-    if (!$stmt) throw new RuntimeException("Failed to prepare building fallback lookup");
-    $stmt->bind_param("i", $buildingId);
-    if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
-    $res = $stmt->get_result();
-    $row = $res ? $res->fetch_assoc() : null;
-    $stmt->close();
-    if ($row) return $row;
-  }
-
-  if ($buildingName !== "") {
-    $nameWhere = $hasObjectName
-      ? "(building_name = ? OR model_object_name = ?)"
-      : "building_name = ?";
-    if ($modelFile !== "" && $hasBuildingSource) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE {$nameWhere} AND source_model_file = ?{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
-      if (!$stmt) throw new RuntimeException("Failed to prepare building-name lookup");
-      if ($hasObjectName) $stmt->bind_param("sss", $buildingName, $buildingName, $modelFile);
-      else $stmt->bind_param("ss", $buildingName, $modelFile);
-      if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
-      $res = $stmt->get_result();
-      $row = $res ? $res->fetch_assoc() : null;
-      $stmt->close();
-      if ($row) return $row;
-      return null;
+    if ($buildingName !== "" && ($buildingName === $name || $buildingName === $objectName)) {
+      return $row;
     }
-
-    $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE {$nameWhere}{$wherePresent} ORDER BY " . ($hasBuildingId ? "building_id DESC" : "building_name ASC") . " LIMIT 1");
-    if (!$stmt) throw new RuntimeException("Failed to prepare building-name fallback lookup");
-    if ($hasObjectName) $stmt->bind_param("ss", $buildingName, $buildingName);
-    else $stmt->bind_param("s", $buildingName);
-    if (!$stmt->execute()) throw new RuntimeException("Failed to load building");
-    $res = $stmt->get_result();
-    $row = $res ? $res->fetch_assoc() : null;
-    $stmt->close();
-    if ($row) return $row;
   }
-
   return null;
 }
 
@@ -236,22 +180,26 @@ try {
     exit;
   }
 
-  $resolvedBuildingId = isset($building["building_id"]) ? (int)$building["building_id"] : null;
-  $resolvedBuildingName = trim((string)($building["building_name"] ?? $buildingName));
-  $rooms = fetch_rooms_for_building($conn, $currentModel, $resolvedBuildingId, $resolvedBuildingName);
+  $resolvedBuildingId = isset($building["id"]) ? (int)$building["id"] : (isset($building["building_id"]) ? (int)$building["building_id"] : null);
+  $resolvedBuildingName = trim((string)($building["name"] ?? $building["building_name"] ?? $buildingName));
+  $entityType = trim((string)($building["entityType"] ?? "building")) ?: "building";
+  $rooms = $entityType === "facility" ? [] : fetch_rooms_for_building($conn, $currentModel, $resolvedBuildingId, $resolvedBuildingName);
 
   echo json_encode([
     "ok" => true,
     "found" => true,
     "modelFile" => $currentModel,
-    "building" => [
-      "id" => $resolvedBuildingId,
-      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
-      "name" => $resolvedBuildingName,
-      "objectName" => trim((string)($building["model_object_name"] ?? $resolvedBuildingName)),
+      "building" => [
+        "id" => $resolvedBuildingId,
+      "buildingUid" => trim((string)($building["buildingUid"] ?? $building["building_uid"] ?? "")),
+        "name" => $resolvedBuildingName,
+      "objectName" => trim((string)($building["objectName"] ?? $building["model_object_name"] ?? $resolvedBuildingName)),
+      "entityType" => $entityType,
       "description" => trim((string)($building["description"] ?? "")),
-      "imagePath" => trim((string)($building["image_path"] ?? "")),
-      "modelFile" => trim((string)($building["source_model_file"] ?? ""))
+      "imagePath" => trim((string)($building["imagePath"] ?? $building["image_path"] ?? "")),
+      "modelFile" => trim((string)($building["modelFile"] ?? $building["source_model_file"] ?? "")),
+      "location" => trim((string)($building["location"] ?? "")),
+      "contactInfo" => trim((string)($building["contactInfo"] ?? ""))
     ],
     "rooms" => array_map(static function(array $row): array {
       return [

@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { buildGuideKey, buildGuideStepsFromPoints } from "./guide-utils.js";
+import { splitEntityPrefix } from "./map-entity-utils.js";
 
 const mapStage = document.getElementById("map-stage");
 if (!mapStage) throw new Error("Missing #map-stage");
@@ -43,6 +44,31 @@ const requestedEventId = Number.parseInt(pageUrl.searchParams.get("event") || ""
 const requestedEventAutoRoute = ["1", "true", "yes"].includes(
   String(pageUrl.searchParams.get("autoroute") || "").toLowerCase()
 );
+const requestedDestinationFromSession = String(
+  sessionStorage.getItem("tnts:jumpToDestination")
+  || sessionStorage.getItem("tnts:jumpToBuilding")
+  || ""
+).trim();
+const requestedDestination = String(pageUrl.searchParams.get("destination") || requestedDestinationFromSession).trim();
+let pendingRequestedDestination = requestedDestination;
+
+function clearEventRequestParamsFromUrl() {
+  try {
+    const nextUrl = new URL(window.location.href);
+    let changed = false;
+    if (nextUrl.searchParams.has("event")) {
+      nextUrl.searchParams.delete("event");
+      changed = true;
+    }
+    if (nextUrl.searchParams.has("autoroute")) {
+      nextUrl.searchParams.delete("autoroute");
+      changed = true;
+    }
+    if (!changed) return;
+    const nextHref = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+    window.history.replaceState(window.history.state, "", nextHref);
+  } catch (_) {}
+}
 
 
 // ==========================
@@ -1322,6 +1348,7 @@ let activeRoutesByKey = new Map(); // normalized name -> { name, mode, names|poi
 let activeGuidesByKey = new Map(); // guide key -> published guide entry
 let routeNamesForSearch = [];      // display names
 let dbBuildingNamesForSearch = []; // DB building names
+let dbTopLevelEntriesForSearch = [];
 let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
 let dbBuildingsByKey = new Map();  // normalized building name -> metadata
 let dbBuildingsByUid = new Map();  // stable uid -> metadata
@@ -1861,12 +1888,47 @@ function buildDirectionsTarget() {
   if (selectedBuildingName) {
     const meta = getDbBuildingMeta(selectedBuildingName);
     return {
-      type: "building",
+      type: String(meta?.entityType || "building").trim() || "building",
       buildingName: selectedBuildingName,
       buildingUid: normalizeBuildingUid(meta?.buildingUid || ""),
       objectName: String(meta?.objectName || "").trim(),
       roomName: ""
     };
+  }
+  return null;
+}
+
+function getRouteEntryForTarget(target) {
+  if (!target) return null;
+  if (typeof target === "string") return getRouteEntryForBuilding(target);
+
+  const candidateKeys = new Set();
+  const buildingUid = normalizeBuildingUid(target.buildingUid || "");
+  if (buildingUid) candidateKeys.add(buildingUid);
+
+  const rawNames = [
+    target.buildingName,
+    target.objectName
+  ].filter(Boolean);
+
+  for (const value of rawNames) {
+    for (const key of getBuildingLookupKeys(value)) {
+      candidateKeys.add(key);
+    }
+  }
+
+  for (const value of rawNames) {
+    const meta = getDbBuildingMeta(value);
+    if (!meta) continue;
+    const metaUid = normalizeBuildingUid(meta?.buildingUid || "");
+    if (metaUid) candidateKeys.add(metaUid);
+    for (const key of getBuildingLookupKeys(meta?.name || "")) candidateKeys.add(key);
+    for (const key of getBuildingLookupKeys(meta?.objectName || "")) candidateKeys.add(key);
+  }
+
+  for (const key of candidateKeys) {
+    const entry = activeRoutesByKey.get(key);
+    if (entry) return entry;
   }
   return null;
 }
@@ -2142,7 +2204,10 @@ function registerDbBuildingMeta(entry) {
   const normalizedEntry = {
     ...entry,
     buildingUid: normalizedUid,
-    objectName: String(entry?.objectName || "").trim()
+    objectName: String(entry?.objectName || "").trim(),
+    entityType: String(entry?.entityType || "building").trim() || "building",
+    location: String(entry?.location || "").trim(),
+    contactInfo: String(entry?.contactInfo || "").trim()
   };
   if (normalizedUid && !dbBuildingsByUid.has(normalizedUid)) {
     dbBuildingsByUid.set(normalizedUid, normalizedEntry);
@@ -2174,6 +2239,16 @@ function getDbBuildingMeta(nameOrUid) {
 
 function getDisplayBuildingName(name) {
   return String(getDbBuildingMeta(name)?.name || name || "").trim();
+}
+
+function getDestinationEntityType(name) {
+  return String(getDbBuildingMeta(name)?.entityType || "building").trim() || "building";
+}
+
+function getEntityTypeLabel(entityType) {
+  const safe = String(entityType || "building").trim().toLowerCase();
+  if (!safe) return "destination";
+  return safe.replace(/_/g, " ");
 }
 
 function getRouteEntryForBuilding(name) {
@@ -2229,18 +2304,24 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbBuildingsByUid = new Map();
     dbRoomsByKey = new Map();
     dbBuildingNamesForSearch = [];
+    dbTopLevelEntriesForSearch = [];
     for (const raw of buildings) {
       const name = String(raw?.name || "").trim();
       if (!name) continue;
-      registerDbBuildingMeta({
+      const entry = {
         id: raw?.id ?? null,
         buildingUid: raw?.buildingUid ?? "",
         name,
         objectName: String(raw?.objectName || "").trim(),
+        entityType: String(raw?.entityType || "building").trim() || "building",
         description: String(raw?.description || "").trim(),
         imagePath: String(raw?.imagePath || "").trim(),
-        modelFile: String(raw?.modelFile || "").trim()
-      });
+        modelFile: String(raw?.modelFile || "").trim(),
+        location: String(raw?.location || "").trim(),
+        contactInfo: String(raw?.contactInfo || "").trim()
+      };
+      registerDbBuildingMeta(entry);
+      dbTopLevelEntriesForSearch.push(entry);
       dbBuildingNamesForSearch.push(name);
     }
 
@@ -2275,9 +2356,20 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     if (loadedModel && String(pendingSearchQuery || "").trim()) {
       handleSearchSelect(pendingSearchQuery);
     }
+    if (loadedModel && pendingRequestedDestination && requestedEventId <= 0) {
+      const destinationQuery = String(pendingRequestedDestination).trim();
+      pendingRequestedDestination = "";
+      sessionStorage.removeItem("tnts:jumpToDestination");
+      sessionStorage.removeItem("tnts:jumpToBuilding");
+      handleSearchSelect(destinationQuery, { autoRoute: requestedEventAutoRoute });
+    }
+    if (loadedModel && activeEventPayload) {
+      applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: false });
+    }
   } catch (err) {
     console.warn("Search catalog unavailable (route/building-only search remains active):", err);
     dbBuildingNamesForSearch = [];
+    dbTopLevelEntriesForSearch = [];
     dbRoomEntriesForSearch = [];
     dbBuildingsByKey = new Map();
     dbBuildingsByUid = new Map();
@@ -2433,12 +2525,24 @@ function collectSearchCandidates(queryNorm) {
 
   // Route-published buildings (highest confidence for routing).
   for (const name of routeNamesForSearch) {
-    pushCandidate({ type: "building", label: name, buildingName: name });
+    pushCandidate({
+      type: getDestinationEntityType(name),
+      label: name,
+      buildingName: name
+    });
   }
 
-  // DB buildings (may include buildings without published route yet).
-  for (const bName of dbBuildingNamesForSearch) {
-    pushCandidate({ type: "building", label: bName, buildingName: bName });
+  // DB top-level destinations (buildings, venues, areas, landmarks, facilities).
+  for (const entry of dbTopLevelEntriesForSearch) {
+    const bName = String(entry?.name || "").trim();
+    if (!bName) continue;
+    pushCandidate({
+      type: String(entry?.entityType || "building").trim() || "building",
+      label: bName,
+      buildingName: bName,
+      description: String(entry?.description || "").trim(),
+      id: entry?.id ?? null
+    });
   }
 
   // DB rooms -> route by parent building.
@@ -2549,7 +2653,7 @@ function handleSearchSelect(rawValue, opts = {}) {
 
   const candidates = collectSearchCandidates(q);
   if (!candidates.length) {
-    showSearchFeedback("Search", `No rooms or buildings matched "${searchText}".`);
+    showSearchFeedback("Search", `No rooms or destinations matched "${searchText}".`);
     return;
   }
 
@@ -2694,7 +2798,9 @@ function isRoadLikeName(name) {
 function isGroundOrHelperName(name) {
   const loose = normalizeLoose(name);
   if (!loose) return true;
+  const { prefix } = splitEntityPrefix(String(name || ""));
   return (
+    prefix === "OB" ||
     isRoadLikeName(name) ||
     loose === "GROUND" ||
     loose === "FLOOR" ||
@@ -3191,6 +3297,8 @@ function renderCardRoomsList(rooms) {
 async function loadCardBuildingDetails(buildingName) {
   const displayName = getDisplayBuildingName(buildingName) || String(buildingName || "").trim();
   const meta = getDbBuildingMeta(buildingName);
+  const entityType = String(meta?.entityType || "building").trim() || "building";
+  const roomsTitle = entityType === "facility" ? "Linked Rooms" : "Rooms";
   if (!displayName) {
     resetCardRoomsPanel();
     return;
@@ -3204,7 +3312,7 @@ async function loadCardBuildingDetails(buildingName) {
     return;
   }
 
-  setCardRoomsLoading("Loading rooms...");
+  setCardRoomsLoading("Loading details...", roomsTitle);
 
   try {
     const url = new URL(BUILDING_DETAILS_ENDPOINT, window.location.href);
@@ -3216,6 +3324,22 @@ async function loadCardBuildingDetails(buildingName) {
     const data = await res.json();
     if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
     if (requestSeq !== cardDetailsRequestSeq) return;
+
+    const payloadBuilding = data?.building && typeof data.building === "object" ? data.building : null;
+    if (payloadBuilding) {
+      registerDbBuildingMeta({
+        id: payloadBuilding?.id ?? meta?.id ?? null,
+        buildingUid: payloadBuilding?.buildingUid ?? meta?.buildingUid ?? "",
+        name: String(payloadBuilding?.name || displayName).trim(),
+        objectName: String(payloadBuilding?.objectName || meta?.objectName || "").trim(),
+        entityType: String(payloadBuilding?.entityType || entityType).trim() || entityType,
+        description: String(payloadBuilding?.description || meta?.description || "").trim(),
+        imagePath: String(payloadBuilding?.imagePath || meta?.imagePath || "").trim(),
+        modelFile: String(payloadBuilding?.modelFile || meta?.modelFile || "").trim(),
+        location: String(payloadBuilding?.location || meta?.location || "").trim(),
+        contactInfo: String(payloadBuilding?.contactInfo || meta?.contactInfo || "").trim()
+      });
+    }
 
     const rooms = Array.isArray(data.rooms) ? data.rooms : [];
     rooms.forEach((room) => {
@@ -3234,10 +3358,16 @@ async function loadCardBuildingDetails(buildingName) {
       });
     });
     cardRoomsCache.set(cacheKey, rooms);
-    renderCardRoomsList(rooms);
+    renderCardRoomItems(
+      Array.isArray(rooms) ? rooms.map((room) => createCardRoomItem(room)) : [],
+      roomsTitle,
+      entityType === "facility"
+        ? "No linked rooms found for this facility."
+        : "No rooms found for this destination in the published model."
+    );
   } catch (err) {
     if (requestSeq !== cardDetailsRequestSeq) return;
-    setCardRoomsMessage(`Room list unavailable: ${err?.message || err}`);
+    setCardRoomsMessage(`Details unavailable: ${err?.message || err}`, roomsTitle);
   }
 }
 
@@ -3341,10 +3471,12 @@ function showSearchFeedback(title, message) {
 }
 
 function showCard(buildingName) {
+  const meta = getDbBuildingMeta(buildingName);
+  const entityType = String(meta?.entityType || "building").trim() || "building";
+  const typeLabel = getEntityTypeLabel(entityType);
   if (!selectedGuideTarget || normalizeQuery(selectedGuideTarget.buildingName) !== normalizeQuery(buildingName)) {
-    const meta = getDbBuildingMeta(buildingName);
     setSelectedGuideTarget({
-      type: "building",
+      type: entityType,
       buildingName,
       buildingUid: meta?.buildingUid || "",
       objectName: meta?.objectName || "",
@@ -3352,15 +3484,22 @@ function showCard(buildingName) {
     });
   }
   const displayName = getDisplayBuildingName(buildingName) || buildingName;
-  const meta = getDbBuildingMeta(buildingName);
   const description = String(meta?.description || "").trim();
-  const routeAvailable = !!getRouteEntryForBuilding(buildingName);
+  const location = String(meta?.location || "").trim();
+  const contactInfo = String(meta?.contactInfo || "").trim();
+  const routeAvailable = !!getRouteEntryForTarget({
+    buildingName,
+    buildingUid: meta?.buildingUid || "",
+    objectName: meta?.objectName || ""
+  });
+  const detailParts = [description, location && entityType === "facility" ? `Location: ${location}` : "", contactInfo && entityType === "facility" ? `Contact: ${contactInfo}` : ""]
+    .filter(Boolean);
 
   infoCard.classList.remove("hidden");
   cardTitle.textContent = displayName;
-  cardInfo.textContent = description
-    ? `${description} ${routeAvailable ? 'Select "Get Directions" to show the route.' : "No published route for this building."}`
-    : (routeAvailable ? 'Select "Get Directions" to show the route.' : "No published route for this building.");
+  cardInfo.textContent = detailParts.length
+    ? `${detailParts.join(" ")} ${routeAvailable ? `Select "Get Directions" to route to this ${typeLabel}.` : `No published route for this ${typeLabel}.`}`
+    : (routeAvailable ? `Select "Get Directions" to route to this ${typeLabel}.` : `No published route for this ${typeLabel}.`);
   directionsBtn.disabled = !routeAvailable;
   loadCardBuildingDetails(buildingName).catch(() => {});
   return;
@@ -3396,16 +3535,18 @@ closeBtn.addEventListener("click", (event) => {
 });
 
 function activateDirectionsForSelectedBuilding() {
-  if (!loadedModel || !selectedBuildingName) return;
+  const directionsTarget = buildDirectionsTarget();
+  const selectedName = String(selectedBuildingName || directionsTarget?.buildingName || "").trim();
+  if (!loadedModel || !directionsTarget?.buildingName) return;
 
-  const routeEntry = getRouteEntryForBuilding(selectedBuildingName);
+  const routeEntry = getRouteEntryForTarget(directionsTarget);
   if (!routeEntry) {
-    console.warn("No route configured for:", selectedBuildingName);
+    console.warn("No route configured for:", selectedName || directionsTarget.buildingName);
     window.tntsReportClientError?.("route_missing", "No route configured for selected building", {
-      buildingName: selectedBuildingName,
+      buildingName: selectedName || directionsTarget.buildingName,
     });
     hideDirectionsPanel();
-    showCard(selectedBuildingName);
+    if (selectedName) showCard(selectedName);
     return;
   }
 
@@ -3421,7 +3562,7 @@ function activateDirectionsForSelectedBuilding() {
   if (points.length < 2) {
     console.warn("Route points < 2. Check console ROUTE DEBUG MISSING list.");
     window.tntsReportClientError?.("route_incomplete", "Route points are incomplete", {
-      buildingName: selectedBuildingName,
+      buildingName: selectedName || directionsTarget.buildingName,
       pointCount: points.length,
     });
     cardInfo.textContent = "Route data is incomplete for this building.";
@@ -3437,7 +3578,7 @@ function activateDirectionsForSelectedBuilding() {
     hideDirectionsPanel();
     return;
   }
-  showDirectionsPanelForSelection(buildDirectionsTarget(), routeEntry, alignedPoints, routeDistance);
+  showDirectionsPanelForSelection(directionsTarget, routeEntry, alignedPoints, routeDistance);
   clearRouteBtn.disabled = false;
 }
 
@@ -3474,6 +3615,7 @@ function dismissActiveEventContext() {
   activeEventAutoRoute = false;
   clearEventAreaHighlight();
   hideEventFocusCard();
+  clearEventRequestParamsFromUrl();
 }
 
 function renderEventPayloadWithFallbackMessage(message) {
@@ -3501,17 +3643,61 @@ function applyActiveEventToMap({ autoRoute = activeEventAutoRoute, recenter = tr
   }
 
   if (target.type === "specific_area") {
-    renderEventFocusPayload({
-      ...runtimePayload,
-      canMap: true,
-      canRoute: false
-    });
     hideCardAndClear();
     const rawPoint = new THREE.Vector3(Number(target.x) || 0, Number(target.y) || 0, Number(target.z) || 0);
     const alignedPoint = alignPointToModelSurface(rawPoint);
+    const anchorBuildingName = String(target.buildingName || "").trim();
+    const anchorBuildingMeta = anchorBuildingName ? getDbBuildingMeta(anchorBuildingName) : null;
+    const anchorTarget = anchorBuildingName ? {
+      type: String(target.anchorType || anchorBuildingMeta?.entityType || "building").trim() || "building",
+      buildingName: anchorBuildingName,
+      buildingUid: String(target.buildingUid || anchorBuildingMeta?.buildingUid || "").trim(),
+      objectName: String(target.objectName || anchorBuildingMeta?.objectName || "").trim(),
+      roomName: ""
+    } : null;
+    const runtimeCanRoute = !!getRouteEntryForTarget(anchorTarget);
+    if (runtimePayload.canRoute !== runtimeCanRoute) {
+      runtimePayload = {
+        ...runtimePayload,
+        canRoute: runtimeCanRoute,
+        health: runtimeCanRoute ? runtimePayload.health : "limited",
+        healthLabel: runtimeCanRoute ? runtimePayload.healthLabel : "Limited",
+        healthMessage: runtimeCanRoute
+          ? "Directions are available through the linked destination. The exact event spot will still open as a highlight."
+          : (anchorBuildingName
+            ? "This event pin is valid, but no published route is available for its linked destination right now."
+            : "This event will open as a map highlight only.")
+      };
+    }
+    renderEventFocusPayload({
+      ...runtimePayload,
+      canMap: true,
+      canRoute: runtimeCanRoute
+    });
+
+    let selectedAnchor = false;
+    if (anchorBuildingName) {
+      const preferredAnchorName = String(target.objectName || anchorBuildingMeta?.objectName || "").trim();
+      selectedAnchor = (preferredAnchorName
+        ? selectBuildingByName(preferredAnchorName, { showInfoCard: false })
+        : false) || selectBuildingByName(anchorBuildingName, { showInfoCard: false });
+      if (selectedAnchor) {
+        setSelectedGuideTarget({
+          type: anchorTarget?.type || String(target.anchorType || anchorBuildingMeta?.entityType || getDestinationEntityType(anchorBuildingName) || "building").trim() || "building",
+          buildingName: anchorBuildingName,
+          buildingUid: anchorTarget?.buildingUid || "",
+          objectName: anchorTarget?.objectName || "",
+          roomName: ""
+        });
+      }
+    }
+
     renderEventAreaHighlight(alignedPoint, Number(target.radius) || 8);
     if (recenter) {
       focusActiveViewOnPoint(alignedPoint, { distanceScale: 0.16 });
+    }
+    if (autoRoute && runtimeCanRoute && selectedAnchor) {
+      activateDirectionsForSelectedBuilding();
     }
     return;
   }
@@ -3565,7 +3751,7 @@ function applyActiveEventToMap({ autoRoute = activeEventAutoRoute, recenter = tr
   } else {
     const buildingMeta = getDbBuildingMeta(buildingName);
     setSelectedGuideTarget({
-      type: "building",
+      type: String(target.type || buildingMeta?.entityType || "building").trim() || "building",
       buildingName,
       buildingUid: buildingMeta?.buildingUid || "",
       objectName: buildingMeta?.objectName || "",
@@ -3599,6 +3785,7 @@ async function loadRequestedEvent() {
       }
 
       if (!payload?.found || !payload?.event) {
+        clearEventRequestParamsFromUrl();
         showEventNoticeCard("Event unavailable", payload?.message || "This event is unavailable or no longer public.");
         return;
       }
@@ -3610,6 +3797,7 @@ async function loadRequestedEvent() {
         health: String(payload.event.health || "limited").trim(),
         healthLabel: String(payload.event.healthLabel || "Limited").trim(),
       };
+      clearEventRequestParamsFromUrl();
       renderEventFocusPayload(activeEventPayload);
       applyActiveEventToMap({ autoRoute: activeEventAutoRoute, recenter: true });
     } catch (error) {
@@ -3621,6 +3809,7 @@ async function loadRequestedEvent() {
           stack: String(error?.stack || ""),
         },
       });
+      clearEventRequestParamsFromUrl();
       showEventNoticeCard("Event unavailable", error?.message || "The requested event could not be loaded.");
     } finally {
       activeEventLoadPromise = null;

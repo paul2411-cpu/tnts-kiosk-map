@@ -7,6 +7,7 @@ header("Expires: 0");
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
+require_once $ROOT . "/admin/inc/map_entities.php";
 app_logger_set_default_subsystem("api.map_search");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
@@ -25,60 +26,27 @@ $rooms = [];
 $warnings = [];
 
 try {
-  $hasBuildingId = has_column($conn, "buildings", "building_id");
-  $hasBuildingPresent = has_column($conn, "buildings", "is_present_in_latest");
-  $hasBuildingSource = has_column($conn, "buildings", "source_model_file");
-  $hasBuildingUid = has_column($conn, "buildings", "building_uid");
-  $hasObjectName = has_column($conn, "buildings", "model_object_name");
-  $hasBuildingDescription = has_column($conn, "buildings", "description");
-  $hasBuildingImage = has_column($conn, "buildings", "image_path");
-
-  $buildingSql = "SELECT "
-    . ($hasBuildingId ? "building_id" : "NULL AS building_id")
-    . ", " . ($hasBuildingUid ? "building_uid" : "NULL AS building_uid")
-    . ", " . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
-    . ", building_name, "
-    . ($hasBuildingDescription ? "description" : "NULL AS description")
-    . ", " . ($hasBuildingImage ? "image_path" : "NULL AS image_path")
-    . ", " . ($hasBuildingSource ? "source_model_file" : "NULL AS source_model_file")
-    . " FROM buildings WHERE building_name IS NOT NULL AND building_name <> ''";
-  if ($hasBuildingPresent) {
-    $buildingSql .= " AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)";
-  }
-
-  $buildingRows = [];
-  if ($currentModel !== "" && $hasBuildingSource) {
-    $stmt = $conn->prepare($buildingSql . " AND source_model_file = ? ORDER BY building_name ASC");
-    if (!$stmt) throw new RuntimeException("Failed to prepare buildings query");
-    $stmt->bind_param("s", $currentModel);
-    if (!$stmt->execute()) throw new RuntimeException("Failed to load buildings");
-    $res = $stmt->get_result();
-    if ($res instanceof mysqli_result) {
-      while ($row = $res->fetch_assoc()) $buildingRows[] = $row;
-    }
-    $stmt->close();
-  } else {
-    $res = $conn->query($buildingSql . " ORDER BY building_name ASC");
-    if (!($res instanceof mysqli_result)) throw new RuntimeException("Failed to load buildings");
-    while ($row = $res->fetch_assoc()) $buildingRows[] = $row;
-  }
-
   $seenBuildings = [];
-  foreach ($buildingRows as $row) {
-    $name = trim((string)($row["building_name"] ?? ""));
+  foreach (map_entities_fetch_model_destinations($conn, $currentModel, true) as $row) {
+    $name = trim((string)($row["name"] ?? ""));
     if ($name === "") continue;
-    $key = mb_strtolower($name);
+    $objectName = trim((string)($row["objectName"] ?? ""));
+    $entityType = trim((string)($row["entityType"] ?? "building")) ?: "building";
+    $key = mb_strtolower($entityType . "|" . ($objectName !== "" ? $objectName : $name));
     if (isset($seenBuildings[$key])) continue;
     $seenBuildings[$key] = true;
 
     $buildings[] = [
-      "id" => isset($row["building_id"]) ? (int)$row["building_id"] : null,
-      "buildingUid" => trim((string)($row["building_uid"] ?? "")),
+      "id" => isset($row["id"]) ? (int)$row["id"] : null,
+      "buildingUid" => trim((string)($row["buildingUid"] ?? "")),
       "name" => $name,
-      "objectName" => trim((string)($row["model_object_name"] ?? $name)),
+      "objectName" => $objectName !== "" ? $objectName : $name,
+      "entityType" => $entityType,
       "description" => trim((string)($row["description"] ?? "")),
-      "imagePath" => trim((string)($row["image_path"] ?? "")),
-      "modelFile" => trim((string)($row["source_model_file"] ?? ""))
+      "imagePath" => trim((string)($row["imagePath"] ?? "")),
+      "modelFile" => trim((string)($row["modelFile"] ?? "")),
+      "location" => trim((string)($row["location"] ?? "")),
+      "contactInfo" => trim((string)($row["contactInfo"] ?? ""))
     ];
   }
 

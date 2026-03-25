@@ -1,8 +1,9 @@
 ﻿<?php
 require_once __DIR__ . "/inc/auth.php";
-require_admin();
+require_admin_permission("manage_map", "You do not have access to the map tools.");
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/building_identity.php";
+require_once __DIR__ . "/inc/map_entities.php";
 app_logger_set_default_subsystem("map_editor");
 
 $ASSET_DIR = __DIR__ . "/assets_map";
@@ -493,7 +494,7 @@ function editor_ensure_snapshot_schema(mysqli $conn): void {
   if (!editor_db_col($conn, "rooms", "is_present_in_latest")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
   if (!editor_db_col($conn, "rooms", "last_edited_at")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!editor_db_col($conn, "rooms", "last_edited_by_admin_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
-  map_identity_ensure_schema($conn);
+  map_entities_ensure_schema($conn);
 }
 
 function editor_get_or_create_version_id(mysqli $conn, string $modelFile, string $modelHash): int {
@@ -1226,19 +1227,22 @@ if (isset($_GET["action"])) {
 
     try {
       editor_ensure_snapshot_schema($conn);
-      $rows = map_identity_fetch_model_buildings($conn, $safe, true);
+      $rows = map_entities_fetch_model_destinations($conn, $safe, true);
       $items = [];
       foreach ($rows as $row) {
-        $name = trim((string)($row["building_name"] ?? ""));
+        $name = trim((string)($row["name"] ?? $row["building_name"] ?? ""));
         if ($name === "") continue;
         $items[] = [
-          "id" => isset($row["building_id"]) ? (int)$row["building_id"] : null,
-          "buildingUid" => map_identity_normalize_uid((string)($row["building_uid"] ?? "")),
+          "id" => isset($row["id"]) ? (int)$row["id"] : (isset($row["building_id"]) ? (int)$row["building_id"] : null),
+          "buildingUid" => map_identity_normalize_uid((string)($row["buildingUid"] ?? $row["building_uid"] ?? "")),
           "name" => $name,
-          "objectName" => trim((string)($row["model_object_name"] ?? $name)),
+          "objectName" => trim((string)($row["objectName"] ?? $row["model_object_name"] ?? $name)),
+          "entityType" => trim((string)($row["entityType"] ?? "building")) ?: "building",
           "description" => trim((string)($row["description"] ?? "")),
-          "imagePath" => trim((string)($row["image_path"] ?? "")),
-          "modelFile" => trim((string)($row["source_model_file"] ?? $safe))
+          "imagePath" => trim((string)($row["imagePath"] ?? $row["image_path"] ?? "")),
+          "modelFile" => trim((string)($row["modelFile"] ?? $row["source_model_file"] ?? $safe)),
+          "location" => trim((string)($row["location"] ?? "")),
+          "contactInfo" => trim((string)($row["contactInfo"] ?? "")),
         ];
       }
       echo json_encode(["ok" => true, "model" => $safe, "buildings" => $items], JSON_PRETTY_PRINT);
@@ -2145,6 +2149,7 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { buildGuideKey, buildGuideStepsFromPoints, buildRouteSignature } from "../js/guide-utils.js";
+import { buildRoomNormalizationContext, classifyTopLevelObjectName, parseRoomObjectName } from "../js/map-entity-utils.js";
 
 const CSRF_TOKEN = <?= json_encode($MAP_EDITOR_CSRF) ?>;
 const MAP_IMPORT_CSRF_TOKEN = <?= json_encode($MAP_IMPORT_CSRF) ?>;
@@ -3372,6 +3377,33 @@ function normalizeBuildingObjectName(name) {
   return normalizeBuildingName(normalized || name);
 }
 
+function normalizeDestinationEntityType(type) {
+  const safe = String(type || "").trim().toLowerCase();
+  if (["building", "venue", "area", "landmark", "facility"].includes(safe)) return safe;
+  return "building";
+}
+
+function inferDestinationEntityType({ objectName = "", buildingName = "", catalogEntry = null } = {}) {
+  const fromCatalog = normalizeDestinationEntityType(catalogEntry?.entityType || "");
+  if (fromCatalog && fromCatalog !== "building") return fromCatalog;
+  const classified = classifyTopLevelObjectName(String(objectName || buildingName || "").trim());
+  if (classified?.include && classified?.entityType) {
+    return normalizeDestinationEntityType(classified.entityType);
+  }
+  return normalizeDestinationEntityType(catalogEntry?.entityType || "building");
+}
+
+function getRoadAttachPolicy(entityType) {
+  const safeType = normalizeDestinationEntityType(entityType);
+  if (safeType === "building" || safeType === "venue") {
+    return { entityType: safeType, attachable: true, blocking: true, maxLinks: 1 };
+  }
+  if (safeType === "area") {
+    return { entityType: safeType, attachable: true, blocking: false, maxLinks: 1 };
+  }
+  return { entityType: safeType, attachable: false, blocking: false, maxLinks: 0 };
+}
+
 function resetModelBuildingCatalog() {
   modelBuildingCatalog = [];
   modelBuildingsByUid = new Map();
@@ -3385,6 +3417,7 @@ function registerModelBuildingCatalogEntry(rawEntry = {}) {
     buildingUid: normalizeBuildingUid(rawEntry?.buildingUid),
     name: String(rawEntry?.name || "").trim(),
     objectName: String(rawEntry?.objectName || rawEntry?.name || "").trim(),
+    entityType: normalizeDestinationEntityType(rawEntry?.entityType || rawEntry?.destinationType || ""),
     description: String(rawEntry?.description || "").trim(),
     imagePath: String(rawEntry?.imagePath || "").trim(),
     modelFile: String(rawEntry?.modelFile || "").trim()
@@ -3458,11 +3491,38 @@ function getModelBuildingCatalogEntry({ buildingUid = "", buildingName = "", obj
 
 function resolveBuildingIdentity({ buildingUid = "", buildingName = "", objectName = "" } = {}) {
   const entry = getModelBuildingCatalogEntry({ buildingUid, buildingName, objectName });
+  const resolvedObjectName = String(objectName || entry?.objectName || buildingName || entry?.name || "").trim();
+  const resolvedBuildingName = String(buildingName || entry?.name || objectName || entry?.objectName || "").trim();
   return {
     buildingUid: normalizeBuildingUid(buildingUid || entry?.buildingUid || ""),
-    buildingName: String(buildingName || entry?.name || objectName || entry?.objectName || "").trim(),
-    objectName: String(objectName || entry?.objectName || buildingName || entry?.name || "").trim(),
+    buildingName: resolvedBuildingName,
+    objectName: resolvedObjectName,
+    entityType: inferDestinationEntityType({
+      objectName: resolvedObjectName,
+      buildingName: resolvedBuildingName,
+      catalogEntry: entry || null
+    }),
     catalogEntry: entry || null
+  };
+}
+
+function resolveAttachTargetIdentity(input = {}) {
+  const raw = (typeof input === "string")
+    ? { buildingName: input, objectName: input }
+    : (input && typeof input === "object" ? input : {});
+  const resolved = resolveBuildingIdentity(raw);
+  const entityType = normalizeDestinationEntityType(raw?.entityType || resolved.entityType || "");
+  const key = buildBuildingIdentityKey({
+    buildingUid: resolved.buildingUid,
+    buildingName: resolved.buildingName,
+    objectName: resolved.objectName
+  });
+  const policy = getRoadAttachPolicy(entityType);
+  return {
+    ...resolved,
+    entityType,
+    key,
+    attachPolicy: policy
   };
 }
 
@@ -3605,89 +3665,79 @@ function buildExportEntityExtraction(sceneRoot) {
   if (!sceneRoot) return [];
 
   const buildingEntries = new Map();
-  const canonicalBaseSet = new Set();
-  const canonicalByBuilding = new Map();
-  const compactByBaseCount = new Map();
+  const roomSources = [];
 
   sceneRoot.traverse((obj) => {
     if (!obj) return;
     const root = getTopLevelNamedAncestorForScene(obj, sceneRoot);
     if (!root || !root.name) return;
-    const buildingName = normalizeExportBuildingName(root.name);
-    if (!buildingName) return;
+    const rootMeta = classifyTopLevelObjectName(root.name);
+    if (!rootMeta?.include) return;
+    const entryKey = String(rootMeta.baseName || root.name || "").trim();
+    if (!entryKey) return;
 
-    let entry = buildingEntries.get(buildingName);
+    let entry = buildingEntries.get(entryKey);
     if (!entry) {
-      entry = { name: buildingName, roomCandidates: [] };
-      buildingEntries.set(buildingName, entry);
+      entry = {
+        name: String(rootMeta.displayName || rootMeta.baseName || root.name || "").trim(),
+        objectName: String(rootMeta.baseName || root.name || "").trim(),
+        classification: String(rootMeta.entityType || "building").trim() || "building",
+        bucket: String(rootMeta.bucket || "buildings"),
+        roomEntries: []
+      };
+      buildingEntries.set(entryKey, entry);
     }
 
     if (!obj.name) return;
-    const parsed = parseExportRoomCandidate(obj.name);
-    if (!parsed) return;
-
-    const row = {
-      buildingName,
-      parsed,
-      oldName: String(obj.name),
-      finalName: ""
-    };
-    entry.roomCandidates.push(row);
-
-    if (parsed.kind === "plain" || parsed.kind === "explicit_suffix" || parsed.kind === "loader_suffix") {
-      canonicalBaseSet.add(parsed.baseDigits);
-      if (!canonicalByBuilding.has(buildingName)) canonicalByBuilding.set(buildingName, new Set());
-      canonicalByBuilding.get(buildingName).add(parsed.baseDigits);
-    }
-    if (parsed.kind === "compact_suffix") {
-      compactByBaseCount.set(parsed.baseDigits, (compactByBaseCount.get(parsed.baseDigits) || 0) + 1);
-    }
+    roomSources.push({ entry, object: obj, buildingName: entry.name });
   });
+
+  const roomContext = buildRoomNormalizationContext(roomSources.map((row) => ({
+    name: row?.object?.name || "",
+    buildingName: row?.buildingName || ""
+  })));
+
+  for (const row of roomSources) {
+    const entry = row?.entry;
+    const obj = row?.object;
+    const buildingName = String(row?.buildingName || "").trim();
+    if (!entry || !obj?.name || !buildingName) continue;
+
+    const parsed = parseRoomObjectName(obj.name, {
+      canonicalBaseSet: roomContext.canonicalBaseSet,
+      canonicalByBuilding: roomContext.canonicalByBuilding,
+      compactByBaseCount: roomContext.compactByBaseCount,
+      buildingName
+    });
+    if (!parsed) continue;
+
+    entry.roomEntries.push({
+      name: String(parsed.roomName || "").trim(),
+      objectName: String(parsed.objectName || obj.name || "").trim(),
+      roomNumber: String(parsed.roomNumber || "").trim()
+    });
+  }
 
   const buildingsOut = [];
   for (const entry of buildingEntries.values()) {
     const roomMap = new Map();
-    for (const row of entry.roomCandidates) {
-      const p = row.parsed;
-      let finalDigits = p.originalDigits;
-
-      if (p.kind === "plain") {
-        finalDigits = p.baseDigits;
-      } else if (p.kind === "explicit_suffix") {
-        finalDigits = p.baseDigits;
-      } else if (p.kind === "compact_suffix") {
-        const suffixNum = Number(p.suffixDigits);
-        const compactLooksLikeDuplicate = p.baseDigits.length >= 1 && p.baseDigits.length <= 4 && suffixNum >= 1 && suffixNum <= 999;
-        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
-        const sameBuildingEvidence = canonicalByBuilding.get(entry.name)?.has(p.baseDigits) || false;
-        const repeatedCompactBase = (compactByBaseCount.get(p.baseDigits) || 0) >= 2;
-        if (compactLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence || repeatedCompactBase)) {
-          finalDigits = p.baseDigits;
-        }
-      } else if (p.kind === "loader_suffix") {
-        const suffixNum = Number(p.suffixDigits);
-        const loaderLooksLikeDuplicate =
-          p.baseDigits.length >= 1 &&
-          p.baseDigits.length <= 4 &&
-          suffixNum >= 1 &&
-          suffixNum <= 999;
-        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
-        const sameBuildingEvidence = canonicalByBuilding.get(entry.name)?.has(p.baseDigits) || false;
-        if (loaderLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence)) {
-          finalDigits = p.baseDigits;
-        }
-      }
-
-      row.finalName = `ROOM ${finalDigits}`;
-      if (!roomMap.has(row.finalName)) {
-        roomMap.set(row.finalName, { name: row.finalName });
-      }
+    for (const row of entry.roomEntries) {
+      const roomKey = String(row.objectName || row.name || "").trim().toLowerCase();
+      if (!roomKey || roomMap.has(roomKey)) continue;
+      roomMap.set(roomKey, {
+        name: row.name,
+        objectName: row.objectName,
+        roomNumber: row.roomNumber
+      });
     }
 
     const rooms = Array.from(roomMap.values()).sort((a, b) => a.name.localeCompare(b.name));
     buildingsOut.push({
       name: entry.name,
-      classification: rooms.length ? "building" : "unclassified",
+      objectName: entry.objectName,
+      bucket: entry.bucket,
+      entityType: entry.classification,
+      classification: rooms.length ? entry.classification : entry.classification,
       rooms
     });
   }
@@ -3928,7 +3978,7 @@ function buildGuideDestinationCatalog(routes = savedRoutes) {
   const destinations = [];
   const buildings = Array.from(byBuilding.values()).sort((a, b) => a.buildingName.localeCompare(b.buildingName));
   for (const building of buildings) {
-    const destinationType = building.classification === "unclassified" ? "site" : "building";
+      const destinationType = String(building.classification || "building").trim() || "building";
       destinations.push({
         destinationType,
         buildingName: building.buildingName,
@@ -4612,12 +4662,13 @@ function findKioskStartPointId() {
 function getRoadMetaBuildingIdentity(meta) {
   if (!meta || isKioskMeta(meta)) return null;
   const building = (meta.building && typeof meta.building === "object") ? meta.building : {};
-  const resolved = resolveBuildingIdentity({
+  const resolved = resolveAttachTargetIdentity({
     buildingUid: building.uid || meta.buildingUid || meta.destinationUid || "",
     buildingName: building.name || meta.buildingName || meta.name || "",
-    objectName: building.objectName || meta.objectName || meta.modelObjectName || ""
+    objectName: building.objectName || meta.objectName || meta.modelObjectName || "",
+    entityType: building.type || meta.entityType || ""
   });
-  const key = buildBuildingIdentityKey(resolved);
+  const key = String(resolved.key || "").trim();
   if (!key) return null;
   return {
     ...resolved,
@@ -5827,6 +5878,32 @@ function getBuildingRootFromObject(obj) {
   return getTopLevelNamedAncestor(obj);
 }
 
+function getRoadAttachTargetForObject(obj) {
+  const root = getBuildingRootFromObject(obj);
+  if (!root || !root.name) return null;
+  const classified = classifyTopLevelObjectName(root.name);
+  const catalogEntry = getModelBuildingCatalogEntry({
+    buildingName: root.name,
+    objectName: root.name
+  });
+  if (!catalogEntry && classified && classified.include === false) return null;
+  const identity = resolveAttachTargetIdentity({
+    buildingName: root.name,
+    objectName: root.name
+  });
+  const policy = identity.attachPolicy || getRoadAttachPolicy(identity.entityType);
+  if (!identity.key && !identity.objectName && !identity.buildingName) return null;
+  return {
+    root,
+    identity,
+    policy,
+    name: String(identity.buildingName || identity.objectName || root.name || "").trim(),
+    objectName: String(identity.objectName || root.name || "").trim(),
+    entityType: normalizeDestinationEntityType(identity.entityType),
+    key: String(identity.key || "").trim()
+  };
+}
+
 function buildLiveRoadSnapSources() {
   const obstacles = [];
   const buildings = [];
@@ -5842,17 +5919,23 @@ function buildLiveRoadSnapSources() {
     if (!obj) return;
     if (obj.userData?.isPlaced) return;
     if (isGroundLikeName(obj.name)) return;
-    const root = getTopLevelNamedAncestor(obj);
-    if (!root || !root.name) return;
-    if (byName.has(root.name)) return;
-    byName.set(root.name, root);
+    const target = getRoadAttachTargetForObject(obj);
+    if (!target || !target.policy?.attachable) return;
+    if (byName.has(target.key)) return;
+    byName.set(target.key, target);
   });
-  for (const [name, obj] of byName.entries()) {
+  for (const target of byName.values()) {
+    const obj = target.root;
     const box = new THREE.Box3().setFromObject(obj);
     if (box.isEmpty()) continue;
     box.getSize(tmpSize);
     if (isGroundObjectOrChild(obj)) continue;
-    buildings.push({ name, obj, box, center: box.getCenter(new THREE.Vector3()) });
+    buildings.push({
+      ...target,
+      obj,
+      box,
+      center: box.getCenter(new THREE.Vector3())
+    });
   }
 
   // Obstacles (for hard-stop collisions) Ã¢â‚¬â€ use collider meshes when available
@@ -5860,6 +5943,8 @@ function buildLiveRoadSnapSources() {
   const addObstacle = (mesh) => {
     if (!mesh) return;
     if (seenObstacle.has(mesh.uuid)) return;
+    const target = getRoadAttachTargetForObject(mesh);
+    if (!target || !target.policy?.blocking) return;
     const box = new THREE.Box3().setFromObject(mesh);
     if (box.isEmpty()) return;
     box.getSize(tmpSize);
@@ -5868,7 +5953,7 @@ function buildLiveRoadSnapSources() {
     seenObstacle.add(mesh.uuid);
     meshes.push(mesh);
     obstacles.push({
-      name: getBuildingLabelForObject(mesh),
+      ...target,
       obj: mesh,
       box,
       center: box.getCenter(new THREE.Vector3())
@@ -5900,17 +5985,23 @@ function rebuildRoadSnapBuildingCache() {
     if (!obj) return;
     if (obj.userData?.isPlaced) return;
     if (isGroundLikeName(obj.name)) return;
-    const root = getTopLevelNamedAncestor(obj);
-    if (!root || !root.name) return;
-    if (byName.has(root.name)) return;
-    byName.set(root.name, root);
+    const target = getRoadAttachTargetForObject(obj);
+    if (!target || !target.policy?.attachable) return;
+    if (byName.has(target.key)) return;
+    byName.set(target.key, target);
   });
-  for (const [name, obj] of byName.entries()) {
+  for (const target of byName.values()) {
+    const obj = target.root;
     const box = new THREE.Box3().setFromObject(obj);
     if (box.isEmpty()) continue;
     box.getSize(tmpSize);
     if (isGroundObjectOrChild(obj)) continue;
-    roadSnapBuildingCache.push({ name, obj, box, center: box.getCenter(new THREE.Vector3()) });
+    roadSnapBuildingCache.push({
+      ...target,
+      obj,
+      box,
+      center: box.getCenter(new THREE.Vector3())
+    });
   }
 
   // 2) Obstacles (for hard-stop collisions) Ã¢â‚¬â€ use collider meshes when available
@@ -5923,6 +6014,8 @@ function rebuildRoadSnapBuildingCache() {
     for (const mesh of obstacleMeshes) {
       if (!mesh) continue;
       if (seenObstacle.has(mesh.uuid)) continue;
+      const target = getRoadAttachTargetForObject(mesh);
+      if (!target || !target.policy?.blocking) continue;
       const box = new THREE.Box3().setFromObject(mesh);
       if (box.isEmpty()) continue;
       box.getSize(tmpSize);
@@ -5930,7 +6023,7 @@ function rebuildRoadSnapBuildingCache() {
       if (isGroundObjectOrChild(mesh)) continue;
       seenObstacle.add(mesh.uuid);
       roadSnapObstacleCache.push({
-        name: getBuildingLabelForObject(mesh),
+        ...target,
         obj: mesh,
         box,
         center: box.getCenter(new THREE.Vector3())
@@ -5941,6 +6034,8 @@ function rebuildRoadSnapBuildingCache() {
     campusRoot.traverse((obj) => {
       if (!obj || !obj.isMesh) return;
       if (seenObstacle.has(obj.uuid)) return;
+      const target = getRoadAttachTargetForObject(obj);
+      if (!target || !target.policy?.blocking) return;
       const box = new THREE.Box3().setFromObject(obj);
       if (box.isEmpty()) return;
       box.getSize(tmpSize);
@@ -5948,7 +6043,7 @@ function rebuildRoadSnapBuildingCache() {
       if (isGroundObjectOrChild(obj)) return;
       seenObstacle.add(obj.uuid);
       roadSnapObstacleCache.push({
-        name: getBuildingLabelForObject(obj),
+        ...target,
         obj,
         box,
         center: box.getCenter(new THREE.Vector3())
@@ -5957,10 +6052,16 @@ function rebuildRoadSnapBuildingCache() {
   }
 }
 
-function isBuildingLinkTaken(buildingName, exceptPointId = null) {
-  const name = String(buildingName || "").trim();
-  if (!name) return false;
+function isBuildingLinkTaken(target, exceptPointId = null, opts = {}) {
+  const identity = resolveAttachTargetIdentity(target);
+  const key = String(identity.key || "").trim();
+  if (!key) return false;
   const except = exceptPointId ? String(exceptPointId) : null;
+  const maxLinks = Math.max(0, Number(
+    opts?.maxLinks ?? identity?.attachPolicy?.maxLinks ?? getRoadAttachPolicy(identity.entityType).maxLinks
+  ) || 0);
+  if (maxLinks <= 0) return true;
+  let linkCount = 0;
 
   const roads = overlayRoot?.children || [];
   for (const obj of roads) {
@@ -5971,12 +6072,12 @@ function isBuildingLinkTaken(buildingName, exceptPointId = null) {
 
     for (let i = 0; i < metaArr.length; i++) {
       const meta = metaArr[i];
-      if (!meta || isKioskMeta(meta)) continue;
-      const metaName = String(meta?.building?.name || "").trim();
-      if (!metaName || metaName !== name) continue;
+      const metaIdentity = getRoadMetaBuildingIdentity(meta);
+      if (!metaIdentity || metaIdentity.key !== key) continue;
       const pid = (idArr[i] ?? meta.id ?? null);
       if (except && pid && String(pid) === except) continue;
-      return true;
+      linkCount++;
+      if (linkCount >= maxLinks) return true;
     }
   }
   return false;
@@ -6035,7 +6136,8 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
           if (!pt) continue;
 
           const root = getBuildingRootFromObject(obj);
-          const buildingName = root?.name || getBuildingLabelForObject(obj);
+          const target = getRoadAttachTargetForObject(root || obj);
+          if (!target || !target.policy?.blocking) continue;
           let side = "front";
           if (root) {
             const rootBox = new THREE.Box3().setFromObject(root);
@@ -6045,21 +6147,26 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
 
           const outX = pt.x - _roadRayDir.x * backOff;
           const outZ = pt.z - _roadRayDir.z * backOff;
-          const taken = buildingName && isBuildingLinkTaken(buildingName, exceptPointId);
+          const taken = isBuildingLinkTaken(target.identity, exceptPointId, {
+            maxLinks: target.policy?.maxLinks
+          });
 
           raycaster.far = prevFar;
           return {
             x: outX,
             z: outZ,
             buildingObj: root || obj,
-            buildingName: taken ? null : (buildingName || null),
+            buildingName: taken ? null : (target.name || null),
+            objectName: taken ? null : (target.objectName || null),
+            buildingUid: taken ? null : (target.identity?.buildingUid || null),
+            entityType: target.entityType || "building",
             side: taken ? null : side,
           };
         }
         raycaster.far = prevFar;
       }
 
-      let bestHit = null; // { t, buildingName, buildingObj, minX,maxX,minZ,maxZ }
+      let bestHit = null; // { t, target, buildingObj, minX,maxX,minZ,maxZ }
       for (const b of obstacles) {
         if (!b?.box) continue;
         const box = b.box;
@@ -6077,7 +6184,7 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
         if (t < 0 || t > maxLen) continue;
 
         if (!bestHit || t < bestHit.t) {
-          bestHit = { t, buildingName: b.name || null, buildingObj: b.obj, minX, maxX, minZ, maxZ };
+          bestHit = { t, target: b, buildingObj: b.obj, minX, maxX, minZ, maxZ };
         }
       }
 
@@ -6100,13 +6207,18 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
         // Pull slightly back along the ray so we stay OUTSIDE the expanded volume.
         const outX = hitX - dirX * backOff;
         const outZ = hitZ - dirZ * backOff;
-        const taken = bestHit.buildingName && isBuildingLinkTaken(bestHit.buildingName, exceptPointId);
+        const taken = isBuildingLinkTaken(bestHit.target?.identity, exceptPointId, {
+          maxLinks: bestHit.target?.policy?.maxLinks
+        });
 
         return {
           x: outX,
           z: outZ,
           buildingObj: bestHit.buildingObj,
-          buildingName: taken ? null : bestHit.buildingName,
+          buildingName: taken ? null : (bestHit.target?.name || null),
+          objectName: taken ? null : (bestHit.target?.objectName || null),
+          buildingUid: taken ? null : (bestHit.target?.identity?.buildingUid || null),
+          entityType: bestHit.target?.entityType || "building",
           side: taken ? null : side,
         };
       }
@@ -6122,7 +6234,8 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
   let best = null;
   for (const b of buildingList) {
     if (!b?.box) continue;
-    if (b?.name && isBuildingLinkTaken(b.name, exceptPointId)) continue;
+    if (!b?.policy?.attachable) continue;
+    if (isBuildingLinkTaken(b.identity, exceptPointId, { maxLinks: b.policy?.maxLinks })) continue;
     const dSq = distSqPointToBoxXZ(endX, endZ, b.box);
     if (dSq > maxSq) continue;
     if (!best || dSq < best.dSq) best = { ...b, dSq };
@@ -6155,26 +6268,29 @@ function snapRoadEndToBuildingSide(anchorW, endX, endZ, width, opts = null) {
     z,
     buildingObj: best.obj,
     buildingName: best.name,
+    objectName: best.objectName || null,
+    buildingUid: best.identity?.buildingUid || null,
+    entityType: best.entityType || "building",
     side,
   };
 }
 
-function makeBuildingLinkMeta(buildingName, side, pointId) {
-  const resolved = resolveBuildingIdentity({
-    buildingName,
-    objectName: buildingName
-  });
-  const name = String(resolved.buildingName || buildingName || "").trim();
-  const objectName = String(resolved.objectName || buildingName || "").trim();
+function makeBuildingLinkMeta(target, side, pointId) {
+  const resolved = resolveAttachTargetIdentity(target);
+  const name = String(resolved.buildingName || (typeof target === "string" ? target : target?.buildingName) || "").trim();
+  const objectName = String(resolved.objectName || (typeof target === "string" ? target : target?.objectName) || "").trim();
+  const entityType = normalizeDestinationEntityType(resolved.entityType);
   const s = String(side || "").trim();
   const building = {};
   if (name) building.name = name;
   if (objectName) building.objectName = objectName;
   if (resolved.buildingUid) building.uid = resolved.buildingUid;
+  if (entityType) building.type = entityType;
   if (s) building.side = s;
   return {
     id: pointId || null,
     label: (name && s) ? `${name}_${s}` : (name || null),
+    entityType,
     building: Object.keys(building).length ? building : null,
     linkedAt: Date.now(),
   };
@@ -6205,6 +6321,9 @@ function computeSnappedRoadEnd(anchorW, rawOnPlane, opts = {}) {
   if (out && typeof out === "object") {
     out.snapped = false;
     out.buildingName = null;
+    out.objectName = null;
+    out.buildingUid = null;
+    out.entityType = null;
     out.side = null;
   }
 
@@ -6219,6 +6338,9 @@ function computeSnappedRoadEnd(anchorW, rawOnPlane, opts = {}) {
         const hasLink = !!(snap.buildingName && snap.side);
         out.snapped = hasLink;
         out.buildingName = hasLink ? (snap.buildingName || null) : null;
+        out.objectName = hasLink ? (snap.objectName || null) : null;
+        out.buildingUid = hasLink ? (snap.buildingUid || null) : null;
+        out.entityType = hasLink ? (snap.entityType || null) : null;
         out.side = hasLink ? (snap.side || null) : null;
       }
     }
@@ -7688,7 +7810,13 @@ function updateRoadSegmentDrag(event) {
   const snapOut = {};
   const endW = computeSnappedRoadEnd(anchorW, rawOnPlane, { width, out: snapOut, snapSources: liveSources });
   roadSegmentDrag.lastEndWorld = endW;
-  roadSegmentDrag.lastSnap = snapOut?.snapped ? { buildingName: snapOut.buildingName, side: snapOut.side } : null;
+  roadSegmentDrag.lastSnap = snapOut?.snapped ? {
+    buildingName: snapOut.buildingName,
+    objectName: snapOut.objectName,
+    buildingUid: snapOut.buildingUid,
+    entityType: snapOut.entityType,
+    side: snapOut.side
+  } : null;
 
   if (endW) {
     showRoadHoverPreviewSegment(anchorW, endW, width);
@@ -7733,7 +7861,13 @@ function endRoadSegmentDrag(pointerId = null, event = null) {
     const liveSources = roadBuildingSnapEnabled ? buildLiveRoadSnapSources() : null;
     const snapOut = {};
     endWorld = computeSnappedRoadEnd(startWorld, rawOnPlane, { width, out: snapOut, snapSources: liveSources });
-    endSnap = snapOut?.snapped ? { buildingName: snapOut.buildingName, side: snapOut.side } : null;
+    endSnap = snapOut?.snapped ? {
+      buildingName: snapOut.buildingName,
+      objectName: snapOut.objectName,
+      buildingUid: snapOut.buildingUid,
+      entityType: snapOut.entityType,
+      side: snapOut.side
+    } : null;
   }
   if (!endWorld) {
     setStatus("Road: canceled");
@@ -7780,7 +7914,7 @@ function endRoadSegmentDrag(pointerId = null, event = null) {
       }
       if (endSnap?.buildingName && endSnap?.side && Array.isArray(branch.userData?.road?.pointIds) && Array.isArray(branch.userData?.road?.pointMeta)) {
         const pid = branch.userData.road.pointIds[1];
-        branch.userData.road.pointMeta[1] = makeBuildingLinkMeta(endSnap.buildingName, endSnap.side, pid);
+        branch.userData.road.pointMeta[1] = makeBuildingLinkMeta(endSnap, endSnap.side, pid);
       }
       // Auto-intersect on newly created branch segment
       const res = applyAutoIntersectionsForSegment(branch, 0, 1, { event });
@@ -7812,7 +7946,7 @@ function endRoadSegmentDrag(pointerId = null, event = null) {
   const roadData = roadObj.userData.road;
 
   const newId = newRoadPointId();
-  const newMeta = (endSnap?.buildingName && endSnap?.side) ? makeBuildingLinkMeta(endSnap.buildingName, endSnap.side, newId) : null;
+  const newMeta = (endSnap?.buildingName && endSnap?.side) ? makeBuildingLinkMeta(endSnap, endSnap.side, newId) : null;
 
   if (ptsLocal.length === 1) {
     ptsLocal.push(newLocal);
@@ -9548,7 +9682,7 @@ function updatePreviewPosition(event) {
 
   if (previewBox && previewBoxHelper) {
     previewBox.setFromObject(previewRoot);
-    previewBoxHelper.update();
+    previewBoxHelper.updateMatrixWorld(true);
   }
 }
 
@@ -9834,7 +9968,7 @@ renderer.domElement.addEventListener("pointermove", (e) => {
           if (snap?.buildingName && snap?.side) {
             roadData.pointMeta[pointIndex] = keepKiosk
               ? normalizeKioskMeta(existing, pid)
-              : makeBuildingLinkMeta(snap.buildingName, snap.side, pid);
+              : makeBuildingLinkMeta(snap, snap.side, pid);
           } else {
             if (keepKiosk) {
               roadData.pointMeta[pointIndex] = normalizeKioskMeta(existing, pid);

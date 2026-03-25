@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . "/inc/auth.php";
-require_admin();
+require_admin_permission("manage_events", "You do not have access to manage events.");
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/events.php";
 require_once __DIR__ . "/inc/layout.php";
@@ -51,6 +51,7 @@ $publicModelUrl = $publicModel !== ""
   : "../models/tnts_navigation.glb";
 
 $buildingOptions = events_load_building_options($conn, $publicModel);
+$specificAreaAnchorOptions = events_load_building_options($conn, $publicModel, events_route_anchor_entity_types());
 $roomOptions = events_load_room_options($conn, $publicModel);
 $facilityOptions = events_load_facility_options($conn);
 
@@ -62,11 +63,14 @@ $form = [
   "title" => "",
   "description" => "",
   "start_date" => "",
+  "start_time" => "",
   "end_date" => "",
+  "end_time" => "",
   "status" => "draft",
   "location_mode" => "text_only",
   "location" => "",
   "building_id" => "",
+  "specific_area_anchor_building_id" => "",
   "room_id" => "",
   "facility_id" => "",
   "map_model_file" => $publicModel,
@@ -116,11 +120,14 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     "title" => events_trimmed($_POST["title"] ?? "", 150),
     "description" => events_trimmed($_POST["description"] ?? "", 5000),
     "start_date" => trim((string)($_POST["start_date"] ?? "")),
+    "start_time" => events_normalize_time_value($_POST["start_time"] ?? ""),
     "end_date" => trim((string)($_POST["end_date"] ?? "")),
+    "end_time" => events_normalize_time_value($_POST["end_time"] ?? ""),
     "status" => events_normalize_status((string)($_POST["status"] ?? "draft")),
     "location_mode" => events_normalize_location_mode((string)($_POST["location_mode"] ?? "text_only")),
     "location" => events_trimmed($_POST["location"] ?? "", 255),
     "building_id" => trim((string)($_POST["building_id"] ?? "")),
+    "specific_area_anchor_building_id" => trim((string)($_POST["specific_area_anchor_building_id"] ?? "")),
     "room_id" => trim((string)($_POST["room_id"] ?? "")),
     "facility_id" => trim((string)($_POST["facility_id"] ?? "")),
     "map_model_file" => trim((string)($_POST["map_model_file"] ?? $publicModel)),
@@ -140,6 +147,28 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
   }
   if ($form["start_date"] !== "" && $form["end_date"] !== "" && $form["end_date"] < $form["start_date"]) {
     $formErrors[] = "The end date cannot be earlier than the start date.";
+  }
+  $postedStartTime = trim((string)($_POST["start_time"] ?? ""));
+  $postedEndTime = trim((string)($_POST["end_time"] ?? ""));
+  if ($postedStartTime !== "" && $form["start_time"] === "") {
+    $formErrors[] = "The start time must be in HH:MM format.";
+  }
+  if ($postedEndTime !== "" && $form["end_time"] === "") {
+    $formErrors[] = "The end time must be in HH:MM format.";
+  }
+  if (($form["start_time"] === "") xor ($form["end_time"] === "")) {
+    $formErrors[] = "Provide both a start time and end time, or leave both blank for an all-day event.";
+  }
+  if (!$formErrors && $form["start_time"] !== "" && $form["end_time"] !== "") {
+    $rangeCheck = events_resolve_interval([
+      "start_date" => $form["start_date"],
+      "start_time" => $form["start_time"],
+      "end_date" => $form["end_date"],
+      "end_time" => $form["end_time"],
+    ]);
+    if (!$rangeCheck || $rangeCheck["end"] <= $rangeCheck["start"]) {
+      $formErrors[] = "The event end time must be later than the start time.";
+    }
   }
 
   $resolvedBuildingId = 0;
@@ -187,6 +216,16 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     if ($form["map_point_x"] === "" || $form["map_point_y"] === "" || $form["map_point_z"] === "") {
       $formErrors[] = "Please click the map to pick the event area.";
     }
+    $resolvedBuildingId = (int)$form["specific_area_anchor_building_id"];
+    if ($resolvedBuildingId > 0) {
+      $anchor = events_fetch_building_by_id($conn, $resolvedBuildingId);
+      if (!$anchor || !events_is_route_anchor_entity_type((string)($anchor["entity_type"] ?? "building"))) {
+        $formErrors[] = "Please choose a valid route anchor destination.";
+        $resolvedBuildingId = 0;
+      } elseif ($form["location"] === "") {
+        $form["location"] = trim((string)($anchor["building_name"] ?? "") . " - Event area");
+      }
+    }
     if ($form["location"] === "") $form["location"] = "Event area";
     $resolvedMapModelFile = $publicModel !== "" ? $publicModel : trim((string)$form["map_model_file"]);
     $resolvedPointX = $form["map_point_x"];
@@ -201,6 +240,24 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
   if (!is_numeric($form["map_radius"]) || (float)$form["map_radius"] <= 0) $form["map_radius"] = "8";
   if (!empty($_POST["remove_banner"])) $form["banner_path"] = "";
+
+  if (!$formErrors && in_array($form["status"], ["draft", "published"], true)) {
+    $conflict = events_find_overlap_conflict($conn, [
+      "location_mode" => $form["location_mode"],
+      "building_id" => $resolvedBuildingId,
+      "room_id" => $resolvedRoomId,
+      "facility_id" => $resolvedFacilityId,
+      "start_date" => $form["start_date"],
+      "start_time" => $form["start_time"],
+      "end_date" => $form["end_date"],
+      "end_time" => $form["end_time"],
+    ], $eventId);
+    if (is_array($conflict)) {
+      $conflictTitle = trim((string)($conflict["title"] ?? "Another event"));
+      $conflictWhen = events_format_date_label($conflict);
+      $formErrors[] = $conflictTitle . " already overlaps this destination on " . $conflictWhen . ". Choose a different time or location.";
+    }
+  }
 
   if (isset($_FILES["banner_file"]) && (int)($_FILES["banner_file"]["error"] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE) {
     $upload = events_store_banner_upload($_FILES["banner_file"], $ROOT);
@@ -222,7 +279,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     if ($eventId > 0) {
       $stmt = $conn->prepare(
         "UPDATE events SET
-          title = ?, description = NULLIF(?, ''), start_date = ?, end_date = NULLIF(?, ''),
+          title = ?, description = NULLIF(?, ''), start_date = ?, start_time = NULLIF(?, ''), end_date = NULLIF(?, ''), end_time = NULLIF(?, ''),
           location = NULLIF(?, ''), banner_path = NULLIF(?, ''), status = ?, location_mode = ?,
           building_id = NULLIF(?, '0'), room_id = NULLIF(?, '0'), facility_id = NULLIF(?, '0'),
           map_model_file = NULLIF(?, ''), map_point_x = NULLIF(?, ''), map_point_y = NULLIF(?, ''),
@@ -231,7 +288,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
          WHERE event_id = ? LIMIT 1"
       );
       if ($stmt) {
-        $stmt->bind_param("ssssssssssssssssii", $form["title"], $form["description"], $form["start_date"], $form["end_date"], $form["location"], $form["banner_path"], $form["status"], $form["location_mode"], $buildingIdToken, $roomIdToken, $facilityIdToken, $mapModelToken, $pointXToken, $pointYToken, $pointZToken, $radiusToken, $adminId, $eventId);
+        $stmt->bind_param("ssssssssssssssssssii", $form["title"], $form["description"], $form["start_date"], $form["start_time"], $form["end_date"], $form["end_time"], $form["location"], $form["banner_path"], $form["status"], $form["location_mode"], $buildingIdToken, $roomIdToken, $facilityIdToken, $mapModelToken, $pointXToken, $pointYToken, $pointZToken, $radiusToken, $adminId, $eventId);
       }
       $ok = $stmt ? $stmt->execute() : false;
       if ($stmt) $stmt->close();
@@ -243,17 +300,17 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     } else {
       $stmt = $conn->prepare(
         "INSERT INTO events (
-          title, description, start_date, end_date, location, banner_path, status, location_mode,
+          title, description, start_date, start_time, end_date, end_time, location, banner_path, status, location_mode,
           building_id, room_id, facility_id, map_model_file, map_point_x, map_point_y, map_point_z,
           map_radius, last_edited_at, last_edited_by_admin_id
          ) VALUES (
-          ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, '0'),
+          ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, '0'),
           NULLIF(?, '0'), NULLIF(?, '0'), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
           NULLIF(?, ''), NOW(), NULLIF(?, 0)
          )"
       );
       if ($stmt) {
-        $stmt->bind_param("ssssssssssssssssi", $form["title"], $form["description"], $form["start_date"], $form["end_date"], $form["location"], $form["banner_path"], $form["status"], $form["location_mode"], $buildingIdToken, $roomIdToken, $facilityIdToken, $mapModelToken, $pointXToken, $pointYToken, $pointZToken, $radiusToken, $adminId);
+        $stmt->bind_param("ssssssssssssssssssi", $form["title"], $form["description"], $form["start_date"], $form["start_time"], $form["end_date"], $form["end_time"], $form["location"], $form["banner_path"], $form["status"], $form["location_mode"], $buildingIdToken, $roomIdToken, $facilityIdToken, $mapModelToken, $pointXToken, $pointYToken, $pointZToken, $radiusToken, $adminId);
       }
       $ok = $stmt ? $stmt->execute() : false;
       $newEventId = $stmt ? (int)$stmt->insert_id : 0;
@@ -276,11 +333,14 @@ if (!$formErrors && $editId > 0) {
       "title" => (string)($editingRow["title"] ?? ""),
       "description" => (string)($editingRow["description"] ?? ""),
       "start_date" => (string)($editingRow["start_date"] ?? ""),
+      "start_time" => (string)($editingRow["start_time"] ?? ""),
       "end_date" => (string)($editingRow["end_date"] ?? ""),
+      "end_time" => (string)($editingRow["end_time"] ?? ""),
       "status" => events_normalize_status((string)($editingRow["status"] ?? "draft")),
       "location_mode" => events_normalize_location_mode((string)($editingRow["location_mode"] ?? "text_only")),
       "location" => (string)($editingRow["location"] ?? ""),
       "building_id" => (string)($editingRow["building_id"] ?? ""),
+      "specific_area_anchor_building_id" => (string)($editingRow["building_id"] ?? ""),
       "room_id" => (string)($editingRow["room_id"] ?? ""),
       "facility_id" => (string)($editingRow["facility_id"] ?? ""),
       "map_model_file" => (string)($editingRow["map_model_file"] ?? $publicModel),
@@ -458,7 +518,7 @@ admin_layout_start("Events", "events");
   <div class="card">
     <div class="section-title"><?= (int)$form["event_id"] > 0 ? "Edit Event" : "Create Event" ?></div>
     <div class="events-note" style="margin-bottom:12px;">
-      Directions are derived from the selected location mode. Buildings and rooms can route when the current live map has a published route. Specific-area events are highlight-only by design.
+      Directions are derived from the selected location mode. Buildings and rooms can route when the current live map has a published route. Specific-area events can also route when they are pinned to an exact spot and linked to a route-ready area or destination.
     </div>
 
     <form method="post" class="events-form-grid" enctype="multipart/form-data" novalidate>
@@ -491,6 +551,19 @@ admin_layout_start("Events", "events");
         <div class="events-row-stack">
           <div class="label">End Date</div>
           <input class="input" type="date" name="end_date" value="<?= htmlspecialchars((string)$form["end_date"], ENT_QUOTES, "UTF-8") ?>">
+        </div>
+      </div>
+
+      <div class="events-inline-grid">
+        <div class="events-row-stack">
+          <div class="label">Start Time</div>
+          <input class="input" type="time" name="start_time" value="<?= htmlspecialchars((string)$form["start_time"], ENT_QUOTES, "UTF-8") ?>">
+          <div class="events-note">Optional. Leave both time fields blank to treat the event as all-day.</div>
+        </div>
+        <div class="events-row-stack">
+          <div class="label">End Time</div>
+          <input class="input" type="time" name="end_time" value="<?= htmlspecialchars((string)$form["end_time"], ENT_QUOTES, "UTF-8") ?>">
+          <div class="events-note">Timed events need both a start and end time.</div>
         </div>
       </div>
 
@@ -579,7 +652,26 @@ admin_layout_start("Events", "events");
         <div class="events-picker-shell">
           <div class="label">Specific Event Area</div>
           <div class="events-note">
-            Click the public map preview to place a highlight marker for this event. Specific-area events are highlight-only and will not show a directions button on the public side. The saved point is tied to the current public model: <strong><?= htmlspecialchars($publicModel !== "" ? $publicModel : "No public model detected", ENT_QUOTES, "UTF-8") ?></strong>.
+            Click the public map preview to place the exact event spot. You can optionally link that spot to a route-ready area or destination such as Quadrangle so the public map can still offer directions. The saved point is tied to the current public model: <strong><?= htmlspecialchars($publicModel !== "" ? $publicModel : "No public model detected", ENT_QUOTES, "UTF-8") ?></strong>.
+          </div>
+          <div class="events-row-stack">
+            <div class="label">Route Anchor</div>
+            <select class="select" name="specific_area_anchor_building_id" id="specific_area_anchor_building_id">
+              <option value="">Highlight only (no route anchor)</option>
+              <?php foreach ($specificAreaAnchorOptions as $anchor): ?>
+                <?php
+                  $anchorId = (string)((int)($anchor["building_id"] ?? 0));
+                  $anchorName = trim((string)($anchor["building_name"] ?? ""));
+                  $anchorType = trim((string)($anchor["entity_type"] ?? "building"));
+                  $anchorLabel = $anchorName !== "" ? $anchorName : ("Destination #" . $anchorId);
+                  $anchorLabel .= " (" . ucfirst(str_replace("_", " ", $anchorType)) . ")";
+                ?>
+                <option value="<?= htmlspecialchars($anchorId, ENT_QUOTES, "UTF-8") ?>" <?= (string)$form["specific_area_anchor_building_id"] === $anchorId ? "selected" : "" ?>>
+                  <?= htmlspecialchars($anchorLabel, ENT_QUOTES, "UTF-8") ?>
+                </option>
+              <?php endforeach; ?>
+            </select>
+            <div class="events-note">Choose the destination that should supply the route and guide text. The event pin will still show the exact final spot.</div>
           </div>
           <div class="events-picker-stage" id="event-area-picker"></div>
           <div class="events-picker-meta">
@@ -655,6 +747,7 @@ admin_layout_start("Events", "events");
               $scheduleLabel = ucwords(str_replace("_", " ", $schedule));
               $displayLocation = trim((string)($resolution["displayLocation"] ?? $row["location"] ?? ""));
               $summary = trim((string)($resolution["message"] ?? ""));
+              $dateLabel = events_format_date_label($row);
             ?>
             <tr>
               <td>
@@ -672,10 +765,7 @@ admin_layout_start("Events", "events");
                 <div class="events-row-stack">
                   <span class="events-chip schedule-<?= htmlspecialchars($schedule, ENT_QUOTES, "UTF-8") ?>"><?= htmlspecialchars($scheduleLabel, ENT_QUOTES, "UTF-8") ?></span>
                   <div class="events-table-meta">
-                    <?= htmlspecialchars((string)($row["start_date"] ?? "No start date"), ENT_QUOTES, "UTF-8") ?>
-                    <?php if (trim((string)($row["end_date"] ?? "")) !== ""): ?>
-                      to <?= htmlspecialchars((string)$row["end_date"], ENT_QUOTES, "UTF-8") ?>
-                    <?php endif; ?>
+                    <?= htmlspecialchars($dateLabel, ENT_QUOTES, "UTF-8") ?>
                   </div>
                 </div>
               </td>
@@ -725,6 +815,15 @@ admin_layout_start("Events", "events");
   "modelUrl" => $publicModelUrl,
   "modelFile" => $publicModel,
   "enabled" => $publicModel !== "",
+  "routeAnchors" => array_map(static function (array $anchor): array {
+    return [
+      "id" => (int)($anchor["building_id"] ?? 0),
+      "name" => trim((string)($anchor["building_name"] ?? "")),
+      "buildingUid" => trim((string)($anchor["building_uid"] ?? "")),
+      "objectName" => trim((string)($anchor["model_object_name"] ?? "")),
+      "entityType" => trim((string)($anchor["entity_type"] ?? "building")),
+    ];
+  }, $specificAreaAnchorOptions),
 ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>
 </script>
 

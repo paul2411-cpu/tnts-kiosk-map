@@ -1,6 +1,6 @@
 <?php
 require_once __DIR__ . "/inc/auth.php";
-require_admin();
+require_admin_permission("view_error_logs", "You do not have access to view error logs.");
 require_once __DIR__ . "/inc/app_logger.php";
 app_logger_bootstrap(["subsystem" => "error_logs"]);
 require_once __DIR__ . "/inc/layout.php";

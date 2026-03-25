@@ -1,8 +1,10 @@
 <?php
 require_once __DIR__ . "/inc/auth.php";
-require_admin();
+require_admin_permission("manage_map", "You do not have access to the map import tools.");
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/building_identity.php";
+require_once __DIR__ . "/inc/map_entities.php";
+require_once __DIR__ . "/inc/map_naming.php";
 app_logger_set_default_subsystem("map_import");
 
 $MODEL_DIR = __DIR__ . "/../models";
@@ -222,49 +224,7 @@ function import_ensure_schema(mysqli $conn): void {
       KEY idx_date_created (date_created)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
   ");
-
-  if (!import_column_exists($conn, "buildings", "source_model_file")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN source_model_file VARCHAR(255) NULL AFTER image_path");
-  }
-  if (!import_column_exists($conn, "buildings", "first_seen_version_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
-  }
-  if (!import_column_exists($conn, "buildings", "last_seen_version_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
-  }
-  if (!import_column_exists($conn, "buildings", "is_present_in_latest")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
-  }
-
-  if (!import_column_exists($conn, "rooms", "source_model_file")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN source_model_file VARCHAR(255) NULL AFTER description");
-  }
-  if (!import_column_exists($conn, "rooms", "indoor_guide_text")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN indoor_guide_text TEXT NULL AFTER description");
-  }
-  if (!import_column_exists($conn, "rooms", "first_seen_version_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN first_seen_version_id INT NULL AFTER source_model_file");
-  }
-  if (!import_column_exists($conn, "rooms", "last_seen_version_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN last_seen_version_id INT NULL AFTER first_seen_version_id");
-  }
-  if (!import_column_exists($conn, "rooms", "is_present_in_latest")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
-  }
-  if (!import_column_exists($conn, "rooms", "last_edited_at")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
-  }
-  if (!import_column_exists($conn, "rooms", "last_edited_by_admin_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
-  }
-  if (!import_column_exists($conn, "buildings", "last_edited_at")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
-  }
-  if (!import_column_exists($conn, "buildings", "last_edited_by_admin_id")) {
-    import_db_query_or_throw($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
-  }
-
-  map_identity_ensure_schema($conn);
+  map_entities_ensure_schema($conn);
 }
 
 function import_get_or_create_version_id(
@@ -338,6 +298,95 @@ function import_get_or_create_version_id(
 
 function import_copy_text(?string $value): string {
   return trim((string)($value ?? ""));
+}
+
+function import_clean_object_name(string $value, int $max = 255): string {
+  $safe = trim((string)$value);
+  if ($safe === "") return "";
+  return substr($safe, 0, $max);
+}
+
+function import_clean_entity_type(string $value): string {
+  $safe = strtolower(trim((string)$value));
+  if (in_array($safe, ["building", "venue", "area", "landmark", "facility"], true)) {
+    return $safe;
+  }
+  return "building";
+}
+
+function import_clean_bucket(string $value): string {
+  $safe = strtolower(trim((string)$value));
+  if (in_array($safe, ["buildings", "facilities"], true)) return $safe;
+  return "buildings";
+}
+
+function import_resolve_destination_row(array $row): ?array {
+  $name = import_clean_building_name((string)($row["name"] ?? ""));
+  $objectName = import_clean_object_name((string)($row["objectName"] ?? $row["modelObjectName"] ?? ""));
+  $bucket = import_clean_bucket((string)($row["bucket"] ?? ""));
+  $entityType = import_clean_entity_type((string)($row["entityType"] ?? $row["classification"] ?? ""));
+
+  if ($objectName === "" && $name === "") {
+    return null;
+  }
+
+  if ($objectName !== "") {
+    $classified = map_naming_classify_top_level($objectName);
+    if (empty($row["bucket"])) {
+      $bucket = import_clean_bucket((string)($classified["bucket"] ?? $bucket));
+    }
+    if (empty($row["entityType"]) && !empty($classified["entity_type"])) {
+      $entityType = import_clean_entity_type((string)$classified["entity_type"]);
+    }
+    if ($name === "" && !empty($classified["display_name"])) {
+      $name = import_clean_building_name((string)$classified["display_name"]);
+    }
+  }
+
+  if ($bucket === "facilities") {
+    $entityType = "facility";
+  }
+
+  if ($name === "") {
+    $name = $objectName !== "" ? map_naming_humanize_label($objectName) : "";
+    $name = import_clean_building_name($name);
+  }
+
+  if ($name === "") {
+    return null;
+  }
+
+  $rooms = [];
+  $roomsIn = isset($row["rooms"]) && is_array($row["rooms"]) ? $row["rooms"] : [];
+  foreach ($roomsIn as $roomRow) {
+    if (!is_array($roomRow)) continue;
+    $roomName = import_clean_room_name((string)($roomRow["name"] ?? ""));
+    $roomObjectName = import_clean_object_name((string)($roomRow["objectName"] ?? $roomRow["modelObjectName"] ?? ""));
+    $roomNumber = trim((string)($roomRow["roomNumber"] ?? ""));
+    if ($roomName === "" && $roomObjectName !== "") {
+      $parsedRoom = map_naming_parse_room_object($roomObjectName);
+      if (is_array($parsedRoom)) {
+        $roomName = import_clean_room_name((string)($parsedRoom["room_name"] ?? ""));
+        if ($roomNumber === "") $roomNumber = trim((string)($parsedRoom["room_number"] ?? ""));
+      }
+    }
+    if ($roomName === "") continue;
+    $dedupeKey = strtolower($roomObjectName !== "" ? $roomObjectName : $roomName);
+    if (isset($rooms[$dedupeKey])) continue;
+    $rooms[$dedupeKey] = [
+      "name" => $roomName,
+      "objectName" => $roomObjectName,
+      "roomNumber" => substr($roomNumber, 0, 50),
+    ];
+  }
+
+  return [
+    "name" => $name,
+    "objectName" => $objectName !== "" ? $objectName : $name,
+    "bucket" => $bucket,
+    "entityType" => $entityType,
+    "rooms" => array_values($rooms),
+  ];
 }
 
 if (isset($_GET["action"])) {
@@ -581,23 +630,21 @@ if (isset($_GET["action"])) {
       import_json_error(500, "Schema update failed: " . $e->getMessage());
     }
 
+    $destinationsIn = [];
     $totalBuildings = 0;
     $totalRooms = 0;
+    $totalFacilities = 0;
     foreach ($buildingsIn as $buildingRow) {
       if (!is_array($buildingRow)) continue;
-      $buildingName = import_clean_building_name((string)($buildingRow["name"] ?? ""));
-      if ($buildingName === "") continue;
-      if (import_is_road_like_building_name($buildingName)) continue;
-      $totalBuildings++;
-      $roomsIn = isset($buildingRow["rooms"]) && is_array($buildingRow["rooms"]) ? $buildingRow["rooms"] : [];
-      $uniqueRooms = [];
-      foreach ($roomsIn as $roomRow) {
-        if (!is_array($roomRow)) continue;
-        $roomName = import_clean_room_name((string)($roomRow["name"] ?? ""));
-        if ($roomName === "") continue;
-        $uniqueRooms[strtolower($roomName)] = true;
+      $destination = import_resolve_destination_row($buildingRow);
+      if (!$destination) continue;
+      $destinationsIn[] = $destination;
+      if ($destination["bucket"] === "facilities") {
+        $totalFacilities++;
+      } else {
+        $totalBuildings++;
       }
-      $totalRooms += count($uniqueRooms);
+      $totalRooms += count($destination["rooms"]);
     }
 
     $adminId = isset($_SESSION["admin_id"]) ? (int)$_SESSION["admin_id"] : null;
@@ -609,6 +656,8 @@ if (isset($_GET["action"])) {
       "modelHash" => $modelHash,
       "buildingsInserted" => 0,
       "buildingsExisting" => 0,
+      "facilitiesInserted" => 0,
+      "facilitiesExisting" => 0,
       "roomsInserted" => 0,
       "roomsExisting" => 0,
       "buildingsUnclassified" => 0,
@@ -616,6 +665,7 @@ if (isset($_GET["action"])) {
       "skippedBuildingNames" => 0,
       "skippedRoomNames" => 0,
       "buildingsMissingAfterSync" => 0,
+      "facilitiesMissingAfterSync" => 0,
       "roomsMissingAfterSync" => 0
     ];
 
@@ -641,57 +691,86 @@ if (isset($_GET["action"])) {
         SET is_present_in_latest = 0, last_seen_version_id = ?
         WHERE source_model_file = ?
       ");
+      $markFacilitiesNotSeenStmt = $conn->prepare("
+        UPDATE facilities
+        SET is_present_in_latest = 0, last_seen_version_id = ?
+        WHERE source_model_file = ?
+      ");
       $selectBuildingStmt = $conn->prepare("
-        SELECT building_id, building_uid, building_name, model_object_name
+        SELECT building_id, building_uid, building_name, model_object_name, entity_type
         FROM buildings
         WHERE source_model_file = ? AND model_object_name = ?
         LIMIT 1
       ");
       $selectBuildingTemplateStmt = $conn->prepare("
-        SELECT building_uid, building_name, model_object_name, description, image_path, last_edited_at, last_edited_by_admin_id
+        SELECT building_uid, building_name, model_object_name, entity_type, description, image_path, last_edited_at, last_edited_by_admin_id
         FROM buildings
-        WHERE model_object_name = ?
+        WHERE model_object_name = ? OR building_name = ?
         ORDER BY building_id DESC
         LIMIT 1
       ");
       $insertBuildingStmt = $conn->prepare("
-        INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO buildings (building_uid, building_name, model_object_name, entity_type, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateBuildingSeenStmt = $conn->prepare("
         UPDATE buildings
-        SET last_seen_version_id = ?, is_present_in_latest = 1
+        SET last_seen_version_id = ?, is_present_in_latest = 1, entity_type = ?, source_model_file = ?
         WHERE building_id = ?
       ");
+      $selectFacilityStmt = $conn->prepare("
+        SELECT facility_id, facility_name, model_object_name
+        FROM facilities
+        WHERE source_model_file = ? AND model_object_name = ?
+        LIMIT 1
+      ");
+      $selectFacilityTemplateStmt = $conn->prepare("
+        SELECT facility_name, model_object_name, description, logo_path, location, contact_info, last_edited_at, last_edited_by_admin_id
+        FROM facilities
+        WHERE model_object_name = ? OR facility_name = ?
+        ORDER BY facility_id DESC
+        LIMIT 1
+      ");
+      $insertFacilityStmt = $conn->prepare("
+        INSERT INTO facilities (facility_name, model_object_name, description, logo_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id, location, contact_info)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+      ");
+      $updateFacilitySeenStmt = $conn->prepare("
+        UPDATE facilities
+        SET last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
+        WHERE facility_id = ?
+      ");
       $selectRoomStmt = $conn->prepare("
-        SELECT room_id, room_name
+        SELECT room_id, room_name, model_object_name
         FROM rooms
         WHERE source_model_file = ? AND building_id = ?
       ");
       $selectRoomTemplateStmt = $conn->prepare("
-        SELECT room_number, room_type, floor_number, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
+        SELECT room_name, room_number, room_type, floor_number, description, indoor_guide_text, image_path, model_object_name, last_edited_at, last_edited_by_admin_id
         FROM rooms
-        WHERE room_name = ? AND building_name = ?
+        WHERE model_object_name = ? OR (room_name = ? AND building_name = ?)
         ORDER BY room_id DESC
         LIMIT 1
       ");
       $insertRoomStmt = $conn->prepare("
-        INSERT INTO rooms (building_id, building_uid, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO rooms (building_id, building_uid, model_object_name, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateRoomSeenStmt = $conn->prepare("
         UPDATE rooms
-        SET building_id = ?, building_uid = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1
+        SET building_id = ?, building_uid = ?, model_object_name = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
         WHERE room_id = ?
       ");
       $countMissingBuildingsStmt = $conn->prepare("SELECT COUNT(*) AS cnt FROM buildings WHERE source_model_file = ? AND is_present_in_latest = 0");
+      $countMissingFacilitiesStmt = $conn->prepare("SELECT COUNT(*) AS cnt FROM facilities WHERE source_model_file = ? AND is_present_in_latest = 0");
       $countMissingRoomsStmt = $conn->prepare("SELECT COUNT(*) AS cnt FROM rooms WHERE source_model_file = ? AND is_present_in_latest = 0");
 
       if (
-        !$markBuildingsNotSeenStmt || !$markRoomsNotSeenStmt ||
+        !$markBuildingsNotSeenStmt || !$markRoomsNotSeenStmt || !$markFacilitiesNotSeenStmt ||
         !$selectBuildingStmt || !$selectBuildingTemplateStmt || !$insertBuildingStmt || !$updateBuildingSeenStmt ||
+        !$selectFacilityStmt || !$selectFacilityTemplateStmt || !$insertFacilityStmt || !$updateFacilitySeenStmt ||
         !$selectRoomStmt || !$selectRoomTemplateStmt || !$insertRoomStmt || !$updateRoomSeenStmt ||
-        !$countMissingBuildingsStmt || !$countMissingRoomsStmt
+        !$countMissingBuildingsStmt || !$countMissingFacilitiesStmt || !$countMissingRoomsStmt
       ) {
         throw new RuntimeException("Failed to prepare SQL statements");
       }
@@ -704,22 +783,89 @@ if (isset($_GET["action"])) {
       if (!$markRoomsNotSeenStmt->execute()) {
         throw new RuntimeException("Failed to mark stale rooms");
       }
+      $markFacilitiesNotSeenStmt->bind_param("is", $versionId, $modelFile);
+      if (!$markFacilitiesNotSeenStmt->execute()) {
+        throw new RuntimeException("Failed to mark stale facilities");
+      }
 
-      foreach ($buildingsIn as $buildingRow) {
+      foreach ($destinationsIn as $buildingRow) {
         if (!is_array($buildingRow)) continue;
 
-        $buildingNameRaw = isset($buildingRow["name"]) ? (string)$buildingRow["name"] : "";
-        $buildingName = import_clean_building_name($buildingNameRaw);
-        if ($buildingName === "") {
+        $buildingName = import_clean_building_name((string)($buildingRow["name"] ?? ""));
+        $buildingObjectName = import_clean_object_name((string)($buildingRow["objectName"] ?? ""));
+        $bucket = import_clean_bucket((string)($buildingRow["bucket"] ?? ""));
+        $entityType = import_clean_entity_type((string)($buildingRow["entityType"] ?? ""));
+        if ($buildingName === "" || $buildingObjectName === "") {
           $summary["skippedBuildingNames"]++;
           continue;
         }
-        if (import_is_road_like_building_name($buildingName)) {
+        if (import_is_road_like_building_name($buildingName) || import_is_road_like_building_name($buildingObjectName)) {
           $summary["skippedRoadLikeBuildings"]++;
           continue;
         }
 
-        $selectBuildingStmt->bind_param("ss", $modelFile, $buildingName);
+        if ($bucket === "facilities") {
+          $selectFacilityStmt->bind_param("ss", $modelFile, $buildingObjectName);
+          if (!$selectFacilityStmt->execute()) {
+            throw new RuntimeException("Failed to query facilities table");
+          }
+          $facilityResult = $selectFacilityStmt->get_result();
+          $existingFacility = $facilityResult ? $facilityResult->fetch_assoc() : null;
+
+          if ($existingFacility && isset($existingFacility["facility_id"])) {
+            $facilityId = (int)$existingFacility["facility_id"];
+            $updateFacilitySeenStmt->bind_param("isi", $versionId, $modelFile, $facilityId);
+            if (!$updateFacilitySeenStmt->execute()) {
+              throw new RuntimeException("Failed to update facility sync markers: " . $buildingName);
+            }
+            $summary["facilitiesExisting"]++;
+          } else {
+            $facilityDisplayName = $buildingName;
+            $facilityDescription = "";
+            $facilityLogoPath = "";
+            $facilityLocation = "";
+            $facilityContact = "";
+            $facilityEditedAt = null;
+            $facilityEditedBy = null;
+            $selectFacilityTemplateStmt->bind_param("ss", $buildingObjectName, $buildingName);
+            if (!$selectFacilityTemplateStmt->execute()) {
+              throw new RuntimeException("Failed to query facility template");
+            }
+            $templateRes = $selectFacilityTemplateStmt->get_result();
+            $templateRow = $templateRes ? $templateRes->fetch_assoc() : null;
+            if ($templateRow) {
+              $templateDisplayName = import_clean_building_name((string)($templateRow["facility_name"] ?? ""));
+              if ($templateDisplayName !== "") $facilityDisplayName = $templateDisplayName;
+              $facilityDescription = import_copy_text($templateRow["description"] ?? "");
+              $facilityLogoPath = import_copy_text($templateRow["logo_path"] ?? "");
+              $facilityLocation = import_copy_text($templateRow["location"] ?? "");
+              $facilityContact = import_copy_text($templateRow["contact_info"] ?? "");
+              $facilityEditedAt = isset($templateRow["last_edited_at"]) ? (string)$templateRow["last_edited_at"] : null;
+              $facilityEditedBy = isset($templateRow["last_edited_by_admin_id"]) ? (int)$templateRow["last_edited_by_admin_id"] : null;
+            }
+            $insertFacilityStmt->bind_param(
+              "sssssiisiss",
+              $facilityDisplayName,
+              $buildingObjectName,
+              $facilityDescription,
+              $facilityLogoPath,
+              $modelFile,
+              $versionId,
+              $versionId,
+              $facilityEditedAt,
+              $facilityEditedBy,
+              $facilityLocation,
+              $facilityContact
+            );
+            if (!$insertFacilityStmt->execute()) {
+              throw new RuntimeException("Failed to insert facility: " . $buildingName);
+            }
+            $summary["facilitiesInserted"]++;
+          }
+          continue;
+        }
+
+        $selectBuildingStmt->bind_param("ss", $modelFile, $buildingObjectName);
         if (!$selectBuildingStmt->execute()) {
           throw new RuntimeException("Failed to query buildings table");
         }
@@ -748,7 +894,7 @@ if (isset($_GET["action"])) {
             $repairUidStmt->close();
           }
           $summary["buildingsExisting"]++;
-          $updateBuildingSeenStmt->bind_param("ii", $versionId, $buildingId);
+          $updateBuildingSeenStmt->bind_param("issi", $versionId, $entityType, $modelFile, $buildingId);
           if (!$updateBuildingSeenStmt->execute()) {
             throw new RuntimeException("Failed to update building sync markers: " . $buildingName);
           }
@@ -759,7 +905,8 @@ if (isset($_GET["action"])) {
           $buildingEditedAt = null;
           $buildingEditedBy = null;
           $buildingUid = "";
-          $selectBuildingTemplateStmt->bind_param("s", $buildingName);
+          $templateEntityType = $entityType;
+          $selectBuildingTemplateStmt->bind_param("ss", $buildingObjectName, $buildingName);
           if (!$selectBuildingTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query building template");
           }
@@ -769,6 +916,7 @@ if (isset($_GET["action"])) {
             $buildingUid = map_identity_normalize_uid((string)($templateRow["building_uid"] ?? ""));
             $templateDisplayName = import_clean_building_name((string)($templateRow["building_name"] ?? ""));
             if ($templateDisplayName !== "") $buildingDisplayName = $templateDisplayName;
+            $templateEntityType = import_clean_entity_type((string)($templateRow["entity_type"] ?? $entityType));
             $buildingDescription = import_copy_text($templateRow["description"] ?? "");
             $buildingImagePath = import_copy_text($templateRow["image_path"] ?? "");
             $buildingEditedAt = isset($templateRow["last_edited_at"]) ? (string)$templateRow["last_edited_at"] : null;
@@ -778,7 +926,7 @@ if (isset($_GET["action"])) {
             $buildingUid = map_identity_resolve_uid($conn, $buildingName, $modelFile);
           }
 
-          $insertBuildingStmt->bind_param("ssssssiisi", $buildingUid, $buildingDisplayName, $buildingName, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
+          $insertBuildingStmt->bind_param("sssssssiisi", $buildingUid, $buildingDisplayName, $buildingObjectName, $templateEntityType, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
           if (!$insertBuildingStmt->execute()) {
             throw new RuntimeException("Failed to insert building: " . $buildingName);
           }
@@ -801,30 +949,31 @@ if (isset($_GET["action"])) {
           throw new RuntimeException("Failed to query rooms table");
         }
         $roomResult = $selectRoomStmt->get_result();
-        $existingRoomsByName = [];
+        $existingRoomsByKey = [];
         if ($roomResult) {
           while ($row = $roomResult->fetch_assoc()) {
-            $n = isset($row["room_name"]) ? strtolower(trim((string)$row["room_name"])) : "";
-            if ($n !== "") $existingRoomsByName[$n] = (int)($row["room_id"] ?? 0);
+            $existingObjectName = import_clean_object_name((string)($row["model_object_name"] ?? ""));
+            $existingRoomName = isset($row["room_name"]) ? strtolower(trim((string)$row["room_name"])) : "";
+            if ($existingObjectName !== "") $existingRoomsByKey[strtolower($existingObjectName)] = (int)($row["room_id"] ?? 0);
+            if ($existingRoomName !== "" && !isset($existingRoomsByKey[$existingRoomName])) {
+              $existingRoomsByKey[$existingRoomName] = (int)($row["room_id"] ?? 0);
+            }
           }
         }
 
-        $roomsInDeduped = [];
         foreach ($roomsIn as $roomRow) {
           if (!is_array($roomRow)) continue;
-          $roomNameRaw = isset($roomRow["name"]) ? (string)$roomRow["name"] : "";
-          $roomName = import_clean_room_name($roomNameRaw);
-          if ($roomName === "") {
+          $roomName = import_clean_room_name((string)($roomRow["name"] ?? ""));
+          $roomObjectName = import_clean_object_name((string)($roomRow["objectName"] ?? ""));
+          $roomKey = strtolower($roomObjectName !== "" ? $roomObjectName : $roomName);
+          if ($roomName === "" || $roomKey === "") {
             $summary["skippedRoomNames"]++;
             continue;
           }
-          $roomsInDeduped[strtolower($roomName)] = $roomName;
-        }
 
-        foreach ($roomsInDeduped as $roomKey => $roomName) {
-          if (isset($existingRoomsByName[$roomKey])) {
-            $existingRoomId = (int)$existingRoomsByName[$roomKey];
-            $updateRoomSeenStmt->bind_param("issii", $buildingId, $buildingUid, $buildingDisplayName, $versionId, $existingRoomId);
+          if (isset($existingRoomsByKey[$roomKey])) {
+            $existingRoomId = (int)$existingRoomsByKey[$roomKey];
+            $updateRoomSeenStmt->bind_param("isssisi", $buildingId, $buildingUid, $roomObjectName, $buildingDisplayName, $versionId, $modelFile, $existingRoomId);
             if (!$updateRoomSeenStmt->execute()) {
               throw new RuntimeException("Failed to update room sync markers: " . $roomName);
             }
@@ -832,7 +981,7 @@ if (isset($_GET["action"])) {
             continue;
           }
 
-          $roomNumber = "";
+          $roomNumber = trim((string)($roomRow["roomNumber"] ?? ""));
           $roomType = "";
           $floorNumber = "";
           $roomDescription = "";
@@ -840,14 +989,15 @@ if (isset($_GET["action"])) {
           $roomImagePath = "";
           $roomEditedAt = null;
           $roomEditedBy = null;
-          $selectRoomTemplateStmt->bind_param("ss", $roomName, $buildingDisplayName);
+          $templateObjectName = $roomObjectName !== "" ? $roomObjectName : $roomName;
+          $selectRoomTemplateStmt->bind_param("sss", $templateObjectName, $roomName, $buildingDisplayName);
           if (!$selectRoomTemplateStmt->execute()) {
             throw new RuntimeException("Failed to query room template");
           }
           $roomTemplateRes = $selectRoomTemplateStmt->get_result();
           $roomTemplate = $roomTemplateRes ? $roomTemplateRes->fetch_assoc() : null;
           if ($roomTemplate) {
-            $roomNumber = import_copy_text($roomTemplate["room_number"] ?? "");
+            if ($roomNumber === "") $roomNumber = import_copy_text($roomTemplate["room_number"] ?? "");
             $roomType = import_copy_text($roomTemplate["room_type"] ?? "");
             $floorNumber = import_copy_text($roomTemplate["floor_number"] ?? "");
             $roomDescription = import_copy_text($roomTemplate["description"] ?? "");
@@ -858,9 +1008,10 @@ if (isset($_GET["action"])) {
           }
 
           $insertRoomStmt->bind_param(
-            "issssssssssiisi",
+            "isssssssssssiisi",
             $buildingId,
             $buildingUid,
+            $roomObjectName,
             $roomName,
             $roomNumber,
             $roomType,
@@ -878,7 +1029,7 @@ if (isset($_GET["action"])) {
           if (!$insertRoomStmt->execute()) {
             throw new RuntimeException("Failed to insert room: " . $roomName);
           }
-          $existingRoomsByName[$roomKey] = (int)$insertRoomStmt->insert_id;
+          $existingRoomsByKey[$roomKey] = (int)$insertRoomStmt->insert_id;
           $summary["roomsInserted"]++;
         }
       }
@@ -890,6 +1041,14 @@ if (isset($_GET["action"])) {
       $missingBuildingsRes = $countMissingBuildingsStmt->get_result();
       $missingBuildingsRow = $missingBuildingsRes ? $missingBuildingsRes->fetch_assoc() : null;
       $summary["buildingsMissingAfterSync"] = $missingBuildingsRow ? (int)($missingBuildingsRow["cnt"] ?? 0) : 0;
+
+      $countMissingFacilitiesStmt->bind_param("s", $modelFile);
+      if (!$countMissingFacilitiesStmt->execute()) {
+        throw new RuntimeException("Failed to count missing facilities");
+      }
+      $missingFacilitiesRes = $countMissingFacilitiesStmt->get_result();
+      $missingFacilitiesRow = $missingFacilitiesRes ? $missingFacilitiesRes->fetch_assoc() : null;
+      $summary["facilitiesMissingAfterSync"] = $missingFacilitiesRow ? (int)($missingFacilitiesRow["cnt"] ?? 0) : 0;
 
       $countMissingRoomsStmt->bind_param("s", $modelFile);
       if (!$countMissingRoomsStmt->execute()) {
@@ -1029,6 +1188,7 @@ admin_layout_start("Map Import", "mapimport");
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+import { buildRoomNormalizationContext, classifyTopLevelObjectName, isGenericSceneName, isGroundLikeName, parseRoomObjectName } from "../js/map-entity-utils.js";
 
 const CSRF_TOKEN = <?= json_encode($MAP_IMPORT_CSRF) ?>;
 const ORIGINAL_MODEL_NAME = <?= json_encode($ORIGINAL_MODEL_NAME) ?>;
@@ -1046,10 +1206,6 @@ const statusEl = document.getElementById("import-status");
 const previewBody = document.getElementById("preview-body");
 const correctionsBody = document.getElementById("corrections-body");
 const auditBody = document.getElementById("audit-body");
-
-const GENERIC_NODE_NAMES = new Set(["scene", "auxscene", "root", "rootnode", "gltf", "model", "group"]);
-const KIOSK_ROUTE_RE = /^KIOSK_START(?:\.\d+|\d+)?$/i;
-const ROAD_LIKE_BUILDING_RE = /^road(?:[._-]\d+)?$/i;
 
 let selectedModelFile = "";
 let selectedBackupFile = "";
@@ -1090,23 +1246,8 @@ function escapeHtml(s) {
     .replaceAll("'", "&#39;");
 }
 
-function isGroundLikeName(name) {
-  const n = String(name || "").trim();
-  if (!n) return false;
-  const lower = n.toLowerCase();
-  if (lower === "ground" || lower === "cground") return true;
-  return /(^|[^a-z0-9])c?ground($|[^a-z0-9])/i.test(n);
-}
-
 function isGenericNodeName(name) {
-  if (!name) return true;
-  const raw = String(name).trim().toLowerCase();
-  if (GENERIC_NODE_NAMES.has(raw)) return true;
-
-  // Export/import pipelines often append numeric suffixes to wrapper nodes.
-  // Treat variants like AuxScene_1 / Scene.001 / root-2 as generic too.
-  const deSuffixed = raw.replace(/([._-]\d+)+$/g, "");
-  return GENERIC_NODE_NAMES.has(deSuffixed);
+  return isGenericSceneName(name);
 }
 
 function normalizeBuildingName(name) {
@@ -1190,127 +1331,133 @@ function parseRoomCandidate(rawName) {
 
 function buildExtraction(sceneRoot) {
   const buildingEntries = new Map();
-  const canonicalBaseSet = new Set();
-  const canonicalByBuilding = new Map();
-  const compactByBaseCount = new Map();
+  const roomSources = [];
 
   sceneRoot.traverse((obj) => {
     if (!obj) return;
     const root = getTopLevelNamedAncestor(obj, sceneRoot);
     if (!root || !root.name) return;
-    const buildingName = normalizeBuildingName(root.name);
-    if (!buildingName) return;
+    const rootMeta = classifyTopLevelObjectName(root.name);
+    if (!rootMeta?.include) return;
 
-    let entry = buildingEntries.get(buildingName);
+    const entryKey = String(rootMeta.baseName || root.name || "").trim();
+    if (!entryKey) return;
+    const buildingName = String(rootMeta.displayName || rootMeta.baseName || root.name || "").trim();
+    let entry = buildingEntries.get(entryKey);
     if (!entry) {
-      entry = { name: buildingName, roomCandidates: [] };
-      buildingEntries.set(buildingName, entry);
+      entry = {
+        name: buildingName,
+        objectName: String(rootMeta.baseName || root.name || "").trim(),
+        classification: String(rootMeta.entityType || "building"),
+        bucket: String(rootMeta.bucket || "buildings"),
+        roomCandidates: [],
+        roomEntries: []
+      };
+      buildingEntries.set(entryKey, entry);
     }
 
     if (!obj.name) return;
-    const parsed = parseRoomCandidate(obj.name);
-    if (!parsed) return;
-
-    const row = {
-      buildingName,
-      object: obj,
-      oldName: String(obj.name),
-      parsed,
-      finalName: "",
-      reason: ""
-    };
-    entry.roomCandidates.push(row);
-
-    if (parsed.kind === "plain" || parsed.kind === "explicit_suffix" || parsed.kind === "loader_suffix") {
-      canonicalBaseSet.add(parsed.baseDigits);
-      if (!canonicalByBuilding.has(buildingName)) {
-        canonicalByBuilding.set(buildingName, new Set());
-      }
-      canonicalByBuilding.get(buildingName).add(parsed.baseDigits);
-    }
-    if (parsed.kind === "compact_suffix") {
-      compactByBaseCount.set(parsed.baseDigits, (compactByBaseCount.get(parsed.baseDigits) || 0) + 1);
-    }
+    roomSources.push({ buildingName, entry, object: obj });
   });
+
+  const roomContext = buildRoomNormalizationContext(roomSources.map((row) => ({
+    name: row?.object?.name || "",
+    buildingName: row?.buildingName || ""
+  })));
+
+  for (const row of roomSources) {
+    const buildingName = String(row?.buildingName || "").trim();
+    const entry = row?.entry;
+    const obj = row?.object;
+    if (!buildingName || !entry || !obj?.name) continue;
+
+    const parsed = parseRoomObjectName(obj.name, {
+      canonicalBaseSet: roomContext.canonicalBaseSet,
+      canonicalByBuilding: roomContext.canonicalByBuilding,
+      compactByBaseCount: roomContext.compactByBaseCount,
+      buildingName
+    });
+    if (!parsed) continue;
+
+    const roomEntry = {
+      name: String(parsed.roomName || "").trim(),
+      objectName: String(parsed.objectName || obj.name || "").trim(),
+      roomNumber: String(parsed.roomNumber || "").trim()
+    };
+    if (!roomEntry.name) continue;
+    entry.roomEntries.push(roomEntry);
+
+    const oldName = String(obj.name || "").trim();
+    const finalName = String(parsed.canonicalObjectName || parsed.roomName || "").trim();
+    if (!finalName || !oldName) continue;
+
+    const isLegacyRoom = parsed.sourceKind === "legacy_room";
+    const needsRename = oldName !== finalName;
+    if (!isLegacyRoom && !needsRename) continue;
+
+    const reason = parsed.sourceKind === "rm"
+      ? "Removed Blender duplicate suffix from prefixed room object name"
+      : "Standardized legacy room naming format";
+    if (needsRename) {
+      entry.roomCandidates.push({
+        buildingName,
+        object: obj,
+        oldName,
+        finalName,
+        reason
+      });
+    } else if (isLegacyRoom) {
+      entry.roomCandidates.push({
+        buildingName,
+        object: obj,
+        oldName,
+        finalName,
+        reason: "Already matches legacy room naming format"
+      });
+    }
+  }
 
   const corrections = [];
   const auditItems = [];
   const buildingsOut = [];
   for (const b of buildingEntries.values()) {
     const roomMap = new Map();
+    for (const row of b.roomEntries) {
+      const roomKey = String(row.objectName || row.name || "").trim().toLowerCase();
+      if (!roomKey || roomMap.has(roomKey)) continue;
+      roomMap.set(roomKey, {
+        name: row.name,
+        objectName: row.objectName,
+        roomNumber: row.roomNumber
+      });
+    }
+
     for (const row of b.roomCandidates) {
-      const p = row.parsed;
-      let finalDigits = p.originalDigits;
-      let reason = "";
-
-      if (p.kind === "plain") {
-        finalDigits = p.baseDigits;
-      } else if (p.kind === "explicit_suffix") {
-        finalDigits = p.baseDigits;
-        reason = `Blender duplicate suffix .${p.suffixDigits} removed`;
-      } else if (p.kind === "compact_suffix") {
-        const suffixNum = Number(p.suffixDigits);
-        const compactLooksLikeDuplicate = p.baseDigits.length >= 1 && p.baseDigits.length <= 4 && suffixNum >= 1 && suffixNum <= 999;
-        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
-        const sameBuildingEvidence = canonicalByBuilding.get(b.name)?.has(p.baseDigits) || false;
-        const repeatedCompactBase = (compactByBaseCount.get(p.baseDigits) || 0) >= 2;
-
-        if (compactLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence || repeatedCompactBase)) {
-          finalDigits = p.baseDigits;
-          reason = crossBuildingEvidence || sameBuildingEvidence
-            ? `Compact duplicate suffix ${p.suffixDigits} removed (matching room number evidence found)`
-            : `Compact duplicate suffix ${p.suffixDigits} removed (repeated compact duplicate pattern)`;
-        }
-      } else if (p.kind === "loader_suffix") {
-        const suffixNum = Number(p.suffixDigits);
-        const loaderLooksLikeDuplicate =
-          p.baseDigits.length >= 1 &&
-          p.baseDigits.length <= 4 &&
-          suffixNum >= 1 &&
-          suffixNum <= 999;
-        const crossBuildingEvidence = canonicalBaseSet.has(p.baseDigits);
-        const sameBuildingEvidence = canonicalByBuilding.get(b.name)?.has(p.baseDigits) || false;
-
-        if (loaderLooksLikeDuplicate && (crossBuildingEvidence || sameBuildingEvidence)) {
-          finalDigits = p.baseDigits;
-          reason = `Loader duplicate suffix ${p.suffixDigits} normalized to room ${p.baseDigits}`;
-        }
-      }
-
-      const finalName = `ROOM ${finalDigits}`;
-      row.finalName = finalName;
-      row.reason = reason || "Standardized room naming format";
-      const loaderAliasAlreadyCanonical =
-        p.kind === "loader_suffix" &&
-        finalDigits === p.baseDigits &&
-        reason.startsWith("Loader duplicate suffix");
-      const isAlreadyEngraved = loaderAliasAlreadyCanonical || String(row.oldName).trim() === finalName;
-
+      const isAlreadyEngraved = String(row.oldName).trim() === String(row.finalName).trim();
       if (!isAlreadyEngraved) {
         corrections.push({
           buildingName: row.buildingName,
           object: row.object,
           oldName: row.oldName,
-          newName: finalName,
+          newName: row.finalName,
           reason: row.reason
         });
       }
       auditItems.push({
         buildingName: row.buildingName,
         oldName: row.oldName,
-        newName: finalName,
+        newName: row.finalName,
         status: isAlreadyEngraved ? "already_engraved" : "needs_rename"
       });
-
-      if (!roomMap.has(finalName)) {
-        roomMap.set(finalName, { name: finalName });
-      }
     }
 
     const rooms = Array.from(roomMap.values()).sort((a, b2) => a.name.localeCompare(b2.name));
     buildingsOut.push({
       name: b.name,
-      classification: rooms.length ? "building" : "unclassified",
+      objectName: b.objectName,
+      bucket: b.bucket,
+      entityType: b.classification,
+      classification: rooms.length ? b.classification : (b.classification || "unclassified"),
       rooms
     });
   }
@@ -1329,16 +1476,17 @@ function buildExtraction(sceneRoot) {
 function renderPreview(buildings) {
   previewBody.innerHTML = "";
   if (!Array.isArray(buildings) || !buildings.length) {
-    previewBody.innerHTML = "<tr><td colspan=\"3\">No buildings detected from model.</td></tr>";
+    previewBody.innerHTML = "<tr><td colspan=\"3\">No destinations detected from model.</td></tr>";
     return;
   }
 
   for (const b of buildings) {
-    const roomNames = b.rooms.map((r) => r.name).join(", ");
+    const roomNames = Array.isArray(b.rooms) ? b.rooms.map((r) => r.name).join(", ") : "";
+    const typeLabel = String(b.entityType || b.classification || "building").trim() || "building";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${escapeHtml(b.name)}</td>
-      <td>${escapeHtml(b.classification)}</td>
+      <td>${escapeHtml(typeLabel)}</td>
       <td>${roomNames ? escapeHtml(roomNames) : "-"}</td>
     `;
     previewBody.appendChild(tr);

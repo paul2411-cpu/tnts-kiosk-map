@@ -9,10 +9,11 @@ export function buildGuideKey(type, data = {}) {
   const safeType = normalizeToken(type) || "building";
   const buildingUid = String(data.buildingUid || data.uid || data.destinationUid || "").trim();
   const buildingName = String(data.buildingName || data.name || "").trim();
+  const objectName = String(data.objectName || data.modelObjectName || "").trim();
   const roomName = String(data.roomName || "").trim();
   const buildingToken = buildingUid
     ? `uid_${normalizeToken(buildingUid)}`
-    : normalizeToken(buildingName);
+    : normalizeToken(buildingName || objectName);
 
   if (safeType === "room") {
     return `room::${buildingToken}::${normalizeToken(roomName)}`;

@@ -1,0 +1,233 @@
+# TNTS System Data Flow Documentation
+
+Prepared on: 2026-03-24
+Project root: `C:\xampp\htdocs\tnts`
+Scope: the whole TNTS system as currently implemented
+
+This file was expanded from an admin-only note into a whole-system data flow document so it can match the short, generalized style of your reference.
+
+## 1. System Overview
+
+TNTS is a web-based campus navigation and information system. It has two main sides:
+
+- the public user side for map viewing, destination lookup, events, announcements, facilities, and feedback
+- the admin side for managing content, map metadata, map models, and publication of the live map
+
+The current system combines MySQL data with file-based GLB and JSON map assets.
+
+## 2. System Users
+
+### Public users
+
+These users can access the public side without admin login:
+
+- visitors
+- freshmen
+- students
+- faculty
+- staff
+- student council members when using the kiosk as normal users
+- student organization members when using the kiosk as normal users
+
+### Administrative users
+
+These users access the admin side through `admin/login.php`:
+
+- admin users stored in `admin_users`
+
+### Planned future role split
+
+These are not yet fully enforced in the current code, but they fit your planned next step:
+
+- `Superadmin` for full access, especially admin user management
+- `Staff` content managers for selected admin functions
+- `Student Council` or `Student Organization` content managers for announcements, events, and related content only
+
+## 3. Contextual Data Flow Diagram of the Whole System
+
+Legend:
+
+- `AS` = Access the system
+- `MS` = Manage the system
+- `SF` = Submit feedback
+- `AD` = Accessed or displayed data
+
+```mermaid
+flowchart LR
+    U1[Visitor / Freshman / Student]
+    U2[Faculty / Staff]
+    U3[Admin User]
+    P0((0 TNTS System))
+    R1[Visitor / Freshman / Student]
+    R2[Faculty / Staff]
+    R3[Admin User]
+
+    U1 -->|AS| P0
+    U2 -->|AS| P0
+    U1 -->|SF| P0
+    U3 -->|MS| P0
+
+    P0 -->|AD| R1
+    P0 -->|AD| R2
+    P0 -->|AD| R3
+```
+
+## 4. Level 1 Data Flow Diagram
+
+```mermaid
+flowchart TB
+    U[Public Users]
+    A[Admin Users]
+
+    P1[1.0 Public Map Navigation]
+    P2[2.0 Public Content Viewing]
+    P3[3.0 Public Feedback Submission]
+    P4[4.0 Admin Content Management]
+    P5[5.0 Admin Map Management and Publication]
+
+    D1[(D1 Buildings / Rooms / Facilities)]
+    D2[(D2 Events / Announcements)]
+    D3[(D3 Feedback)]
+    D4[(D4 Admin Users)]
+    D5[(D5 GLB Models / Overlay JSON / Live Map Files)]
+
+    U --> P1
+    U --> P2
+    U --> P3
+
+    A --> P4
+    A --> P5
+
+    P1 --> D1
+    P1 --> D5
+
+    P2 --> D1
+    P2 --> D2
+    P2 --> D5
+
+    P3 --> D3
+
+    P4 --> D2
+    P4 --> D3
+    P4 --> D4
+
+    P5 --> D1
+    P5 --> D5
+```
+
+## 5. How the Current System Works
+
+### 5.1 Public side
+
+The public side is built from the pages under `pages/` and the shared layout in `ui/`.
+
+- `pages/map.php` is the main live navigation page
+- `pages/facilities.php` shows facilities tied to the current public model
+- `pages/events.php` shows public events and links them back to the map
+- `pages/announcement.php` shows active announcements
+- `pages/feedback.php` lets public users submit feedback
+
+The map page mainly depends on these APIs:
+
+- `api/map_live.php`
+- `api/map_search.php`
+- `api/map_building_details.php`
+- `api/event_details.php`
+
+In simple flow:
+
+1. A public user opens a page.
+2. The system loads the current live model and metadata.
+3. The user searches destinations, opens details, views facilities, checks announcements and events, or submits feedback.
+4. The system returns the requested map, content, or feedback result.
+
+### 5.2 Admin side
+
+The admin side is built under `admin/`.
+
+- `admin/login.php` authenticates admin users
+- `admin/dashboard.php` summarizes key records
+- `admin/announcement.php` manages announcements
+- `admin/events.php` manages events
+- `admin/feedback.php` reviews public feedback
+- `admin/facilities.php` manages facilities
+- `admin/building.php` manages building metadata
+- `admin/room.php` manages room metadata
+- `admin/mapImport.php` imports and normalizes GLB model data
+- `admin/mapEditor.php` edits overlays, roads, guides, routes, and publishes the live map
+
+In simple flow:
+
+1. An admin logs in.
+2. The admin updates content or map-related data.
+3. The admin imports, edits, exports, or publishes map files.
+4. The public side then reads the latest published data.
+
+## 6. Main Data Stores
+
+### Database tables
+
+- `admin_users`
+- `buildings`
+- `rooms`
+- `facilities`
+- `events`
+- `announcements`
+- `feedback`
+- `map_versions`
+
+### File-based stores
+
+- `models/*.glb`
+- `models/backups/*.glb`
+- `models/drafts/*.glb`
+- `admin/overlays/*.json`
+- `admin/overlays/drafts/*.json`
+- `assets/events/*`
+- `assets/announcements/*`
+- `storage/logs/*.log`
+
+## 7. End-to-End System Flow
+
+The current TNTS flow can be summarized like this:
+
+1. Admin users maintain map data, content data, and publication data.
+2. The admin side writes to MySQL tables and to GLB or JSON files.
+3. `admin/mapEditor.php` publishes the selected map state as the live public map.
+4. Public APIs read the live files and current metadata.
+5. Public users access the latest campus navigation and information through the kiosk pages.
+6. Public feedback is stored and later reviewed by admins.
+
+## 8. Current Role Status
+
+### Currently implemented
+
+- Public users do not need admin login.
+- Admin users log in through `admin_users`.
+- The admin session stores a `role`, but page-by-page permission separation is not yet fully implemented.
+
+### Planned next step
+
+For your next phase, the system can be split into:
+
+- `Superadmin`
+  Full access to all admin functions, especially the admin users page.
+- `Staff` or content admin
+  Access to selected content management functions.
+- `Student Council` or `Student Organization` content admin
+  Access mainly to announcements, events, and related content pages.
+
+This planned permission model is not yet the current live behavior, so it should be documented as a future enhancement, not as a finished feature.
+
+## 9. Suggested Thesis-Style Summary
+
+The TNTS system is accessed by public users such as visitors, freshmen, students, faculty, and staff, while administrative users manage the system through the admin panel. The public side provides map navigation, destination search, facilities, announcements, events, and feedback submission. The admin side maintains the database records and map assets, then publishes the live map used by the public pages. The whole system therefore works as an integrated public-information and map-management platform supported by both MySQL records and file-based GLB and JSON map resources.
+
+## 10. Reference Notes
+
+For a wider technical review of the repository, see:
+
+- `PROJECT_SYSTEM_DOCUMENTATION.md`
+
+This current document is the shorter, generalized data flow version.
+

@@ -23,7 +23,10 @@ function event_details_resolved_target($target): ?array {
 
   $out = ["type" => $type];
   if (isset($target["buildingId"])) $out["buildingId"] = (int)$target["buildingId"];
+  if (isset($target["buildingUid"])) $out["buildingUid"] = trim((string)$target["buildingUid"]);
   if (isset($target["buildingName"])) $out["buildingName"] = trim((string)$target["buildingName"]);
+  if (isset($target["objectName"])) $out["objectName"] = trim((string)$target["objectName"]);
+  if (isset($target["anchorType"])) $out["anchorType"] = trim((string)$target["anchorType"]);
   if (isset($target["roomId"])) $out["roomId"] = (int)$target["roomId"];
   if (isset($target["roomName"])) $out["roomName"] = trim((string)$target["roomName"]);
   if (isset($target["roomNumber"])) $out["roomNumber"] = trim((string)$target["roomNumber"]);
@@ -80,7 +83,9 @@ try {
       "scheduleLabel" => ucwords(str_replace("_", " ", $schedule)),
       "dateLabel" => events_format_date_label($row),
       "startDate" => trim((string)($row["start_date"] ?? "")),
+      "startTime" => trim((string)($row["start_time"] ?? "")),
       "endDate" => trim((string)($row["end_date"] ?? "")),
+      "endTime" => trim((string)($row["end_time"] ?? "")),
       "locationLabel" => trim((string)($resolution["displayLocation"] ?? $row["location"] ?? "")),
       "locationMode" => trim((string)($resolution["mode"] ?? "text_only")),
       "health" => trim((string)($resolution["health"] ?? "limited")),

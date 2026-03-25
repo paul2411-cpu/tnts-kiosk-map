@@ -5,7 +5,7 @@ html, body {
   height: 100%;
   width: 100%;
   font-family: Arial, sans-serif;
-  background: #ffffff;
+  background: #f4f5f7;
 }
 
 .app-shell{
@@ -17,18 +17,27 @@ html, body {
 
 /* Top bar */
 .topbar{
-  height: 70px;
-  padding: 18px 28px;
+  height: 74px;
+  padding: 16px 28px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: #ffffff;
+  background: rgba(255, 255, 255, 0.9);
+  border-bottom: 1px solid rgba(16, 24, 40, 0.08);
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.05);
+  backdrop-filter: blur(18px);
 }
 
 .topbar-title{
   font-size: 18px;
-  letter-spacing: 1px;
-  color: #111;
+  letter-spacing: 0.18em;
+  font-weight: 900;
+  color: #7a0000;
+}
+
+.topbar-right{
+  display: flex;
+  align-items: center;
 }
 
 /* Search box */
@@ -36,24 +45,40 @@ html, body {
   display: flex;
   align-items: center;
   gap: 10px;
-  border: 1px solid #333;
-  border-radius: 6px;
-  padding: 10px 12px;
+  border: 1px solid #d0d5dd;
+  border-radius: 999px;
+  padding: 10px 12px 10px 14px;
   min-width: 320px;
+  background: rgba(248, 250, 252, 0.94);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
 }
 
 .searchbox input{
   border: none;
   outline: none;
   width: 100%;
+  background: transparent;
+  color: #101828;
   font-size: 14px;
 }
 
 .searchbtn{
+  width: 34px;
+  height: 34px;
   border: none;
-  background: transparent;
+  border-radius: 999px;
+  background: #7a0000;
+  color: #fff;
   cursor: pointer;
-  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex: 0 0 auto;
+}
+
+.searchbtn span{
+  line-height: 1;
 }
 
 /* Main area */
@@ -61,5 +86,5 @@ html, body {
   flex: 1;
   position: relative;
   overflow: hidden; /* IMPORTANT: canvas stays inside */
-  background: #ffffff;
+  background: #f4f5f7;
 }

@@ -32,45 +32,62 @@ function admin_layout_start(string $title, string $active = "") { ?>
 
       <nav class="nav">
         <a class="nav-item <?= $active==='dashboard'?'active':'' ?>" href="dashboard.php">
-          <span class="ico">🏠</span><span>Dashboard</span>
+          <span class="ico">&#x1F3E0;</span><span>Dashboard</span>
         </a>
-        <a class="nav-item <?= $active==='buildings'?'active':'' ?>" href="building.php">
-          <span class="ico">🏢</span><span>Buildings</span>
-        </a>
-        <a class="nav-item <?= $active==='rooms'?'active':'' ?>" href="room.php">
-          <span class="ico">🚪</span><span>Rooms</span>
-        </a>
-        <a class="nav-item <?= $active==='facilities'?'active':'' ?>" href="facilities.php">
-          <span class="ico">🧰</span><span>Facilities</span>
-        </a>
-        <a class="nav-item <?= $active==='events'?'active':'' ?>" href="events.php">
-          <span class="ico">📅</span><span>Events</span>
-        </a>
-        <a class="nav-item <?= $active==='announcements'?'active':'' ?>" href="announcement.php">
-          <span class="ico">📣</span><span>Announcements</span>
-        </a>
-
-        <a class="nav-item <?= $active==='feedback'?'active':'' ?>" href="feedback.php">
-          <span class="ico">FB</span><span>Feedback</span>
-        </a>
+        <?php if (admin_has_permission("manage_buildings")): ?>
+          <a class="nav-item <?= $active==='buildings'?'active':'' ?>" href="building.php">
+            <span class="ico">&#x1F3E2;</span><span>Buildings</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("manage_rooms")): ?>
+          <a class="nav-item <?= $active==='rooms'?'active':'' ?>" href="room.php">
+            <span class="ico">&#x1F6AA;</span><span>Rooms</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("manage_facilities")): ?>
+          <a class="nav-item <?= $active==='facilities'?'active':'' ?>" href="facilities.php">
+            <span class="ico">&#x1F9F0;</span><span>Facilities</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("manage_events")): ?>
+          <a class="nav-item <?= $active==='events'?'active':'' ?>" href="events.php">
+            <span class="ico">&#x1F4C5;</span><span>Events</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("manage_announcements")): ?>
+          <a class="nav-item <?= $active==='announcements'?'active':'' ?>" href="announcement.php">
+            <span class="ico">&#x1F4E3;</span><span>Announcements</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("manage_feedback")): ?>
+          <a class="nav-item <?= $active==='feedback'?'active':'' ?>" href="feedback.php">
+            <span class="ico">&#x1F4AC;</span><span>Feedback</span>
+          </a>
+        <?php endif; ?>
 
         <div class="nav-sep"></div>
 
-        <a class="nav-item <?= $active==='mapeditor'?'active':'' ?>" href="mapEditor.php">
-          <span class="ico">🗺️</span><span>Map Editor</span>
-        </a>
-        <a class="nav-item <?= $active==='errorlogs'?'active':'' ?>" href="errorLogs.php">
-          <span class="ico">LOG</span><span>Error Logs</span>
-        </a>
-        <a class="nav-item <?= $active==='admins'?'active':'' ?>" href="adminUser.php">
-          <span class="ico">👤</span><span>Admin Users</span>
-        </a>
+        <?php if (admin_has_permission("manage_map")): ?>
+          <a class="nav-item <?= $active==='mapeditor'?'active':'' ?>" href="mapEditor.php">
+            <span class="ico">&#x1F5FA;&#xFE0F;</span><span>Map Editor</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_has_permission("view_error_logs")): ?>
+          <a class="nav-item <?= $active==='errorlogs'?'active':'' ?>" href="errorLogs.php">
+            <span class="ico">&#x1F4CB;</span><span>Error Logs</span>
+          </a>
+        <?php endif; ?>
+        <?php if (admin_is_superadmin()): ?>
+          <a class="nav-item <?= $active==='admins'?'active':'' ?>" href="adminUser.php">
+            <span class="ico">&#x1F464;</span><span>Admin Users</span>
+          </a>
+        <?php endif; ?>
       </nav>
 
       <div class="sidebar-footer">
         <div class="me">
           <div class="me-name"><?= htmlspecialchars(admin_name()) ?></div>
-          <div class="me-role"><?= htmlspecialchars(admin_role()) ?></div>
+          <div class="me-role"><?= htmlspecialchars(admin_role_label()) ?></div>
         </div>
         <a class="btn ghost" href="logout.php">Logout</a>
       </div>

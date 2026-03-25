@@ -1,284 +1,352 @@
 <?php
-// pages/facilities.php
 $pageTitle = "Facilities";
 $activePage = "facilities";
 
+$ROOT = dirname(__DIR__);
+require_once $ROOT . "/admin/inc/db.php";
+require_once $ROOT . "/admin/inc/map_sync.php";
+
+function facilities_page_has_column(mysqli $conn, string $table, string $column): bool {
+  $safeTable = str_replace("`", "``", $table);
+  $safeColumn = $conn->real_escape_string($column);
+  $res = $conn->query("SHOW COLUMNS FROM `{$safeTable}` LIKE '{$safeColumn}'");
+  return $res instanceof mysqli_result && $res->num_rows > 0;
+}
+
+function facilities_page_escape(string $value): string {
+  return htmlspecialchars($value, ENT_QUOTES, "UTF-8");
+}
+
+function facilities_page_infer_category(string $name, string $description = ""): string {
+  $haystack = mb_strtolower(trim($name . " " . $description), "UTF-8");
+  foreach (["library", "reading", "science", "ict", "print", "assessment"] as $keyword) {
+    if (strpos($haystack, $keyword) !== false) return "academic";
+  }
+  return "services";
+}
+
+function facilities_page_initials(string $value): string {
+  $clean = trim(preg_replace('/\s+/u', ' ', $value));
+  if ($clean === "") return "MAP";
+
+  $compact = preg_replace('/[^\p{L}\p{N}]+/u', '', $clean);
+  if ($compact !== null && $compact !== "") {
+    return strtoupper((string)mb_substr($compact, 0, 3, "UTF-8"));
+  }
+
+  return strtoupper((string)mb_substr($clean, 0, 3, "UTF-8"));
+}
+
+function facilities_page_category_label(string $category): string {
+  return $category === "academic" ? "Academic Support" : "Campus Service";
+}
+
+$state = map_sync_resolve_public_model($ROOT);
+$currentModel = trim((string)($state["modelFile"] ?? ""));
+$facilities = [];
+
+try {
+  $hasSource = facilities_page_has_column($conn, "facilities", "source_model_file");
+  $hasPresent = facilities_page_has_column($conn, "facilities", "is_present_in_latest");
+  $hasObjectName = facilities_page_has_column($conn, "facilities", "model_object_name");
+
+  $sql = "SELECT facility_id, facility_name, "
+    . ($hasObjectName ? "model_object_name" : "NULL AS model_object_name")
+    . ", description, logo_path, location, contact_info"
+    . ($hasSource ? ", source_model_file" : ", NULL AS source_model_file")
+    . " FROM facilities WHERE facility_name IS NOT NULL AND facility_name <> ''";
+  if ($hasPresent) {
+    $sql .= " AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)";
+  }
+
+  if ($currentModel !== "" && $hasSource) {
+    $stmt = $conn->prepare($sql . " AND source_model_file = ? ORDER BY facility_name ASC");
+    if ($stmt) {
+      $stmt->bind_param("s", $currentModel);
+      if ($stmt->execute()) {
+        $res = $stmt->get_result();
+        if ($res instanceof mysqli_result) {
+          while ($row = $res->fetch_assoc()) $facilities[] = $row;
+        }
+      }
+      $stmt->close();
+    }
+  } else {
+    $res = $conn->query($sql . " ORDER BY facility_name ASC");
+    if ($res instanceof mysqli_result) {
+      while ($row = $res->fetch_assoc()) $facilities[] = $row;
+    }
+  }
+} catch (Throwable $_) {
+  $facilities = [];
+}
+
+$preparedFacilities = [];
+$academicCount = 0;
+$servicesCount = 0;
+$contactCount = 0;
+
+foreach ($facilities as $facility) {
+  $facilityName = trim((string)($facility["facility_name"] ?? ""));
+  if ($facilityName === "") continue;
+
+  $description = trim((string)($facility["description"] ?? ""));
+  $location = trim((string)($facility["location"] ?? ""));
+  $contactInfo = trim((string)($facility["contact_info"] ?? ""));
+  $imagePath = trim((string)($facility["logo_path"] ?? ""));
+  $objectName = trim((string)($facility["model_object_name"] ?? ""));
+  $category = facilities_page_infer_category($facilityName, $description);
+
+  if ($category === "academic") $academicCount++;
+  else $servicesCount++;
+  if ($contactInfo !== "") $contactCount++;
+
+  $preparedFacilities[] = [
+    "name" => $facilityName,
+    "description" => $description !== "" ? $description : "Mapped facility destination.",
+    "location" => $location,
+    "contactInfo" => $contactInfo,
+    "imagePath" => $imagePath,
+    "objectName" => $objectName,
+    "category" => $category,
+    "categoryLabel" => facilities_page_category_label($category),
+    "initials" => facilities_page_initials($facilityName),
+    "destination" => $facilityName,
+  ];
+}
+
+$totalFacilities = count($preparedFacilities);
+
 ob_start();
 ?>
+<div class="public-page public-page--facilities">
+  <div class="public-page__shell">
+    <section class="public-hero">
+      <div class="public-hero__eyebrow">Campus Facilities</div>
+      <h1 class="public-hero__title">Find the service spaces, study hubs, and support offices available across TNTS.</h1>
+      <p class="public-hero__copy">
+        Facilities now follow the same polished card system used by announcements and events, so visitors can scan information faster and jump straight into the public map when they are ready.
+      </p>
 
-<div class="fac-wrap">
-  <div class="fac-header">
-    <h1 class="fac-title">FACILITIES</h1>
+      <div class="public-stats">
+        <article class="public-stat">
+          <div class="public-stat__value"><?= $totalFacilities ?></div>
+          <div class="public-stat__label">Visible Facilities</div>
+          <div class="public-stat__hint">Currently available in the active public campus model.</div>
+        </article>
+        <article class="public-stat">
+          <div class="public-stat__value"><?= $academicCount ?></div>
+          <div class="public-stat__label">Academic Support</div>
+          <div class="public-stat__hint">Libraries, reading spaces, ICT areas, and learning-focused destinations.</div>
+        </article>
+        <article class="public-stat">
+          <div class="public-stat__value"><?= $servicesCount ?></div>
+          <div class="public-stat__label">Campus Services</div>
+          <div class="public-stat__hint">Operational offices and visitor-facing support points around the campus.</div>
+        </article>
+        <article class="public-stat">
+          <div class="public-stat__value"><?= $contactCount ?></div>
+          <div class="public-stat__label">With Contact Info</div>
+          <div class="public-stat__hint">Cards that already include a direct phone number, email, or office contact note.</div>
+        </article>
+      </div>
+    </section>
 
-    <div class="fac-filters" role="tablist" aria-label="Facilities Filters">
-      <button class="fac-pill active" type="button" data-filter="all" aria-pressed="true">
-        <span class="fac-icon">▦</span> ALL
-      </button>
-      <button class="fac-pill" type="button" data-filter="academic" aria-pressed="false">
-        <span class="fac-icon">☆</span> ACADEMIC
-      </button>
-      <button class="fac-pill" type="button" data-filter="services" aria-pressed="false">
-        <span class="fac-icon">⚙</span> SERVICES
-      </button>
-    </div>
+    <?php if (!$preparedFacilities): ?>
+      <section class="public-empty">
+        <h2 class="public-empty__title">No facilities are published yet.</h2>
+        <p class="public-empty__copy">
+          Facilities will appear here after the current public map model is imported and the facility metadata is saved from the admin side.
+        </p>
+      </section>
+    <?php else: ?>
+      <section class="public-toolbar">
+        <div class="public-toolbar__content">
+          <div class="public-toolbar__label">Browse by Type</div>
+          <div class="public-toolbar__copy">Switch between learning spaces and support services without leaving the page.</div>
+        </div>
+        <div class="public-filters" role="tablist" aria-label="Facilities Filters">
+          <button class="public-filter is-active" type="button" data-filter="all" aria-pressed="true">All Facilities</button>
+          <button class="public-filter" type="button" data-filter="academic" aria-pressed="false">Academic Support</button>
+          <button class="public-filter" type="button" data-filter="services" aria-pressed="false">Campus Services</button>
+        </div>
+      </section>
+
+      <section class="public-grid" id="facGrid">
+        <?php foreach ($preparedFacilities as $facility): ?>
+          <article
+            class="public-card facility-card"
+            data-category="<?= facilities_page_escape($facility["category"]) ?>"
+            data-name="<?= facilities_page_escape($facility["name"]) ?>"
+          >
+            <div class="public-card__media facility-card__media<?= $facility["imagePath"] === "" ? " is-fallback" : "" ?>">
+              <div class="facility-card__overlay">
+                <span class="public-pill public-pill--soft">Map Ready</span>
+              </div>
+              <?php if ($facility["imagePath"] !== ""): ?>
+                <img
+                  src="../<?= facilities_page_escape(ltrim($facility["imagePath"], "/")) ?>"
+                  alt="<?= facilities_page_escape($facility["name"]) ?>"
+                  loading="lazy"
+                  onerror="this.remove(); this.parentElement.classList.add('is-fallback');"
+                >
+              <?php endif; ?>
+              <div class="facility-card__fallback" aria-hidden="true"><?= facilities_page_escape($facility["initials"]) ?></div>
+            </div>
+
+            <div class="public-card__meta">
+              <span class="public-pill public-pill--brand"><?= facilities_page_escape($facility["categoryLabel"]) ?></span>
+              <?php if ($facility["contactInfo"] !== ""): ?>
+                <span class="public-pill public-pill--soft">Has Contact</span>
+              <?php endif; ?>
+            </div>
+
+            <h2 class="public-card__title"><?= facilities_page_escape($facility["name"]) ?></h2>
+            <p class="public-card__copy public-card__copy--clamp-4"><?= facilities_page_escape($facility["description"]) ?></p>
+
+            <div class="public-details">
+              <?php if ($facility["location"] !== ""): ?>
+                <div class="public-detail">
+                  <div class="public-detail__label">Location</div>
+                  <div class="public-detail__value"><?= facilities_page_escape($facility["location"]) ?></div>
+                </div>
+              <?php endif; ?>
+              <?php if ($facility["contactInfo"] !== ""): ?>
+                <div class="public-detail">
+                  <div class="public-detail__label">Contact</div>
+                  <div class="public-detail__value"><?= facilities_page_escape($facility["contactInfo"]) ?></div>
+                </div>
+              <?php endif; ?>
+              <?php if ($facility["location"] === "" && $facility["contactInfo"] === ""): ?>
+                <div class="public-note">Open the map to inspect the linked destination and its surrounding campus context.</div>
+              <?php endif; ?>
+            </div>
+
+            <div class="public-actions">
+              <button
+                class="public-btn public-btn--primary"
+                type="button"
+                data-open="<?= facilities_page_escape($facility["destination"]) ?>"
+                data-object="<?= facilities_page_escape($facility["objectName"]) ?>"
+              >
+                Open on Map
+              </button>
+            </div>
+          </article>
+        <?php endforeach; ?>
+      </section>
+
+      <section class="public-empty public-empty--inline" id="facFilteredEmpty" aria-live="polite">
+        <h2 class="public-empty__title">No facilities match that filter.</h2>
+        <p class="public-empty__copy">Try switching back to all facilities or choose the other category to continue browsing.</p>
+      </section>
+    <?php endif; ?>
   </div>
-
-  <section class="fac-grid" id="fac-grid">
-    <!-- Card 1 -->
-    <article class="fac-card" data-category="academic" data-name="ANTERIO SORIANO BLDG">
-      <div class="fac-img">
-        <img src="../assets/facilities/anterio.jpg" alt="Anterio Soriano Bldg" onerror="this.style.display='none'; this.parentElement.classList.add('img-fallback');">
-        <div class="fac-fallback-mark" aria-hidden="true">TNTS</div>
-      </div>
-      <div class="fac-body">
-        <div class="fac-name">ANTERIO SORIANO BLDG</div>
-        <div class="fac-desc">Main Administrative and Faculty Offices</div>
-        <button class="fac-btn" type="button" data-open="ANTERIO_SORIANO">VIEW DETAILS</button>
-      </div>
-    </article>
-
-    <!-- Card 2 -->
-    <article class="fac-card" data-category="services" data-name="EPIMASCO VELASCO BLDG">
-      <div class="fac-img">
-        <img src="../assets/facilities/epimasco.jpg" alt="Epimasco Velasco Bldg" onerror="this.style.display='none'; this.parentElement.classList.add('img-fallback');">
-        <div class="fac-fallback-mark" aria-hidden="true">TNTS</div>
-      </div>
-      <div class="fac-body">
-        <div class="fac-name">EPIMASCO VELASCO BLDG</div>
-        <div class="fac-desc">Student Support and Counseling Service</div>
-        <button class="fac-btn" type="button" data-open="EPIMASCO_VELASCO">VIEW DETAILS</button>
-      </div>
-    </article>
-
-    <!-- Card 3 -->
-    <article class="fac-card" data-category="academic" data-name="LIBRARY">
-      <div class="fac-img">
-        <img src="../assets/facilities/library.jpg" alt="Library" onerror="this.style.display='none'; this.parentElement.classList.add('img-fallback');">
-        <div class="fac-fallback-mark" aria-hidden="true">TNTS</div>
-      </div>
-      <div class="fac-body">
-        <div class="fac-name">LIBRARY</div>
-        <div class="fac-desc">For Books, Research and Study</div>
-        <button class="fac-btn" type="button" data-open="LIBRARY">VIEW DETAILS</button>
-      </div>
-    </article>
-
-    <!-- Card 4 -->
-    <article class="fac-card" data-category="services" data-name="CLINIC">
-      <div class="fac-img">
-        <img src="../assets/facilities/clinic.jpg" alt="Clinic" onerror="this.style.display='none'; this.parentElement.classList.add('img-fallback');">
-        <div class="fac-fallback-mark" aria-hidden="true">TNTS</div>
-      </div>
-      <div class="fac-body">
-        <div class="fac-name">CLINIC</div>
-        <div class="fac-desc">Medical Checkups and First Aid</div>
-        <button class="fac-btn" type="button" data-open="CLINIC">VIEW DETAILS</button>
-      </div>
-    </article>
-
-    <!-- Add more cards following the same pattern -->
-  </section>
 </div>
-
 <?php
 $content = ob_get_clean();
 
-// Inline styles + small JS (keeps everything self-contained; no extra files needed)
 $extraHead = <<<HTML
 <style>
-  .fac-wrap{
-    width: 100%;
-    height: 100%;
-    padding: 26px 34px;
-    box-sizing: border-box;
-    overflow: auto;
+  .facility-card {
+    align-content: start;
   }
 
-  .fac-header{
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    margin-bottom: 18px;
+  .facility-card__media {
+    min-height: 220px;
+    background:
+      radial-gradient(circle at top left, rgba(122, 0, 0, 0.18), transparent 44%),
+      linear-gradient(135deg, #f6ebe6 0%, #f8fbff 100%);
   }
 
-  .fac-title{
-    margin: 0;
-    font-size: 22px;
-    letter-spacing: .5px;
-    font-weight: 800;
-    color: #111;
+  .facility-card__overlay {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 2;
   }
 
-  .fac-filters{
-    display: flex;
-    gap: 12px;
-    align-items: center;
-  }
-
-  .fac-pill{
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
-    border: 1px solid #cfcfcf;
-    border-radius: 8px;
-    background: #fff;
-    color: #111;
-    font-weight: 800;
-    font-size: 13px;
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .fac-pill .fac-icon{
-    width: 18px;
-    display: inline-flex;
-    justify-content: center;
-    font-weight: 900;
-  }
-
-  .fac-pill.active{
-    background: #7a0000;
-    border-color: #7a0000;
-    color: #fff;
-  }
-
-  .fac-grid{
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 26px;
-    padding-bottom: 24px;
-  }
-
-  .fac-card{
-    border: 1px solid #d7d7d7;
-    border-radius: 10px;
-    background: #fff;
-    box-shadow: 0 2px 0 rgba(0,0,0,0.03);
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .fac-img{
-    height: 150px;
-    background: #f4f4f4;
-    display: flex;
+  .facility-card__fallback {
+    display: none;
     align-items: center;
     justify-content: center;
-    position: relative;
-  }
-
-  .fac-img img{
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-
-  .fac-img.img-fallback{
-    background: #fff;
-  }
-
-  .fac-fallback-mark{
-    width: 88px;
-    height: 88px;
+    width: 96px;
+    height: 96px;
     border-radius: 999px;
-    border: 10px solid #c00000;
-    color: #c00000;
+    border: 10px solid rgba(122, 0, 0, 0.88);
+    background: rgba(255, 255, 255, 0.86);
+    box-shadow: 0 20px 44px rgba(122, 0, 0, 0.16);
+    color: #7a0000;
+    font-size: 24px;
     font-weight: 900;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    letter-spacing: .5px;
+    letter-spacing: 0.08em;
   }
 
-  .fac-body{
-    padding: 12px 12px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    text-align: center;
+  .facility-card__media.is-fallback {
+    display: grid;
+    place-items: center;
   }
 
-  .fac-name{
-    font-weight: 900;
-    font-size: 11px;
-    letter-spacing: .4px;
-    color: #111;
+  .facility-card__media.is-fallback::after {
+    content: "";
+    position: absolute;
+    inset: 20px;
+    border-radius: 22px;
+    border: 1px dashed rgba(122, 0, 0, 0.2);
   }
 
-  .fac-desc{
-    font-size: 10px;
-    color: #444;
-    line-height: 1.25;
-    min-height: 26px;
-  }
-
-  .fac-btn{
-    margin-top: 4px;
-    align-self: center;
-    width: 120px;
-    height: 28px;
-    border: 0;
-    border-radius: 7px;
-    background: #7a0000;
-    color: #fff;
-    font-weight: 900;
-    font-size: 10px;
-    cursor: pointer;
-  }
-
-  .fac-card[hidden]{ display: none !important; }
-
-  @media (max-width: 1100px){
-    .fac-grid{ grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  }
-  @media (max-width: 820px){
-    .fac-grid{ grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .facility-card__media.is-fallback .facility-card__fallback {
+    display: inline-flex;
+    z-index: 1;
   }
 </style>
 HTML;
 
 $extraScripts = <<<HTML
 <script>
-  (function(){
-    const pills = document.querySelectorAll(".fac-pill");
-    const cards = document.querySelectorAll(".fac-card");
+  (function () {
+    const filters = Array.from(document.querySelectorAll(".public-filter[data-filter]"));
+    const cards = Array.from(document.querySelectorAll(".facility-card"));
+    const filteredEmpty = document.getElementById("facFilteredEmpty");
 
-    function setActive(btn){
-      pills.forEach(p => {
-        const on = p === btn;
-        p.classList.toggle("active", on);
-        p.setAttribute("aria-pressed", on ? "true" : "false");
-      });
+    function renderFilteredEmpty() {
+      if (!filteredEmpty) return;
+      const hasVisibleCards = cards.some((card) => !card.hidden);
+      filteredEmpty.classList.toggle("is-visible", !hasVisibleCards);
     }
 
-    function applyFilter(filter){
-      cards.forEach(card => {
-        const cat = card.getAttribute("data-category");
-        card.hidden = !(filter === "all" || cat === filter);
+    function applyFilter(filter) {
+      cards.forEach((card) => {
+        const category = card.getAttribute("data-category");
+        card.hidden = !(filter === "all" || category === filter);
       });
+      renderFilteredEmpty();
     }
 
-    pills.forEach(btn => {
-      btn.addEventListener("click", () => {
-        const filter = btn.getAttribute("data-filter");
-        setActive(btn);
+    filters.forEach((button) => {
+      button.addEventListener("click", () => {
+        const filter = button.getAttribute("data-filter") || "all";
+        filters.forEach((item) => {
+          const active = item === button;
+          item.classList.toggle("is-active", active);
+          item.setAttribute("aria-pressed", active ? "true" : "false");
+        });
         applyFilter(filter);
       });
     });
 
-    // "VIEW DETAILS" behavior: jump to map and auto-search/highlight
-    document.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-open]");
-      if (!b) return;
-
-      const key = b.getAttribute("data-open"); // e.g. "ALUMNI" or "ANTERIO_SORIANO"
-      // Store the requested building key for map page
-      sessionStorage.setItem("tnts:jumpToBuilding", key);
-      window.location.href = "../pages/map.php";
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-open]");
+      if (!button) return;
+      const destination = String(button.getAttribute("data-open") || "").trim();
+      if (!destination) return;
+      sessionStorage.setItem("tnts:jumpToDestination", destination);
+      window.location.href = "../pages/map.php?destination=" + encodeURIComponent(destination);
     });
+
+    if (cards.length > 0) {
+      applyFilter("all");
+    }
   })();
 </script>
 HTML;

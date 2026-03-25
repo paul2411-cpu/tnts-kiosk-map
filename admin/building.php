@@ -1,9 +1,10 @@
 <?php
 require_once __DIR__ . "/inc/auth.php";
-require_admin();
+require_admin_permission("manage_buildings", "You do not have access to manage buildings.");
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_sync.php";
 require_once __DIR__ . "/inc/building_identity.php";
+require_once __DIR__ . "/inc/map_entities.php";
 app_logger_set_default_subsystem("building_admin");
 
 $MODEL_DIR = __DIR__ . "/../models";
@@ -51,6 +52,18 @@ function bld_is_road_like_name(string $raw): bool {
   $name = trim($raw);
   if ($name === "") return false;
   return (bool)preg_match('/^road(?:[._-]\d+)?$/i', $name);
+}
+
+function bld_entity_meta(string $objectName): array {
+  $classified = map_naming_classify_top_level($objectName);
+  $entityType = trim((string)($classified["entity_type"] ?? ""));
+  if ($entityType === "") $entityType = "building";
+  $displayName = trim((string)($classified["display_name"] ?? ""));
+  return [
+    "include" => !empty($classified["include"]) && (($classified["bucket"] ?? "") === "buildings"),
+    "entityType" => $entityType,
+    "displayName" => $displayName,
+  ];
 }
 
 function bld_col(mysqli $conn, string $table, string $col): bool {
@@ -108,7 +121,7 @@ function bld_ensure_schema(mysqli $conn): void {
   if (!bld_col($conn, "buildings", "is_present_in_latest")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN is_present_in_latest TINYINT(1) NOT NULL DEFAULT 1 AFTER last_seen_version_id");
   if (!bld_col($conn, "buildings", "last_edited_at")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!bld_col($conn, "buildings", "last_edited_by_admin_id")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
-  map_identity_ensure_schema($conn);
+  map_entities_ensure_schema($conn);
 }
 
 function bld_version_id(mysqli $conn, string $modelFile, string $modelHash, ?int $adminId): int {
@@ -230,7 +243,10 @@ if (isset($_GET["action"])) {
     $hasVersion = bld_col($conn, "buildings", "last_seen_version_id");
     $hasEdited = bld_col($conn, "buildings", "last_edited_at");
 
-    $sql = "SELECT building_id, building_name, description, image_path, "
+    $sql = "SELECT building_id, building_name, "
+      . (bld_col($conn, "buildings", "model_object_name") ? "model_object_name" : "NULL AS model_object_name")
+      . ", " . (bld_col($conn, "buildings", "entity_type") ? "entity_type" : "'building' AS entity_type")
+      . ", description, image_path, "
       . ($hasSource ? "source_model_file" : "NULL AS source_model_file")
       . ", " . ($hasVersion ? "last_seen_version_id" : "NULL AS last_seen_version_id")
       . ", " . ($hasEdited ? "last_edited_at" : "NULL AS last_edited_at")
@@ -269,14 +285,16 @@ if (isset($_GET["action"])) {
     }
     $hasSource = bld_col($conn, "buildings", "source_model_file");
     $sqlCols = "building_id, building_name, description, image_path, "
+      . (bld_col($conn, "buildings", "model_object_name") ? "model_object_name" : "NULL AS model_object_name")
+      . ", " . (bld_col($conn, "buildings", "entity_type") ? "entity_type" : "'building' AS entity_type")
       . (bld_col($conn, "buildings", "last_seen_version_id") ? "last_seen_version_id" : "NULL AS last_seen_version_id")
       . ", " . (bld_col($conn, "buildings", "last_edited_at") ? "last_edited_at" : "NULL AS last_edited_at")
       . ", " . ($hasSource ? "source_model_file" : "NULL AS source_model_file");
     $row = null;
     if ($model !== "" && $hasSource) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1");
+      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE source_model_file = ? AND (building_name = ? OR model_object_name = ?) LIMIT 1");
       if ($stmt) {
-        $stmt->bind_param("ss", $model, $name);
+        $stmt->bind_param("sss", $model, $name, $name);
         if ($stmt->execute()) {
           $res = $stmt->get_result();
           $row = $res ? $res->fetch_assoc() : null;
@@ -284,9 +302,9 @@ if (isset($_GET["action"])) {
       }
     }
     if (!$row) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_name = ? ORDER BY building_id DESC LIMIT 1");
+      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_name = ? OR model_object_name = ? ORDER BY building_id DESC LIMIT 1");
       if ($stmt) {
-        $stmt->bind_param("s", $name);
+        $stmt->bind_param("ss", $name, $name);
         if ($stmt->execute()) {
           $res = $stmt->get_result();
           $row = $res ? $res->fetch_assoc() : null;
@@ -319,6 +337,11 @@ if (isset($_GET["action"])) {
     if (bld_is_road_like_name($oldName) || bld_is_road_like_name($newName)) {
       bld_fail(400, "Road objects cannot be saved as buildings");
     }
+    $entityMeta = bld_entity_meta($oldName);
+    if (empty($entityMeta["include"])) {
+      bld_fail(400, "Selected object is not a building-style destination");
+    }
+    $entityType = (string)$entityMeta["entityType"];
 
     if (!isset($_FILES["glb"])) bld_fail(400, "Missing GLB upload");
     if ((int)($_FILES["glb"]["error"] ?? 1) !== UPLOAD_ERR_OK) bld_fail(400, "GLB upload error");
@@ -358,16 +381,19 @@ if (isset($_GET["action"])) {
       $id = 0;
       $buildingUid = "";
       $buildingObjectName = $oldName;
+      $previousDisplayName = "";
       $lookups = [
-        ["SELECT building_id, building_uid, model_object_name FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $oldName]],
-        ["SELECT building_id, building_uid, model_object_name FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $newName]],
+        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE source_model_file = ? AND model_object_name = ? LIMIT 1", "ss", [$modelFile, $oldName]],
+        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $newName]],
+        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE model_object_name = ? ORDER BY building_id DESC LIMIT 1", "s", [$oldName]],
+        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE building_name = ? ORDER BY building_id DESC LIMIT 1", "s", [$newName]],
       ];
       foreach ($lookups as $q) {
         if ($id > 0) break;
         [$sql, $types, $params] = $q;
         $stmt = $conn->prepare($sql);
         if (!$stmt) throw new RuntimeException("Failed to prepare lookup");
-        $stmt->bind_param("ss", $params[0], $params[1]);
+        $stmt->bind_param($types, ...$params);
         if (!$stmt->execute()) throw new RuntimeException("Failed building lookup");
         $res = $stmt->get_result();
         $row = $res ? $res->fetch_assoc() : null;
@@ -375,11 +401,13 @@ if (isset($_GET["action"])) {
           $id = (int)$row["building_id"];
           $buildingUid = map_identity_normalize_uid((string)($row["building_uid"] ?? ""));
           $buildingObjectName = trim((string)($row["model_object_name"] ?? $buildingObjectName));
+          $previousDisplayName = trim((string)($row["building_name"] ?? ""));
+          $entityType = trim((string)($row["entity_type"] ?? $entityType)) ?: $entityType;
         }
         $stmt->close();
       }
 
-      if ($oldName !== $newName) {
+      if ($newName !== "") {
         $dupStmt = $conn->prepare("SELECT building_id FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1");
         if (!$dupStmt) throw new RuntimeException("Failed to prepare duplicate building check");
         $dupStmt->bind_param("ss", $modelFile, $newName);
@@ -397,50 +425,55 @@ if (isset($_GET["action"])) {
       }
 
       if ($buildingUid === "") {
-        $buildingUid = map_identity_resolve_uid($conn, $oldName !== "" ? $oldName : $newName, $modelFile);
+        $buildingUid = map_identity_resolve_uid($conn, $previousDisplayName !== "" ? $previousDisplayName : $newName, $modelFile);
       }
       if ($buildingObjectName === "") {
         $buildingObjectName = $oldName !== "" ? $oldName : $newName;
+      }
+      if ($previousDisplayName === "") {
+        $previousDisplayName = $newName;
       }
 
       $inserted = false;
       if ($id > 0) {
         if ($adminId === null) {
-          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE building_id=?");
+          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, entity_type=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=NULL WHERE building_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssssii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $id);
+          $stmt->bind_param("sssssssii", $buildingUid, $newName, $buildingObjectName, $entityType, $description, $imagePath, $modelFile, $versionId, $id);
         } else {
-          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE building_id=?");
+          $stmt = $conn->prepare("UPDATE buildings SET building_uid=?, building_name=?, model_object_name=?, entity_type=?, description=?, image_path=?, source_model_file=?, last_seen_version_id=?, is_present_in_latest=1, last_edited_at=NOW(), last_edited_by_admin_id=? WHERE building_id=?");
           if (!$stmt) throw new RuntimeException("Failed to prepare update");
-          $stmt->bind_param("ssssssiii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
+          $stmt->bind_param("sssssssiii", $buildingUid, $newName, $buildingObjectName, $entityType, $description, $imagePath, $modelFile, $versionId, $adminId, $id);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to update building");
         $stmt->close();
       } else {
         $inserted = true;
         if ($adminId === null) {
-          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
+          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, entity_type, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssssii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $versionId);
+          $stmt->bind_param("sssssssii", $buildingUid, $newName, $buildingObjectName, $entityType, $description, $imagePath, $modelFile, $versionId, $versionId);
         } else {
-          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
+          $stmt = $conn->prepare("INSERT INTO buildings (building_uid, building_name, model_object_name, entity_type, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)");
           if (!$stmt) throw new RuntimeException("Failed to prepare insert");
-          $stmt->bind_param("ssssssiii", $buildingUid, $newName, $buildingObjectName, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
+          $stmt->bind_param("sssssssiii", $buildingUid, $newName, $buildingObjectName, $entityType, $description, $imagePath, $modelFile, $versionId, $versionId, $adminId);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to insert building");
         $id = (int)$stmt->insert_id;
         $stmt->close();
       }
 
-      bld_sync_linked_room_names($conn, $id, $buildingUid, $oldName, $newName, $modelFile);
+      bld_sync_linked_room_names($conn, $id, $buildingUid, $previousDisplayName, $newName, $modelFile);
 
-      if ($oldName !== $newName && !map_sync_rename_roadnet_links($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
+      $displayNameChanged = !$inserted && $previousDisplayName !== "" && strcasecmp($previousDisplayName, $newName) !== 0;
+
+      if ($displayNameChanged && !map_sync_rename_roadnet_links($projectRoot, $modelFile, $previousDisplayName, $newName, $buildingUid)) {
         throw new RuntimeException("Failed to sync published road links for renamed building");
       }
-      if ($oldName !== $newName && !map_sync_rename_route_entry($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
+      if ($displayNameChanged && !map_sync_rename_route_entry($projectRoot, $modelFile, $previousDisplayName, $newName, $buildingUid)) {
         throw new RuntimeException("Failed to sync published routes for renamed building");
       }
-      if ($oldName !== $newName && !map_sync_rename_guide_entries($projectRoot, $modelFile, $oldName, $newName, $buildingUid)) {
+      if ($displayNameChanged && !map_sync_rename_guide_entries($projectRoot, $modelFile, $previousDisplayName, $newName, $buildingUid)) {
         throw new RuntimeException("Failed to sync published text guides for renamed building");
       }
 
@@ -459,8 +492,10 @@ if (isset($_GET["action"])) {
         "modelFile" => $modelFile,
         "buildingId" => $id,
         "buildingUid" => $buildingUid,
-        "oldName" => $oldName,
+        "objectName" => $buildingObjectName,
+        "oldName" => $previousDisplayName,
         "newName" => $newName,
+        "entityType" => $entityType,
         "inserted" => $inserted,
         "versionId" => $versionId,
       ], [
@@ -472,6 +507,7 @@ if (isset($_GET["action"])) {
         "buildingId" => $id,
         "versionId" => $versionId,
         "editedAt" => $edited,
+        "entityType" => $entityType,
         "inserted" => $inserted,
         "backupFile" => "models/backups/" . $backupName
       ], JSON_PRETTY_PRINT);
@@ -515,7 +551,7 @@ admin_layout_start("Buildings", "buildings");
   <div class="section-title">Building Editor (Map + DB)</div>
   <div style="color:#667085;font-weight:800;line-height:1.6;">
     Load a map model, click a building in the 3D viewport, edit details, and save.<br>
-    Save engraves the new building name into GLB and updates database metadata with map version and edit timestamp.
+    Save keeps the GLB object name stable and updates the database label, metadata, and destination type based on the map object prefix.
   </div>
 </div>
 
@@ -540,7 +576,8 @@ admin_layout_start("Buildings", "buildings");
     <form class="form" onsubmit="return false;">
       <div class="row"><div class="label">Selected (Map)</div><input id="selected-object-name" class="input" readonly /></div>
       <div class="row"><div class="label">Source Model</div><input id="selected-model-file" class="input" readonly /></div>
-      <div class="row"><div class="label">Building Name</div><input id="building-new-name" class="input" /></div>
+      <div class="row"><div class="label">Display Name</div><input id="building-new-name" class="input" /></div>
+      <div class="row"><div class="label">Destination Type</div><input id="building-entity-type" class="input" readonly /></div>
       <div class="row"><div class="label">Description</div><textarea id="building-description" class="textarea"></textarea></div>
       <div class="row"><div class="label">Image Path</div><input id="building-image-path" class="input" placeholder="/assets/buildings/arca.jpg" /></div>
       <div class="row"><div class="label">Version ID</div><input id="building-version" class="input" readonly /></div>
@@ -558,11 +595,11 @@ admin_layout_start("Buildings", "buildings");
   <table>
     <thead>
       <tr>
-        <th>ID</th><th>Building</th><th>Description</th><th>Image</th><th>Model</th><th>Version</th><th>Last Edited</th>
+        <th>ID</th><th>Display Name</th><th>Object Name</th><th>Type</th><th>Description</th><th>Image</th><th>Model</th><th>Version</th><th>Last Edited</th>
       </tr>
     </thead>
     <tbody id="buildings-table-body">
-      <tr><td colspan="7">No data loaded yet.</td></tr>
+      <tr><td colspan="9">No data loaded yet.</td></tr>
     </tbody>
   </table>
 </div>
@@ -581,6 +618,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { classifyTopLevelObjectName, isGenericSceneName, isGroundLikeName, isRoadLikeObjectName } from "../js/map-entity-utils.js";
 
 const CSRF = <?= json_encode($BUILDING_EDITOR_CSRF) ?>;
 const ORIGINAL = <?= json_encode($ORIGINAL_MODEL_NAME) ?>;
@@ -595,6 +633,7 @@ const tableBody = document.getElementById("buildings-table-body");
 const selectedName = document.getElementById("selected-object-name");
 const selectedModel = document.getElementById("selected-model-file");
 const newName = document.getElementById("building-new-name");
+const entityType = document.getElementById("building-entity-type");
 const desc = document.getElementById("building-description");
 const imagePath = document.getElementById("building-image-path");
 const version = document.getElementById("building-version");
@@ -687,29 +726,30 @@ function updateEditorMode() {
 }
 
 function isGroundName(name) {
-  const n = String(name || "").trim().toLowerCase();
-  if (!n) return false;
-  if (n === "ground" || n === "cground") return true;
-  return /(^|[^a-z0-9])c?ground($|[^a-z0-9])/i.test(n);
+  return isGroundLikeName(name);
 }
 
 function isRoadLikeName(name) {
-  const n = String(name || "").trim();
-  if (!n) return false;
-  return /^road(?:[._-]\d+)?$/i.test(n);
+  return isRoadLikeObjectName(name);
 }
 
 function isGenericName(name) {
-  const raw = String(name || "").trim().toLowerCase();
-  const d = raw.replace(/([._-]\d+)+$/g, "");
-  return d === "scene" || d === "auxscene" || d === "root" || d === "rootnode" || d === "gltf" || d === "model" || d === "group";
+  return isGenericSceneName(name);
+}
+
+function classifyDestinationRoot(name) {
+  const info = classifyTopLevelObjectName(name || "");
+  if (!info?.include) return null;
+  if (info.bucket !== "buildings") return null;
+  return info;
 }
 
 function topNamedAncestor(obj, root) {
   let p = obj;
   let top = null;
   while (p && p !== root) {
-    if (p.name && !isGenericName(p.name) && !isGroundName(p.name) && !isRoadLikeName(p.name)) top = p;
+    const info = classifyDestinationRoot(p?.name || "");
+    if (info) top = p;
     p = p.parent;
   }
   return top;
@@ -727,6 +767,7 @@ function clearHelper(ref) {
 function clearSelectionForm() {
   selectedName.value = "";
   newName.value = "";
+  entityType.value = "";
   desc.value = "";
   imagePath.value = "";
   version.value = "";
@@ -745,7 +786,9 @@ function setSelection(root) {
   scene.add(selectedBox);
   selectedName.value = selectedRoot.name || "";
   selectedModel.value = modelSel.value || "";
-  newName.value = selectedRoot.name || "";
+  const classification = classifyDestinationRoot(selectedRoot.name || "");
+  newName.value = classification?.displayName || selectedRoot.name || "";
+  entityType.value = classification?.entityType || "";
   loadSelectedMeta().catch((err) => setStatus(`Meta load failed: ${err?.message || err}`, "#b42318"));
 }
 
@@ -883,12 +926,12 @@ async function loadBuildingsTable() {
   const rows = Array.isArray(data.buildings) ? data.buildings : [];
   tableBody.innerHTML = "";
   if (!rows.length) {
-    tableBody.innerHTML = "<tr><td colspan=\"7\">No metadata for this model.</td></tr>";
+    tableBody.innerHTML = "<tr><td colspan=\"9\">No metadata for this model.</td></tr>";
     return;
   }
   rows.forEach((r) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${esc(r.building_id)}</td><td>${esc(r.building_name)}</td><td>${esc(r.description || "-")}</td><td>${esc(r.image_path || "-")}</td><td>${esc(r.source_model_file || "-")}</td><td>${esc(r.last_seen_version_id || "-")}</td><td>${esc(r.last_edited_at || "-")}</td>`;
+    tr.innerHTML = `<td>${esc(r.building_id)}</td><td>${esc(r.building_name)}</td><td>${esc(r.model_object_name || "-")}</td><td>${esc(r.entity_type || "building")}</td><td>${esc(r.description || "-")}</td><td>${esc(r.image_path || "-")}</td><td>${esc(r.source_model_file || "-")}</td><td>${esc(r.last_seen_version_id || "-")}</td><td>${esc(r.last_edited_at || "-")}</td>`;
     tableBody.appendChild(tr);
   });
 }
@@ -899,7 +942,10 @@ async function loadSelectedMeta() {
   const res = await fetch(url, { cache: "no-store" });
   const data = await res.json();
   if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+  const classification = classifyDestinationRoot(selectedRoot.name || "");
   if (!data.found || !data.building) {
+    newName.value = classification?.displayName || selectedRoot.name || "";
+    entityType.value = classification?.entityType || "building";
     desc.value = "";
     imagePath.value = "";
     version.value = "";
@@ -907,6 +953,8 @@ async function loadSelectedMeta() {
     return;
   }
   const b = data.building;
+  newName.value = String(b.building_name || classification?.displayName || selectedRoot.name || "");
+  entityType.value = String(b.entity_type || classification?.entityType || "building");
   desc.value = String(b.description || "");
   imagePath.value = String(b.image_path || "");
   version.value = b.last_seen_version_id != null ? String(b.last_seen_version_id) : "";
@@ -967,9 +1015,7 @@ async function saveBuilding() {
     return;
   }
 
-  const prev = selectedRoot.name;
-  selectedRoot.name = nextName;
-  setStatus(`Saving ${oldName} -> ${nextName} ...`);
+  setStatus(`Saving ${oldName} as ${nextName} ...`);
   try {
     const binary = await exportBinary(mapRoot);
     const fd = new FormData();
@@ -988,14 +1034,14 @@ async function saveBuilding() {
     const data = await res.json();
     if (!res.ok || !data?.ok) throw new Error(data?.error || `HTTP ${res.status}`);
 
-    selectedName.value = nextName;
+    selectedName.value = oldName;
+    entityType.value = String(data.entityType || entityType.value || "");
     version.value = data.versionId != null ? String(data.versionId) : "";
     editedAt.value = String(data.editedAt || "");
     await loadBuildingsTable();
     setStatus(`Saved ${nextName}. Backup: ${data.backupFile || "created"}.`, "#0f766e");
   } catch (err) {
-    selectedRoot.name = prev;
-    selectedName.value = prev;
+    selectedName.value = oldName;
     setStatus(`Save failed: ${err?.message || err}`, "#b42318");
   }
 }

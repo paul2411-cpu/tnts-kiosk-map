@@ -18,6 +18,7 @@ if (!isset($extraScripts)) $extraScripts = "";
   <link rel="stylesheet" href="../css/app.css">
   <link rel="stylesheet" href="../css/nav.css">
   <link rel="stylesheet" href="../css/map.css">
+  <link rel="stylesheet" href="../css/public-panels.css">
 
   <?= $extraHead ?>
   <?= app_logger_client_bootstrap([
@@ -40,9 +41,7 @@ if (!isset($extraScripts)) $extraScripts = "";
       <div class="topbar-right">
         <div class="searchbox">
           <input id="search-input" type="text" placeholder="Type to Search here...." />
-          <button type="button" class="searchbtn" aria-label="Search">
-            🔍
-          </button>
+          <button type="button" class="searchbtn" aria-label="Search"><span aria-hidden="true">&#128269;</span></button>
         </div>
       </div>
     </header>

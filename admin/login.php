@@ -2,8 +2,10 @@
 // /admin/login.php
 if (session_status() === PHP_SESSION_NONE) session_start();
 require_once __DIR__ . "/inc/db.php";
+require_once __DIR__ . "/inc/admin_users.php";
 
 $error = "";
+admin_users_ensure_schema($conn);
 
 if (!empty($_SESSION["admin_logged_in"])) {
   header("Location: dashboard.php");
@@ -17,20 +19,15 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
   if ($username === "" || $password === "") {
     $error = "Please enter username and password.";
   } else {
-    $stmt = $conn->prepare("SELECT admin_id, username, password_hash, full_name, role FROM admin_users WHERE username=? LIMIT 1");
-    $stmt->bind_param("s", $username);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    $user = $res->fetch_assoc();
-    $stmt->close();
+    try {
+      $user = admin_users_fetch_by_username($conn, $username);
+    } catch (Throwable $_) {
+      $user = null;
+    }
 
     if ($user && password_verify($password, $user["password_hash"])) {
       session_regenerate_id(true);
-      $_SESSION["admin_logged_in"] = true;
-      $_SESSION["admin_id"] = $user["admin_id"];
-      $_SESSION["admin_username"] = $user["username"];
-      $_SESSION["admin_full_name"] = $user["full_name"] ?: $user["username"];
-      $_SESSION["admin_role"] = $user["role"];
+      admin_users_apply_session($user);
 
       // Update last login
       $stmt2 = $conn->prepare("UPDATE admin_users SET last_login=NOW() WHERE admin_id=?");
