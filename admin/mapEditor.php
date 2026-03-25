@@ -3383,6 +3383,38 @@ function normalizeDestinationEntityType(type) {
   return "building";
 }
 
+function getDestinationEntityPriority(entityType) {
+  switch (normalizeDestinationEntityType(entityType)) {
+    case "facility":
+      return 5;
+    case "venue":
+      return 4;
+    case "area":
+      return 3;
+    case "landmark":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function shouldPreferCatalogAlias(nextEntry, currentEntry) {
+  if (!currentEntry) return true;
+  const nextPriority = getDestinationEntityPriority(nextEntry?.entityType);
+  const currentPriority = getDestinationEntityPriority(currentEntry?.entityType);
+  if (nextPriority !== currentPriority) return nextPriority > currentPriority;
+
+  const nextObject = String(nextEntry?.objectName || "").trim();
+  const currentObject = String(currentEntry?.objectName || "").trim();
+  if (!!nextObject !== !!currentObject) return !!nextObject;
+
+  const nextUid = normalizeBuildingUid(nextEntry?.buildingUid);
+  const currentUid = normalizeBuildingUid(currentEntry?.buildingUid);
+  if (!!nextUid !== !!currentUid) return !!nextUid;
+
+  return false;
+}
+
 function inferDestinationEntityType({ objectName = "", buildingName = "", catalogEntry = null } = {}) {
   const fromCatalog = normalizeDestinationEntityType(catalogEntry?.entityType || "");
   if (fromCatalog && fromCatalog !== "building") return fromCatalog;
@@ -3398,7 +3430,7 @@ function getRoadAttachPolicy(entityType) {
   if (safeType === "building" || safeType === "venue") {
     return { entityType: safeType, attachable: true, blocking: true, maxLinks: 1 };
   }
-  if (safeType === "area") {
+  if (safeType === "area" || safeType === "facility") {
     return { entityType: safeType, attachable: true, blocking: false, maxLinks: 1 };
   }
   return { entityType: safeType, attachable: false, blocking: false, maxLinks: 0 };
@@ -3430,12 +3462,12 @@ function registerModelBuildingCatalogEntry(rawEntry = {}) {
   }
 
   const nameKey = normalizeBuildingName(entry.name);
-  if (nameKey && !modelBuildingsByNameKey.has(nameKey)) {
+  if (nameKey && (!modelBuildingsByNameKey.has(nameKey) || shouldPreferCatalogAlias(entry, modelBuildingsByNameKey.get(nameKey)))) {
     modelBuildingsByNameKey.set(nameKey, entry);
   }
 
   const objectKey = normalizeBuildingObjectName(entry.objectName);
-  if (objectKey && !modelBuildingsByObjectKey.has(objectKey)) {
+  if (objectKey && (!modelBuildingsByObjectKey.has(objectKey) || shouldPreferCatalogAlias(entry, modelBuildingsByObjectKey.get(objectKey)))) {
     modelBuildingsByObjectKey.set(objectKey, entry);
   }
 
@@ -3472,21 +3504,29 @@ function getModelBuildingCatalogEntry({ buildingUid = "", buildingName = "", obj
     return modelBuildingsByUid.get(safeUid) || null;
   }
 
+  let best = null;
+
   for (const candidate of [objectName, buildingName]) {
     const objectKey = normalizeBuildingObjectName(candidate);
     if (objectKey && modelBuildingsByObjectKey.has(objectKey)) {
-      return modelBuildingsByObjectKey.get(objectKey) || null;
+      const entry = modelBuildingsByObjectKey.get(objectKey) || null;
+      if (entry && (!best || shouldPreferCatalogAlias(entry, best))) {
+        best = entry;
+      }
     }
   }
 
   for (const candidate of [buildingName, objectName]) {
     const nameKey = normalizeBuildingName(candidate);
     if (nameKey && modelBuildingsByNameKey.has(nameKey)) {
-      return modelBuildingsByNameKey.get(nameKey) || null;
+      const entry = modelBuildingsByNameKey.get(nameKey) || null;
+      if (entry && (!best || shouldPreferCatalogAlias(entry, best))) {
+        best = entry;
+      }
     }
   }
 
-  return null;
+  return best;
 }
 
 function resolveBuildingIdentity({ buildingUid = "", buildingName = "", objectName = "" } = {}) {

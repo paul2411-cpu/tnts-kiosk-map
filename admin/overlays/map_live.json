@@ -1,9 +1,9 @@
 {
     "ok": true,
-    "modelFile": "tnts_mapROAD_TEST.glb",
-    "roadnetFile": "roadnet_tnts_mapROAD_TEST.glb.json",
-    "routesFile": "routes_tnts_mapROAD_TEST.glb.json",
-    "guidesFile": "guides_tnts_mapROAD_TEST.glb.json",
-    "version": "20260324085042_c9e4c9ed",
-    "publishedAt": 1774338642
+    "modelFile": "tnts_map_export_20260326_040256.glb",
+    "roadnetFile": "roadnet_tnts_map_export_20260326_040256.glb.json",
+    "routesFile": "routes_tnts_map_export_20260326_040256.glb.json",
+    "guidesFile": "guides_tnts_map_export_20260326_040256.glb.json",
+    "version": "20260325210313_a9361135",
+    "publishedAt": 1774468993
 }

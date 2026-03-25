@@ -5,6 +5,7 @@
   position: absolute;
   inset: 0;           /* fill main area */
   overflow: hidden;   /* prevent zoom scroll jump */
+  overscroll-behavior: none;
   background: #ffffff;
 }
 /* Force the WebGL canvas to fill the map area */
@@ -214,6 +215,32 @@
   gap: 10px;
 }
 
+#card-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.card-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.card-header-btn {
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: #eef2ff;
+  color: #274690;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.card-header-btn:hover {
+  background: #dfe7ff;
+}
+
 #card-title { margin: 0; font-size: 18px; color: #222; font-weight: 700; }
 #card-info  { margin: 0; color: #555; line-height: 1.5; font-size: 14px; }
 #card-info { order: 1; }
@@ -249,7 +276,7 @@
 .card-rooms-list {
   display: grid;
   gap: 8px;
-  max-height: 200px;
+  max-height: 280px;
   overflow: auto;
 }
 
@@ -272,6 +299,11 @@
 .card-room-item--interactive:hover {
   border-color: #98a2b3;
   box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08);
+}
+
+.card-room-item--interactive:focus-visible {
+  outline: 3px solid rgba(31, 122, 255, 0.26);
+  outline-offset: 1px;
 }
 
 .card-room-head {
@@ -329,6 +361,37 @@
 .card-room-action {
   color: #175cd3;
   font-weight: 700;
+}
+
+.card-search-item {
+  gap: 0;
+}
+
+.card-search-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #274690;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.card-search-copy {
+  margin-top: 6px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.card-search-copy.is-muted {
+  color: #98a2b3;
 }
 
 #close-btn {

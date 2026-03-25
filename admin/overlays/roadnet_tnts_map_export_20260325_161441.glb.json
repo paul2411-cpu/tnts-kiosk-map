@@ -1,0 +1,292 @@
+{
+    "ok": true,
+    "model": "tnts_map_export_20260325_161441.glb",
+    "updated": 1774426483,
+    "roads": [
+        {
+            "type": "road",
+            "id": "road_1774426411518_361",
+            "name": "road",
+            "position": [
+                586.2991498781795,
+                1.4310853248237336,
+                -34.351073964599124
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 7,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426411518_5"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774426411518_5",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774426411518
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426420204_711",
+            "name": "road",
+            "position": [
+                586.2991498781795,
+                1.4310853248237336,
+                -34.351073964599124
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 7,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    -43.70675669290233,
+                    0,
+                    7.105427357601002e-15
+                ],
+                [
+                    -100.02774088953612,
+                    0,
+                    0
+                ],
+                [
+                    -174.32375992837626,
+                    0,
+                    7.105427357601002e-15
+                ],
+                [
+                    -174.32375992837626,
+                    0,
+                    -9.756221207520014
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426411518_5",
+                "rp_1774426420204_7",
+                "rp_1774426421830_8",
+                "rp_1774426423708_9",
+                "rp_1774426426580_10"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774426411518_5",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774426411518
+                },
+                null,
+                null,
+                null,
+                {
+                    "id": "rp_1774426426580_10",
+                    "label": "BLD_ADMIN__front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_ADMIN_",
+                        "objectName": "BLD_ADMIN_",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774426426580
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426427798_459",
+            "name": "road",
+            "position": [
+                486.2714089886434,
+                1.4310853248237336,
+                -34.351073964599124
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 7,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    0,
+                    0,
+                    -11.564456716178555
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426421830_8",
+                "rp_1774426427798_12"
+            ],
+            "pointMeta": [
+                null,
+                {
+                    "id": "rp_1774426427798_12",
+                    "label": "BLD_ERINEO_MALIKSI_front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_ERINEO_MALIKSI",
+                        "objectName": "BLD_ERINEO_MALIKSI",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774426427798
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426429325_681",
+            "name": "road",
+            "position": [
+                542.5923931852772,
+                1.4310853248237336,
+                -34.35107396459912
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 7,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    0,
+                    0,
+                    -12.165023344519888
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426420204_7",
+                "rp_1774426429325_14"
+            ],
+            "pointMeta": [
+                null,
+                {
+                    "id": "rp_1774426429325_14",
+                    "label": "BLD_J_REMULLA_front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_J_REMULLA",
+                        "objectName": "BLD_J_REMULLA",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774426429325
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426470037_950",
+            "name": "road",
+            "position": [
+                411.97538994980323,
+                1.4310853248237336,
+                -34.35107396459912
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 7,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    -29.29104791142379,
+                    0,
+                    -7.105427357601002e-15
+                ],
+                [
+                    -26.91738270950782,
+                    0,
+                    -33.95860080755893
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426423708_9",
+                "rp_1774426470037_16",
+                "rp_1774426475636_17"
+            ],
+            "pointMeta": [
+                null,
+                null,
+                {
+                    "id": "rp_1774426475636_17",
+                    "label": "BLD_SOCIAL_HALL_front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_SOCIAL_HALL",
+                        "objectName": "BLD_SOCIAL_HALL",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774426475636
+                }
+            ]
+        }
+    ]
+}

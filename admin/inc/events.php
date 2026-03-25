@@ -87,6 +87,11 @@ function events_normalize_entity_type(string $type): string {
   return in_array($safe, ["building", "venue", "area", "landmark"], true) ? $safe : "building";
 }
 
+function events_normalize_destination_type(string $type): string {
+  $safe = trim(mb_strtolower($type));
+  return in_array($safe, ["building", "venue", "area", "landmark", "facility"], true) ? $safe : "building";
+}
+
 function events_route_anchor_entity_types(): array {
   return ["building", "venue", "area"];
 }
@@ -257,6 +262,104 @@ function events_is_model_match(string $targetModel, string $publicModel): bool {
   $publicModel = trim($publicModel);
   if ($publicModel === "" || $targetModel === "") return true;
   return strcasecmp($targetModel, $publicModel) === 0;
+}
+
+function events_public_destination_catalog(mysqli $conn, string $publicModel): array {
+  static $cache = [];
+  $cacheKey = trim($publicModel);
+  if (array_key_exists($cacheKey, $cache)) return $cache[$cacheKey];
+  try {
+    $cache[$cacheKey] = map_entities_fetch_model_destinations($conn, $publicModel, true);
+  } catch (Throwable $_) {
+    $cache[$cacheKey] = [];
+  }
+  return $cache[$cacheKey];
+}
+
+function events_public_room_catalog(mysqli $conn, string $publicModel): array {
+  static $cache = [];
+  $cacheKey = trim($publicModel);
+  if (array_key_exists($cacheKey, $cache)) return $cache[$cacheKey];
+  try {
+    $cache[$cacheKey] = events_load_room_options($conn, $publicModel);
+  } catch (Throwable $_) {
+    $cache[$cacheKey] = [];
+  }
+  return $cache[$cacheKey];
+}
+
+function events_lookup_public_destination(
+  mysqli $conn,
+  string $publicModel,
+  string $buildingName = "",
+  string $objectName = "",
+  string $buildingUid = "",
+  array $entityTypes = []
+): ?array {
+  $safeUid = trim((string)$buildingUid);
+  $safeName = events_normalize_lookup($buildingName);
+  $safeObject = events_normalize_lookup($objectName);
+  $allowedTypes = array_values(array_unique(array_filter(array_map("events_normalize_destination_type", $entityTypes))));
+
+  $best = null;
+  $bestScore = 0;
+  foreach (events_public_destination_catalog($conn, $publicModel) as $row) {
+    $type = events_normalize_destination_type((string)($row["entityType"] ?? "building"));
+    if ($allowedTypes && !in_array($type, $allowedTypes, true)) continue;
+
+    $rowUid = trim((string)($row["buildingUid"] ?? ""));
+    $rowName = events_normalize_lookup((string)($row["name"] ?? ""));
+    $rowObject = events_normalize_lookup((string)($row["objectName"] ?? ""));
+
+    $score = 0;
+    if ($safeUid !== "" && $rowUid !== "" && strcasecmp($rowUid, $safeUid) === 0) $score += 220;
+    if ($safeObject !== "" && $rowObject === $safeObject) $score += 140;
+    if ($safeName !== "" && $rowName === $safeName) $score += 110;
+    if ($safeObject !== "" && $rowName === $safeObject) $score += 40;
+    if ($safeName !== "" && $rowObject === $safeName) $score += 30;
+    if ($score <= 0) continue;
+
+    if ($score > $bestScore) {
+      $bestScore = $score;
+      $best = $row;
+    }
+  }
+
+  return is_array($best) ? $best : null;
+}
+
+function events_lookup_public_room(
+  mysqli $conn,
+  string $publicModel,
+  string $buildingName = "",
+  string $roomName = "",
+  string $roomNumber = ""
+): ?array {
+  $safeBuilding = events_normalize_lookup($buildingName);
+  $safeRoom = events_normalize_lookup($roomName);
+  $safeNumber = events_normalize_lookup($roomNumber);
+  if ($safeRoom === "" && $safeNumber === "") return null;
+
+  $best = null;
+  $bestScore = 0;
+  foreach (events_public_room_catalog($conn, $publicModel) as $row) {
+    $rowBuilding = events_normalize_lookup((string)($row["building_name"] ?? ""));
+    $rowRoom = events_normalize_lookup((string)($row["room_name"] ?? ""));
+    $rowNumber = events_normalize_lookup((string)($row["room_number"] ?? ""));
+
+    $score = 0;
+    if ($safeBuilding !== "" && $rowBuilding === $safeBuilding) $score += 90;
+    if ($safeRoom !== "" && $rowRoom === $safeRoom) $score += 130;
+    if ($safeNumber !== "" && $rowNumber === $safeNumber) $score += 120;
+    if ($score <= 0) continue;
+
+    if ($score > $bestScore) {
+      $bestScore = $score;
+      $best = $row;
+    }
+  }
+
+  return is_array($best) ? $best : null;
 }
 
 function events_banner_url(?string $storedPath): string {
@@ -452,6 +555,29 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
     ];
   }
 
+  $publicFacilityMatch = events_lookup_public_destination(
+    $conn,
+    $publicModel,
+    $facilityName,
+    $facilityObjectName,
+    "",
+    ["facility"]
+  );
+  $fallbackFacilityMatch = is_array($publicFacilityMatch) ? [
+    "facility" => $facility,
+    "health" => "limited",
+    "canMap" => true,
+    "canRoute" => false,
+    "message" => "This facility was matched to the current public map.",
+    "resolvedTarget" => [
+      "type" => "facility",
+      "buildingId" => isset($publicFacilityMatch["id"]) ? (int)$publicFacilityMatch["id"] : 0,
+      "buildingUid" => trim((string)($publicFacilityMatch["buildingUid"] ?? "")),
+      "buildingName" => trim((string)($publicFacilityMatch["name"] ?? $facilityName)),
+      "objectName" => trim((string)($publicFacilityMatch["objectName"] ?? $facilityObjectName)),
+    ],
+  ] : null;
+
   $hasRoomSource = events_has_column($conn, "rooms", "source_model_file");
   $hasRoomPresent = events_has_column($conn, "rooms", "is_present_in_latest");
   $hasRoomBuildingName = events_has_column($conn, "rooms", "building_name");
@@ -479,6 +605,7 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
 
   $stmt = $conn->prepare($sql);
   if (!$stmt) {
+    if (is_array($fallbackFacilityMatch)) return $fallbackFacilityMatch;
     return [
       "facility" => $facility,
       "health" => "limited",
@@ -492,6 +619,7 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
   $stmt->bind_param("i", $facilityId);
   if (!$stmt->execute()) {
     $stmt->close();
+    if (is_array($fallbackFacilityMatch)) return $fallbackFacilityMatch;
     return [
       "facility" => $facility,
       "health" => "limited",
@@ -512,6 +640,7 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
   $stmt->close();
 
   if (!$rows) {
+    if (is_array($fallbackFacilityMatch)) return $fallbackFacilityMatch;
     return [
       "facility" => $facility,
       "health" => "limited",
@@ -533,6 +662,7 @@ function events_resolve_facility_target(mysqli $conn, int $facilityId, string $p
   }
 
   if (!$validRows) {
+    if (is_array($fallbackFacilityMatch)) return $fallbackFacilityMatch;
     return [
       "facility" => $facility,
       "health" => "needs_review",
@@ -796,11 +926,46 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
 
     $buildingName = trim((string)($building["building_name"] ?? ""));
     $buildingType = trim((string)($building["entity_type"] ?? "building")) ?: "building";
+    $buildingUid = trim((string)($building["building_uid"] ?? ""));
+    $buildingObjectName = trim((string)($building["model_object_name"] ?? ""));
     if ($displayLocation === "") $resolved["displayLocation"] = $buildingName;
 
     $present = (string)($building["is_present_in_latest"] ?? "1") !== "0";
     $sourceModel = trim((string)($building["source_model_file"] ?? ""));
     if (!$present || !events_is_model_match($sourceModel, $publicModel)) {
+      $fallbackBuilding = events_lookup_public_destination(
+        $conn,
+        $publicModel,
+        $buildingName,
+        $buildingObjectName,
+        $buildingUid,
+        [$buildingType]
+      );
+      if (is_array($fallbackBuilding)) {
+        $fallbackName = trim((string)($fallbackBuilding["name"] ?? $buildingName));
+        $fallbackUid = trim((string)($fallbackBuilding["buildingUid"] ?? ""));
+        $fallbackObjectName = trim((string)($fallbackBuilding["objectName"] ?? $buildingObjectName));
+        if ($displayLocation === "") $resolved["displayLocation"] = $fallbackName;
+        $resolved["health"] = "limited";
+        $resolved["healthLabel"] = events_health_labels()["limited"];
+        $resolved["canMap"] = true;
+        $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+          "buildingUid" => $fallbackUid,
+          "buildingName" => $fallbackName,
+          "objectName" => $fallbackObjectName,
+        ]);
+        $resolved["message"] = $resolved["canRoute"]
+          ? "This event was matched to the current public map. Directions are available."
+          : "This event was matched to the current public map, but no published route is available right now.";
+        $resolved["resolvedTarget"] = [
+          "type" => trim((string)($fallbackBuilding["entityType"] ?? $buildingType)) ?: $buildingType,
+          "buildingId" => isset($fallbackBuilding["id"]) ? (int)$fallbackBuilding["id"] : 0,
+          "buildingName" => $fallbackName,
+          "buildingUid" => $fallbackUid,
+          "objectName" => $fallbackObjectName,
+        ];
+        return $resolved;
+      }
       $resolved["health"] = "needs_review";
       $resolved["healthLabel"] = events_health_labels()["needs_review"];
       $resolved["message"] = "The linked building is not available in the current public map.";
@@ -809,9 +974,9 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
 
     $resolved["canMap"] = true;
     $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
-      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
+      "buildingUid" => $buildingUid,
       "buildingName" => $buildingName,
-      "objectName" => trim((string)($building["model_object_name"] ?? "")),
+      "objectName" => $buildingObjectName,
     ]);
     $resolved["message"] = $resolved["canRoute"]
       ? "Directions are available for this building."
@@ -824,8 +989,8 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
       "type" => $buildingType,
       "buildingId" => (int)$building["building_id"],
       "buildingName" => $buildingName,
-      "buildingUid" => trim((string)($building["building_uid"] ?? "")),
-      "objectName" => trim((string)($building["model_object_name"] ?? "")),
+      "buildingUid" => $buildingUid,
+      "objectName" => $buildingObjectName,
     ];
     return $resolved;
   }
@@ -843,6 +1008,8 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     $buildingName = trim((string)($room["building_name"] ?? ""));
     $roomName = trim((string)($room["room_name"] ?? ""));
     $roomNumber = trim((string)($room["room_number"] ?? ""));
+    $buildingUid = trim((string)($room["building_uid"] ?? ""));
+    $buildingObjectName = trim((string)($room["building_object_name"] ?? ""));
     if ($displayLocation === "") {
       $resolved["displayLocation"] = trim($buildingName . ($roomName !== "" ? " - " . $roomName : ""));
     }
@@ -851,6 +1018,47 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     $buildingPresent = (string)($room["building_present"] ?? "1") !== "0";
     $sourceModel = trim((string)($room["source_model_file"] ?? ""));
     if (!$roomPresent || !$buildingPresent || !events_is_model_match($sourceModel, $publicModel)) {
+      $fallbackRoom = events_lookup_public_room($conn, $publicModel, $buildingName, $roomName, $roomNumber);
+      if (is_array($fallbackRoom)) {
+        $fallbackBuildingName = trim((string)($fallbackRoom["building_name"] ?? $buildingName));
+        $fallbackRoomName = trim((string)($fallbackRoom["room_name"] ?? $roomName));
+        $fallbackRoomNumber = trim((string)($fallbackRoom["room_number"] ?? $roomNumber));
+        $fallbackBuilding = events_lookup_public_destination(
+          $conn,
+          $publicModel,
+          $fallbackBuildingName,
+          "",
+          "",
+          events_route_anchor_entity_types()
+        );
+        $fallbackUid = trim((string)($fallbackBuilding["buildingUid"] ?? ""));
+        $fallbackObjectName = trim((string)($fallbackBuilding["objectName"] ?? ""));
+        if ($displayLocation === "") {
+          $resolved["displayLocation"] = trim($fallbackBuildingName . ($fallbackRoomName !== "" ? " - " . $fallbackRoomName : ""));
+        }
+        $resolved["health"] = "limited";
+        $resolved["healthLabel"] = events_health_labels()["limited"];
+        $resolved["canMap"] = true;
+        $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+          "buildingUid" => $fallbackUid,
+          "buildingName" => $fallbackBuildingName,
+          "objectName" => $fallbackObjectName,
+        ]);
+        $resolved["message"] = $resolved["canRoute"]
+          ? "This event room was matched to the current public map. Directions are available through its parent building."
+          : "This event room was matched to the current public map, but no published route is available for its building right now.";
+        $resolved["resolvedTarget"] = [
+          "type" => "room",
+          "buildingId" => (int)($fallbackRoom["building_id"] ?? 0),
+          "buildingUid" => $fallbackUid,
+          "buildingName" => $fallbackBuildingName,
+          "objectName" => $fallbackObjectName,
+          "roomId" => (int)($fallbackRoom["room_id"] ?? 0),
+          "roomName" => $fallbackRoomName,
+          "roomNumber" => $fallbackRoomNumber,
+        ];
+        return $resolved;
+      }
       $resolved["health"] = "needs_review";
       $resolved["healthLabel"] = events_health_labels()["needs_review"];
       $resolved["message"] = "The linked room is not available in the current public map.";
@@ -859,9 +1067,9 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
 
     $resolved["canMap"] = true;
     $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
-      "buildingUid" => trim((string)($room["building_uid"] ?? "")),
+      "buildingUid" => $buildingUid,
       "buildingName" => $buildingName,
-      "objectName" => trim((string)($room["building_object_name"] ?? "")),
+      "objectName" => $buildingObjectName,
     ]);
     $resolved["message"] = $resolved["canRoute"]
       ? "Directions are available through the room's parent building."
@@ -873,9 +1081,9 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     $resolved["resolvedTarget"] = [
       "type" => "room",
       "buildingId" => (int)($room["building_id"] ?? 0),
-      "buildingUid" => trim((string)($room["building_uid"] ?? "")),
+      "buildingUid" => $buildingUid,
       "buildingName" => $buildingName,
-      "objectName" => trim((string)($room["building_object_name"] ?? "")),
+      "objectName" => $buildingObjectName,
       "roomId" => (int)($room["room_id"] ?? 0),
       "roomName" => $roomName,
       "roomNumber" => $roomNumber,
@@ -946,6 +1154,7 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     $z = $event["map_point_z"] ?? null;
     $radius = $event["map_radius"] ?? null;
     $modelFile = trim((string)($event["map_model_file"] ?? ""));
+    $differentAreaModel = $modelFile !== "" && !events_is_model_match($modelFile, $publicModel);
     if (!is_numeric($x) || !is_numeric($y) || !is_numeric($z)) {
       $resolved["health"] = "broken";
       $resolved["healthLabel"] = events_health_labels()["broken"];
@@ -955,18 +1164,19 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
     if ($displayLocation === "") {
       $resolved["displayLocation"] = "Event area";
     }
-    if ($modelFile !== "" && !events_is_model_match($modelFile, $publicModel)) {
-      $resolved["health"] = "needs_review";
-      $resolved["healthLabel"] = events_health_labels()["needs_review"];
-      $resolved["message"] = "This event area was pinned on a different map version and needs review.";
-      return $resolved;
+    if ($differentAreaModel) {
+      $resolved["health"] = "limited";
+      $resolved["healthLabel"] = events_health_labels()["limited"];
+      $resolved["message"] = "This event area was pinned on an older map version.";
     }
 
     $resolved["canMap"] = true;
     $resolved["canRoute"] = false;
-    $resolved["health"] = "valid";
-    $resolved["healthLabel"] = events_health_labels()["valid"];
-    $resolved["message"] = "This event will open as a map highlight only.";
+    if (!$differentAreaModel) {
+      $resolved["health"] = "valid";
+      $resolved["healthLabel"] = events_health_labels()["valid"];
+      $resolved["message"] = "This event will open as a map highlight only.";
+    }
     $resolved["resolvedTarget"] = [
       "type" => "specific_area",
       "x" => (float)$x,
@@ -996,6 +1206,52 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
 
       $anchorPresent = (string)($anchor["is_present_in_latest"] ?? "1") !== "0";
       $anchorSourceModel = trim((string)($anchor["source_model_file"] ?? ""));
+      if ($differentAreaModel) {
+        $anchorMatch = ($anchorPresent && events_is_model_match($anchorSourceModel, $publicModel))
+          ? [
+              "id" => (int)($anchor["building_id"] ?? 0),
+              "buildingUid" => trim((string)($anchor["building_uid"] ?? "")),
+              "name" => trim((string)($anchor["building_name"] ?? "")),
+              "objectName" => trim((string)($anchor["model_object_name"] ?? "")),
+              "entityType" => $anchorType,
+            ]
+          : events_lookup_public_destination(
+              $conn,
+              $publicModel,
+              trim((string)($anchor["building_name"] ?? "")),
+              trim((string)($anchor["model_object_name"] ?? "")),
+              trim((string)($anchor["building_uid"] ?? "")),
+              [$anchorType]
+            );
+        if (!is_array($anchorMatch)) {
+          $resolved["health"] = "needs_review";
+          $resolved["healthLabel"] = events_health_labels()["needs_review"];
+          $resolved["message"] = "This event area was pinned on a different map version and its linked destination is not available in the current public map.";
+          return $resolved;
+        }
+
+        $anchorName = trim((string)($anchorMatch["name"] ?? $anchor["building_name"] ?? ""));
+        if ($displayLocation === "") {
+          $resolved["displayLocation"] = trim($anchorName . " - Event area");
+        }
+        $resolved["resolvedTarget"] = [
+          "type" => $anchorType,
+          "buildingId" => isset($anchorMatch["id"]) ? (int)$anchorMatch["id"] : (int)($anchor["building_id"] ?? 0),
+          "buildingUid" => trim((string)($anchorMatch["buildingUid"] ?? $anchor["building_uid"] ?? "")),
+          "buildingName" => $anchorName,
+          "objectName" => trim((string)($anchorMatch["objectName"] ?? $anchor["model_object_name"] ?? "")),
+        ];
+        $resolved["canMap"] = true;
+        $resolved["canRoute"] = events_has_route_for_target($routeKeys, [
+          "buildingUid" => trim((string)($resolved["resolvedTarget"]["buildingUid"] ?? "")),
+          "buildingName" => $anchorName,
+          "objectName" => trim((string)($resolved["resolvedTarget"]["objectName"] ?? "")),
+        ]);
+        $resolved["message"] = $resolved["canRoute"]
+          ? "This event area was pinned on an older map version. The exact highlight is unavailable, but directions are available through the current linked destination."
+          : "This event area was pinned on an older map version. The exact highlight is unavailable, but the linked destination can still open on the map.";
+        return $resolved;
+      }
       if (!$anchorPresent || !events_is_model_match($anchorSourceModel, $publicModel)) {
         $resolved["health"] = "needs_review";
         $resolved["healthLabel"] = events_health_labels()["needs_review"];
@@ -1026,6 +1282,12 @@ function events_resolve_location(mysqli $conn, array $event, string $publicModel
         $resolved["healthLabel"] = events_health_labels()["limited"];
         $resolved["message"] = "This event area highlight is valid, but no published route is available for its linked destination right now.";
       }
+    }
+    if ($differentAreaModel) {
+      $resolved["health"] = "needs_review";
+      $resolved["healthLabel"] = events_health_labels()["needs_review"];
+      $resolved["message"] = "This event area was pinned on a different map version and needs review.";
+      return $resolved;
     }
     return $resolved;
   }

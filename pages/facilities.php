@@ -5,6 +5,7 @@ $activePage = "facilities";
 $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
+require_once $ROOT . "/admin/inc/events.php";
 
 function facilities_page_has_column(mysqli $conn, string $table, string $column): bool {
   $safeTable = str_replace("`", "``", $table);
@@ -44,6 +45,13 @@ function facilities_page_category_label(string $category): string {
 $state = map_sync_resolve_public_model($ROOT);
 $currentModel = trim((string)($state["modelFile"] ?? ""));
 $facilities = [];
+$publicRouteKeys = [];
+
+try {
+  $publicRouteKeys = events_public_route_keys($ROOT);
+} catch (Throwable $_) {
+  $publicRouteKeys = [];
+}
 
 try {
   $hasSource = facilities_page_has_column($conn, "facilities", "source_model_file");
@@ -95,7 +103,32 @@ foreach ($facilities as $facility) {
   $contactInfo = trim((string)($facility["contact_info"] ?? ""));
   $imagePath = trim((string)($facility["logo_path"] ?? ""));
   $objectName = trim((string)($facility["model_object_name"] ?? ""));
+  $facilityId = (int)($facility["facility_id"] ?? 0);
   $category = facilities_page_infer_category($facilityName, $description);
+
+  $routeTarget = null;
+  if ($facilityId > 0) {
+    $facilityResolution = events_resolve_facility_target($conn, $facilityId, $currentModel);
+    if (is_array($facilityResolution["resolvedTarget"] ?? null)) {
+      $routeTarget = $facilityResolution["resolvedTarget"];
+    }
+  }
+  if (!$routeTarget && $facilityName !== "") {
+    $routeTarget = [
+      "type" => "facility",
+      "buildingUid" => "",
+      "buildingName" => $facilityName,
+      "objectName" => $objectName,
+    ];
+  }
+  $canRoute = is_array($routeTarget) && events_has_route_for_target($publicRouteKeys, [
+    "buildingUid" => trim((string)($routeTarget["buildingUid"] ?? "")),
+    "buildingName" => trim((string)($routeTarget["buildingName"] ?? $facilityName)),
+    "objectName" => trim((string)($routeTarget["objectName"] ?? $objectName)),
+  ]);
+  $routeMessage = $canRoute
+    ? "Directions are available for this facility on the current public map."
+    : "Open the map to inspect the destination. Directions are not published for this facility yet.";
 
   if ($category === "academic") $academicCount++;
   else $servicesCount++;
@@ -112,6 +145,8 @@ foreach ($facilities as $facility) {
     "categoryLabel" => facilities_page_category_label($category),
     "initials" => facilities_page_initials($facilityName),
     "destination" => $facilityName,
+    "canRoute" => $canRoute,
+    "routeMessage" => $routeMessage,
   ];
 }
 
@@ -181,7 +216,7 @@ ob_start();
           >
             <div class="public-card__media facility-card__media<?= $facility["imagePath"] === "" ? " is-fallback" : "" ?>">
               <div class="facility-card__overlay">
-                <span class="public-pill public-pill--soft">Map Ready</span>
+                <span class="public-pill public-pill--soft"><?= $facility["canRoute"] ? "Directions Ready" : "Map Ready" ?></span>
               </div>
               <?php if ($facility["imagePath"] !== ""): ?>
                 <img
@@ -220,17 +255,37 @@ ob_start();
               <?php if ($facility["location"] === "" && $facility["contactInfo"] === ""): ?>
                 <div class="public-note">Open the map to inspect the linked destination and its surrounding campus context.</div>
               <?php endif; ?>
+              <div class="public-note"><?= facilities_page_escape($facility["routeMessage"]) ?></div>
             </div>
 
             <div class="public-actions">
-              <button
-                class="public-btn public-btn--primary"
-                type="button"
-                data-open="<?= facilities_page_escape($facility["destination"]) ?>"
-                data-object="<?= facilities_page_escape($facility["objectName"]) ?>"
-              >
-                Open on Map
-              </button>
+              <?php if ($facility["canRoute"]): ?>
+                <button
+                  class="public-btn public-btn--primary"
+                  type="button"
+                  data-route="<?= facilities_page_escape($facility["destination"]) ?>"
+                  data-object="<?= facilities_page_escape($facility["objectName"]) ?>"
+                >
+                  Get Directions
+                </button>
+                <button
+                  class="public-btn"
+                  type="button"
+                  data-open="<?= facilities_page_escape($facility["destination"]) ?>"
+                  data-object="<?= facilities_page_escape($facility["objectName"]) ?>"
+                >
+                  Open on Map
+                </button>
+              <?php else: ?>
+                <button
+                  class="public-btn public-btn--primary"
+                  type="button"
+                  data-open="<?= facilities_page_escape($facility["destination"]) ?>"
+                  data-object="<?= facilities_page_escape($facility["objectName"]) ?>"
+                >
+                  Open on Map
+                </button>
+              <?php endif; ?>
             </div>
           </article>
         <?php endforeach; ?>
@@ -336,12 +391,14 @@ $extraScripts = <<<HTML
     });
 
     document.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-open]");
+      const button = event.target.closest("[data-open], [data-route]");
       if (!button) return;
-      const destination = String(button.getAttribute("data-open") || "").trim();
+      const destination = String(button.getAttribute("data-route") || button.getAttribute("data-open") || "").trim();
       if (!destination) return;
+      const autoRoute = button.hasAttribute("data-route");
       sessionStorage.setItem("tnts:jumpToDestination", destination);
-      window.location.href = "../pages/map.php?destination=" + encodeURIComponent(destination);
+      const suffix = autoRoute ? "&autoroute=1" : "";
+      window.location.href = "../pages/map.php?destination=" + encodeURIComponent(destination) + suffix;
     });
 
     if (cards.length > 0) {

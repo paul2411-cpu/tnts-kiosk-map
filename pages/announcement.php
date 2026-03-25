@@ -80,7 +80,7 @@ ob_start();
               <article class="public-card public-card--feature announcement-card announcement-card--headline">
                 <?php if ($bannerUrl !== ""): ?>
                   <div class="public-card__media announcement-card__media announcement-card__media--headline">
-                    <img src="<?= htmlspecialchars($bannerUrl, ENT_QUOTES, "UTF-8") ?>" alt="<?= htmlspecialchars((string)($row["title"] ?? "Announcement banner"), ENT_QUOTES, "UTF-8") ?>" loading="lazy">
+                    <img src="<?= htmlspecialchars($bannerUrl, ENT_QUOTES, "UTF-8") ?>" alt="<?= htmlspecialchars((string)($row["title"] ?? "Announcement banner"), ENT_QUOTES, "UTF-8") ?>" loading="lazy" decoding="async">
                   </div>
                 <?php endif; ?>
                 <div class="public-card__meta">
@@ -111,7 +111,7 @@ ob_start();
               <article class="public-card announcement-card">
                 <?php if ($bannerUrl !== ""): ?>
                   <div class="public-card__media announcement-card__media">
-                    <img src="<?= htmlspecialchars($bannerUrl, ENT_QUOTES, "UTF-8") ?>" alt="<?= htmlspecialchars((string)($row["title"] ?? "Announcement banner"), ENT_QUOTES, "UTF-8") ?>" loading="lazy">
+                    <img src="<?= htmlspecialchars($bannerUrl, ENT_QUOTES, "UTF-8") ?>" alt="<?= htmlspecialchars((string)($row["title"] ?? "Announcement banner"), ENT_QUOTES, "UTF-8") ?>" loading="lazy" decoding="async">
                   </div>
                 <?php endif; ?>
                 <div class="public-card__meta">
@@ -144,11 +144,30 @@ $extraHead = <<<HTML
   }
 
   .announcement-card__media {
-    min-height: 240px;
+    display: grid;
+    place-items: center;
+    min-height: 0;
+    height: clamp(220px, 28vw, 300px);
+    max-height: min(34vh, 320px);
+    padding: 12px;
+    background:
+      radial-gradient(circle at top left, rgba(255, 255, 255, 0.16), transparent 38%),
+      linear-gradient(135deg, #23181d 0%, #7a0000 100%);
+  }
+
+  .announcement-card__media img {
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    object-position: center;
   }
 
   .announcement-card__media--headline {
-    min-height: 320px;
+    height: clamp(240px, 32vw, 360px);
+    max-height: min(42vh, 380px);
+    padding: 16px;
   }
 
   .announcement-card__content {
@@ -157,11 +176,15 @@ $extraHead = <<<HTML
 
   @media (max-width: 760px) {
     .announcement-card__media {
-      min-height: 220px;
+      height: clamp(200px, 56vw, 240px);
+      max-height: min(30vh, 250px);
+      padding: 10px;
     }
 
     .announcement-card__media--headline {
-      min-height: 260px;
+      height: clamp(220px, 62vw, 280px);
+      max-height: min(36vh, 290px);
+      padding: 12px;
     }
   }
 </style>

@@ -7,6 +7,10 @@ require_once __DIR__ . "/inc/layout.php";
 
 announcements_ensure_schema($conn);
 $ROOT = dirname(__DIR__);
+$bannerConstraints = announcements_banner_constraints();
+$bannerMaxBytesMb = (int)round(((int)($bannerConstraints["max_bytes"] ?? 0)) / 1048576);
+$bannerMaxWidth = (int)($bannerConstraints["max_width"] ?? 0);
+$bannerMaxHeight = (int)($bannerConstraints["max_height"] ?? 0);
 
 function announcements_admin_redirect(array $query = []): void {
   $url = "announcement.php";
@@ -354,6 +358,8 @@ admin_layout_start("Announcements", "announcements");
   .announcements-schedule-grid { display: grid; gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .announcements-row-stack { display: grid; gap: 8px; }
   .announcements-note { color: #475467; font-size: 12px; line-height: 1.55; }
+  .announcements-note.is-warning { color: #b42318; font-weight: 800; }
+  .announcements-note.is-success { color: #067647; font-weight: 700; }
   .announcements-form-actions { display: flex; gap: 10px; justify-content: space-between; flex-wrap: wrap; }
   .announcements-banner-preview,
   .announcements-schedule-panel {
@@ -523,7 +529,14 @@ admin_layout_start("Announcements", "announcements");
       <div class="announcements-row-stack">
         <div class="label">Banner Image</div>
         <input class="input" type="file" name="banner_file" accept="image/jpeg,image/png,image/webp,image/gif">
-        <div class="announcements-note">Optional. Supported formats: JPG, PNG, WEBP, and GIF up to 6 MB.</div>
+        <?php
+          $bannerHelp = "Optional. Supported formats: JPG, PNG, WEBP, and GIF up to {$bannerMaxBytesMb} MB. Large banners are limited to {$bannerMaxWidth} x {$bannerMaxHeight} px so they do not overpower the public announcement page.";
+        ?>
+        <div
+          class="announcements-note"
+          data-banner-help
+          data-default-message="<?= htmlspecialchars($bannerHelp, ENT_QUOTES, "UTF-8") ?>"
+        ><?= htmlspecialchars($bannerHelp, ENT_QUOTES, "UTF-8") ?></div>
         <?php if (trim((string)$form["banner_path"]) !== ""): ?>
           <div class="announcements-banner-preview">
             <img src="<?= htmlspecialchars(announcements_banner_url((string)$form["banner_path"]), ENT_QUOTES, "UTF-8") ?>" alt="Current announcement banner">
@@ -634,6 +647,66 @@ admin_layout_start("Announcements", "announcements");
 
     modeSelect.addEventListener("change", syncPanels);
     syncPanels();
+  })();
+
+  (() => {
+    const bannerInput = document.querySelector('input[name="banner_file"]');
+    const bannerHelp = document.querySelector("[data-banner-help]");
+    if (!bannerInput || !bannerHelp || typeof URL === "undefined" || typeof Image === "undefined") return;
+
+    const constraints = {
+      maxBytes: <?= (int)$bannerConstraints["max_bytes"] ?>,
+      maxWidth: <?= $bannerMaxWidth ?>,
+      maxHeight: <?= $bannerMaxHeight ?>,
+      maxPixels: <?= (int)$bannerConstraints["max_pixels"] ?>,
+    };
+    const defaultMessage = String(bannerHelp.getAttribute("data-default-message") || bannerHelp.textContent || "").trim();
+
+    const setMessage = (message, tone = "") => {
+      bannerHelp.textContent = message || defaultMessage;
+      bannerHelp.classList.remove("is-warning", "is-success");
+      if (tone === "warning" || tone === "success") {
+        bannerHelp.classList.add(`is-${tone}`);
+      }
+    };
+
+    bannerInput.addEventListener("change", () => {
+      const file = bannerInput.files && bannerInput.files[0] ? bannerInput.files[0] : null;
+      if (!file) {
+        setMessage(defaultMessage);
+        return;
+      }
+
+      if (file.size > constraints.maxBytes) {
+        setMessage(`This file is larger than ${Math.round(constraints.maxBytes / 1048576)} MB. Choose a smaller banner image.`, "warning");
+        return;
+      }
+
+      const objectUrl = URL.createObjectURL(file);
+      const probe = new Image();
+      probe.onload = () => {
+        const width = probe.naturalWidth || 0;
+        const height = probe.naturalHeight || 0;
+        URL.revokeObjectURL(objectUrl);
+
+        if (
+          !width || !height ||
+          width > constraints.maxWidth ||
+          height > constraints.maxHeight ||
+          (width * height) > constraints.maxPixels
+        ) {
+          setMessage(`This image is ${width} x ${height}px. Announcement banners are limited to ${constraints.maxWidth} x ${constraints.maxHeight}px so they stay controlled on the public page.`, "warning");
+          return;
+        }
+
+        setMessage(`${defaultMessage} Selected image: ${width} x ${height}px.`, "success");
+      };
+      probe.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        setMessage(defaultMessage);
+      };
+      probe.src = objectUrl;
+    });
   })();
 </script>
 

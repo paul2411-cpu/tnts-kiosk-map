@@ -29,7 +29,10 @@ ob_start();
     <div id="info-card" class="hidden">
       <div class="card-header">
         <h2 id="card-title">Building</h2>
-        <button id="close-btn" title="Close">&times;</button>
+        <div class="card-header-actions">
+          <button id="card-back-btn" class="card-header-btn hidden" type="button" title="Back to search results">Back</button>
+          <button id="close-btn" type="button" title="Close">&times;</button>
+        </div>
       </div>
 
       <div class="card-body">
@@ -271,8 +274,9 @@ $extraHead = <<<HTML
 </script>
 HTML;
 
+$mapScriptVersion = @filemtime(__DIR__ . "/../js/map3d.js") ?: time();
 $extraScripts = <<<HTML
-<script type="module" src="../js/map3d.js"></script>
+<script type="module" src="../js/map3d.js?v={$mapScriptVersion}"></script>
 HTML;
 
 include __DIR__ . "/../ui/layout.php";

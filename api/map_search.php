@@ -8,6 +8,7 @@ $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
 require_once $ROOT . "/admin/inc/map_entities.php";
+require_once $ROOT . "/admin/inc/events.php";
 app_logger_set_default_subsystem("api.map_search");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
@@ -15,6 +16,21 @@ function has_column(mysqli $conn, string $table, string $column): bool {
   $safeColumn = $conn->real_escape_string($column);
   $res = $conn->query("SHOW COLUMNS FROM `{$safeTable}` LIKE '{$safeColumn}'");
   return $res instanceof mysqli_result && $res->num_rows > 0;
+}
+
+function map_search_route_target_payload($target): ?array {
+  if (!is_array($target)) return null;
+  $buildingName = trim((string)($target["buildingName"] ?? ""));
+  if ($buildingName === "") return null;
+  $payload = [
+    "type" => trim((string)($target["type"] ?? "building")) ?: "building",
+    "buildingName" => $buildingName,
+    "buildingUid" => trim((string)($target["buildingUid"] ?? "")),
+    "objectName" => trim((string)($target["objectName"] ?? "")),
+    "roomName" => trim((string)($target["roomName"] ?? "")),
+    "roomNumber" => trim((string)($target["roomNumber"] ?? "")),
+  ];
+  return $payload;
 }
 
 $requestedModel = map_sync_sanitize_glb_name($_GET["model"] ?? "");
@@ -32,6 +48,11 @@ try {
     if ($name === "") continue;
     $objectName = trim((string)($row["objectName"] ?? ""));
     $entityType = trim((string)($row["entityType"] ?? "building")) ?: "building";
+    $routeTarget = null;
+    if ($entityType === "facility" && !empty($row["id"])) {
+      $facilityResolution = events_resolve_facility_target($conn, (int)$row["id"], $currentModel);
+      $routeTarget = map_search_route_target_payload($facilityResolution["resolvedTarget"] ?? null);
+    }
     $key = mb_strtolower($entityType . "|" . ($objectName !== "" ? $objectName : $name));
     if (isset($seenBuildings[$key])) continue;
     $seenBuildings[$key] = true;
@@ -46,7 +67,8 @@ try {
       "imagePath" => trim((string)($row["imagePath"] ?? "")),
       "modelFile" => trim((string)($row["modelFile"] ?? "")),
       "location" => trim((string)($row["location"] ?? "")),
-      "contactInfo" => trim((string)($row["contactInfo"] ?? ""))
+      "contactInfo" => trim((string)($row["contactInfo"] ?? "")),
+      "routeTarget" => $routeTarget,
     ];
   }
 
@@ -55,12 +77,14 @@ try {
   $hasRoomBuildingId = has_column($conn, "rooms", "building_id");
   $hasRoomBuildingName = has_column($conn, "rooms", "building_name");
   $hasRoomId = has_column($conn, "rooms", "room_id");
+  $hasRoomObjectName = has_column($conn, "rooms", "model_object_name");
   $hasRoomNumber = has_column($conn, "rooms", "room_number");
   $hasRoomType = has_column($conn, "rooms", "room_type");
   $hasFloor = has_column($conn, "rooms", "floor_number");
   $hasDescription = has_column($conn, "rooms", "description");
   $hasIndoorGuideText = has_column($conn, "rooms", "indoor_guide_text");
   $hasRoomEdited = has_column($conn, "rooms", "last_edited_at");
+  $hasBuildingPresent = has_column($conn, "buildings", "is_present_in_latest");
 
   $roomBuildingExpr = $hasRoomBuildingId
     ? "COALESCE(NULLIF(TRIM(b.building_name), ''), " . ($hasRoomBuildingName ? "NULLIF(TRIM(r.building_name), '')" : "NULL") . ")"
@@ -69,6 +93,7 @@ try {
   $roomSql = "SELECT "
     . ($hasRoomId ? "r.room_id" : "NULL AS room_id")
     . ", r.room_name, {$roomBuildingExpr} AS building_name"
+    . ", " . ($hasRoomObjectName ? "r.model_object_name" : "NULL AS model_object_name")
     . ", " . ($hasRoomNumber ? "r.room_number" : "NULL AS room_number")
     . ", " . ($hasRoomType ? "r.room_type" : "NULL AS room_type")
     . ", " . ($hasFloor ? "r.floor_number" : "NULL AS floor_number")
@@ -124,6 +149,7 @@ try {
       "id" => isset($row["room_id"]) ? (int)$row["room_id"] : null,
       "roomName" => $roomName,
       "buildingName" => $buildingName,
+      "objectName" => trim((string)($row["model_object_name"] ?? "")),
       "roomNumber" => trim((string)($row["room_number"] ?? "")),
       "roomType" => trim((string)($row["room_type"] ?? "")),
       "floorNumber" => trim((string)($row["floor_number"] ?? "")),

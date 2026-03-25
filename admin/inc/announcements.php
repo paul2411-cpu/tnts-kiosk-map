@@ -6,6 +6,18 @@ function announcements_trimmed($value, int $maxLen): string {
   return mb_strlen($text) > $maxLen ? mb_substr($text, 0, $maxLen) : $text;
 }
 
+function announcements_banner_constraints(): array {
+  $maxBytes = 6 * 1024 * 1024;
+  $maxWidth = 2560;
+  $maxHeight = 1600;
+  return [
+    "max_bytes" => $maxBytes,
+    "max_width" => $maxWidth,
+    "max_height" => $maxHeight,
+    "max_pixels" => $maxWidth * $maxHeight,
+  ];
+}
+
 function announcements_has_index(mysqli $conn, string $table, string $index): bool {
   $safeTable = str_replace("`", "``", $table);
   $safeIndex = $conn->real_escape_string($index);
@@ -312,14 +324,40 @@ function announcements_store_banner_upload(array $file, string $root): array {
     return ["ok" => false, "error" => "The uploaded banner image could not be verified."];
   }
 
-  $maxBytes = 6 * 1024 * 1024;
+  $limits = announcements_banner_constraints();
+  $maxBytes = (int)($limits["max_bytes"] ?? 0);
   $fileSize = (int)($file["size"] ?? 0);
   if ($fileSize <= 0 || $fileSize > $maxBytes) {
     return ["ok" => false, "error" => "Banner images must be smaller than 6 MB."];
   }
 
+  $imageSize = @getimagesize($tmpPath);
+  $width = (int)($imageSize[0] ?? 0);
+  $height = (int)($imageSize[1] ?? 0);
+  if ($width <= 0 || $height <= 0) {
+    return ["ok" => false, "error" => "The uploaded banner image could not be verified."];
+  }
+
+  $maxWidth = (int)($limits["max_width"] ?? 0);
+  $maxHeight = (int)($limits["max_height"] ?? 0);
+  $maxPixels = (int)($limits["max_pixels"] ?? 0);
+  $pixelCount = $width * $height;
+  if (
+    ($maxWidth > 0 && $width > $maxWidth) ||
+    ($maxHeight > 0 && $height > $maxHeight) ||
+    ($maxPixels > 0 && $pixelCount > $maxPixels)
+  ) {
+    return [
+      "ok" => false,
+      "error" => "Banner images must be {$maxWidth}px wide by {$maxHeight}px tall or smaller so they stay balanced on the public kiosk.",
+    ];
+  }
+
   $finfo = new finfo(FILEINFO_MIME_TYPE);
-  $mime = (string)$finfo->file($tmpPath);
+  $mime = trim((string)($imageSize["mime"] ?? ""));
+  if ($mime === "") {
+    $mime = (string)$finfo->file($tmpPath);
+  }
   $allowed = [
     "image/jpeg" => "jpg",
     "image/png" => "png",

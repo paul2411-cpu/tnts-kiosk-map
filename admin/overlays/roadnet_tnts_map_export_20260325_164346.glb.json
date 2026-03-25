@@ -1,0 +1,227 @@
+{
+    "ok": true,
+    "model": "tnts_map_export_20260325_164346.glb",
+    "updated": 1774428231,
+    "roads": [
+        {
+            "type": "road",
+            "id": "road_1774426137632_913",
+            "name": "road",
+            "position": [
+                367.45905652022583,
+                1.4310853248237336,
+                -39.587470229074704
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 5,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426137630_1"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774426137630_1",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774426137633
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426142686_916",
+            "name": "road",
+            "position": [
+                367.45905652022583,
+                1.4310853248237336,
+                -39.587470229074704
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 5,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    -73.57654573715502,
+                    0,
+                    -7.105427357601002e-15
+                ],
+                [
+                    -113.56257243605876,
+                    0,
+                    -1.4210854715202004e-14
+                ],
+                [
+                    -113.56257243605876,
+                    0,
+                    34.74248121077248
+                ],
+                [
+                    -190.37781823678733,
+                    0,
+                    34.742481210772475
+                ],
+                [
+                    -212.64364890303833,
+                    0,
+                    34.742481210772475
+                ],
+                [
+                    -251.17326696870458,
+                    0,
+                    34.74248121077247
+                ],
+                [
+                    -251.17326696870458,
+                    0,
+                    26.869583764574276
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426137630_1",
+                "rp_1774426142686_3",
+                "rp_1774426143997_4",
+                "rp_1774426145180_5",
+                "rp_1774426146173_6",
+                "rp_1774426148909_7",
+                "rp_1774428215248_1",
+                "rp_1774428220199_2"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774426137630_1",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774426137633
+                },
+                null,
+                null,
+                null,
+                null,
+                {
+                    "id": "rp_1774426148909_7",
+                    "label": "AREA_QUADRANGLE_right",
+                    "entityType": "area",
+                    "building": {
+                        "name": "AREA_QUADRANGLE",
+                        "objectName": "AREA_QUADRANGLE",
+                        "uid": "bld_b65c496367e185cc",
+                        "side": "right"
+                    },
+                    "linkedAt": 1774426148909
+                },
+                null,
+                {
+                    "id": "rp_1774428220199_2",
+                    "label": "BLD_LUIS_Y_FERRER_front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_LUIS_Y_FERRER",
+                        "objectName": "BLD_LUIS_Y_FERRER",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774428220200
+                }
+            ]
+        },
+        {
+            "type": "road",
+            "id": "road_1774426951157_915",
+            "name": "road",
+            "position": [
+                367.45905652022583,
+                1.4310853248237336,
+                -39.587470229074704
+            ],
+            "rotation": [
+                0,
+                0,
+                0
+            ],
+            "scale": [
+                1,
+                1,
+                1
+            ],
+            "locked": false,
+            "width": 5,
+            "points": [
+                [
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    118.0645800825244,
+                    0,
+                    0
+                ],
+                [
+                    118.0645800825244,
+                    0,
+                    -7.328060451702974
+                ]
+            ],
+            "pointIds": [
+                "rp_1774426137630_1",
+                "rp_1774426951156_2",
+                "rp_1774426955364_3"
+            ],
+            "pointMeta": [
+                {
+                    "id": "rp_1774426137630_1",
+                    "type": "kiosk_start",
+                    "kiosk": true,
+                    "label": "Kiosk_Start",
+                    "building": null,
+                    "linkedAt": 1774426137633
+                },
+                null,
+                {
+                    "id": "rp_1774426955364_3",
+                    "label": "BLD_ERINEO_MALIKSI_front",
+                    "entityType": "building",
+                    "building": {
+                        "name": "BLD_ERINEO_MALIKSI",
+                        "objectName": "BLD_ERINEO_MALIKSI",
+                        "side": "front"
+                    },
+                    "linkedAt": 1774426955365
+                }
+            ]
+        }
+    ]
+}

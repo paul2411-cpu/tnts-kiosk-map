@@ -832,6 +832,9 @@
         dispatchEnter();
         return;
       case "done":
+        if (state.target && state.target.id === "search-input") {
+          dispatchEnter();
+        }
         hideKeyboard();
         return;
       default:

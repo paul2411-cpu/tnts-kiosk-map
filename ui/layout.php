@@ -7,6 +7,7 @@ if (!isset($activePage)) $activePage = "";
 if (!isset($extraHead)) $extraHead = "";
 if (!isset($content)) $content = "";
 if (!isset($extraScripts)) $extraScripts = "";
+$mapCssVersion = @filemtime(__DIR__ . "/../css/map.css") ?: time();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -17,7 +18,7 @@ if (!isset($extraScripts)) $extraScripts = "";
 
   <link rel="stylesheet" href="../css/app.css">
   <link rel="stylesheet" href="../css/nav.css">
-  <link rel="stylesheet" href="../css/map.css">
+  <link rel="stylesheet" href="../css/map.css?v=<?= $mapCssVersion ?>">
   <link rel="stylesheet" href="../css/public-panels.css">
 
   <?= $extraHead ?>

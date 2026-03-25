@@ -15,6 +15,7 @@ const cardRoomsWrap = document.getElementById("card-rooms-wrap");
 const cardRoomsTitle = infoCard?.querySelector(".card-rooms-title") || null;
 const cardRoomsStatus = document.getElementById("card-rooms-status");
 const cardRoomsList = document.getElementById("card-rooms-list");
+const cardBackBtn = document.getElementById("card-back-btn");
 const closeBtn = document.getElementById("close-btn");
 const directionsBtn = document.getElementById("directions-btn");
 const clearRouteBtn = document.getElementById("clear-route-btn");
@@ -399,19 +400,65 @@ function kbHandlePress(e) {
 
 
 // ----- INIT -----
+function dismissOnScreenKeyboards(force = false) {
+  try {
+    window.TNTSOnScreenKeyboard?.hide?.(force);
+  } catch (_) {}
+  hideKeyboard();
+}
+
+function bindSearchInputBehavior(input) {
+  if (!input || input.dataset.tntsSearchBound === "1") return;
+  input.dataset.tntsSearchBound = "1";
+
+  input.addEventListener("input", () => {
+    handleSearchSelect(input.value);
+  });
+
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      handleSearchSelect(input.value, { autoRoute: true });
+      dismissOnScreenKeyboards();
+    }
+  });
+
+  const searchBtn = document.querySelector(".searchbtn");
+  if (searchBtn && searchBtn.dataset.tntsSearchBound !== "1") {
+    searchBtn.dataset.tntsSearchBound = "1";
+    searchBtn.addEventListener("click", () => {
+      handleSearchSelect(input.value, { autoRoute: true });
+      dismissOnScreenKeyboards();
+    });
+  }
+}
+
 function setupOnScreenKeyboard() {
-  if (window.TNTSOnScreenKeyboard) return;
   const input = getSearchInput();
   if (!input) {
     console.warn("On-screen keyboard: search input not found. Set SEARCH_INPUT_SELECTOR.");
     return;
   }
 
-  createKeyboard();
+  bindSearchInputBehavior(input);
 
-  // ✅ Force normal typing direction (fixes “backwards / left side” issues)
+  // Force normal typing direction (fixes backwards / left-side typing issues)
   input.style.direction = "ltr";
   input.style.textAlign = "left";
+
+  // Kiosk-friendly input attributes
+  input.setAttribute("autocomplete", "off");
+  input.setAttribute("autocorrect", "off");
+  input.setAttribute("autocapitalize", "off");
+  input.setAttribute("spellcheck", "false");
+
+  // If the shared keyboard is already active, keep it and only bind map search behavior.
+  if (window.TNTSOnScreenKeyboard) {
+    console.log("Shared on-screen keyboard detected; map search bindings attached for:", input);
+    return;
+  }
+
+  createKeyboard();
 
   // Open keyboard on focus/tap
   const open = () => showKeyboardFor(input);
@@ -419,36 +466,9 @@ function setupOnScreenKeyboard() {
   input.addEventListener("pointerdown", open, { passive: true });
   input.addEventListener("click", open);
 
-  // ✅ Trigger building select while typing
-  input.addEventListener("input", () => {
-    handleSearchSelect(input.value);
-  });
-
-  // ✅ Hardware keyboard Enter OR on-screen Enter dispatch
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      handleSearchSelect(input.value, { autoRoute: true });
-      hideKeyboard();
-    }
-  });
-
-  const searchBtn = document.querySelector(".searchbtn");
-  if (searchBtn) {
-    searchBtn.addEventListener("click", () => {
-      handleSearchSelect(input.value, { autoRoute: true });
-    });
-  }
-
   // Bind keyboard presses (pointerdown avoids blur issues)
   const overlay = document.getElementById("kiosk-kb-overlay");
   overlay.addEventListener("pointerdown", kbHandlePress, { passive: false });
-
-  // Kiosk-friendly input attributes
-  input.setAttribute("autocomplete", "off");
-  input.setAttribute("autocorrect", "off");
-  input.setAttribute("autocapitalize", "off");
-  input.setAttribute("spellcheck", "false");
 
   console.log("On-screen keyboard + search ready for:", input);
 }
@@ -489,8 +509,8 @@ const VIEW_MODE_2D = "2d";
 const DEFAULT_PERSPECTIVE_FOV = 55;
 const PERSPECTIVE_FOV_MIN = 18;
 const PERSPECTIVE_FOV_MAX = 75;
-const ORTHO_ZOOM_MIN = 0.85;
-const ORTHO_ZOOM_MAX = 12;
+const ORTHO_ZOOM_MIN = 1;
+const ORTHO_ZOOM_MAX = 9;
 const ORTHO_PLAN_PADDING = 1.12;
 const ORTHO_CAMERA_HEIGHT_FACTOR = 1.5;
 const HORIZON_POLAR_EPSILON = 0.02;
@@ -864,14 +884,21 @@ function syncViewModeUi() {
   mapView2dBtn?.setAttribute("aria-pressed", !is3d ? "true" : "false");
 }
 
-function getPerspectiveZoomPercent(fov = perspectiveCamera.fov) {
-  const normalized = (PERSPECTIVE_FOV_MAX - fov) / (PERSPECTIVE_FOV_MAX - PERSPECTIVE_FOV_MIN);
+function getPerspectiveZoomPercent() {
+  const target = controls?.target || perspectiveViewState.target || mapWorldCenter;
+  const minDistance = getPerspectiveMinDistance();
+  const maxDistance = getPerspectiveMaxDistance();
+  const distance = perspectiveCamera.position.distanceTo(target);
+  const normalized = (maxDistance - clamp(distance, minDistance, maxDistance)) / Math.max(maxDistance - minDistance, 1e-6);
   return clamp(normalized * 100, 0, 100);
 }
 
-function getPerspectiveFovFromPercent(percent) {
-  const normalized = clamp(percent, 0, 100) / 100;
-  return PERSPECTIVE_FOV_MAX - (normalized * (PERSPECTIVE_FOV_MAX - PERSPECTIVE_FOV_MIN));
+function getPerspectiveMinDistance() {
+  return Math.max(mapWorldDiagonal * 0.06, 3);
+}
+
+function getPerspectiveMaxDistance() {
+  return Math.max(mapWorldDiagonal * 0.65, getPerspectiveMinDistance() + 1);
 }
 
 function getOrthoZoomPercent(zoom = orthographicCamera.zoom) {
@@ -907,15 +934,22 @@ function applyActiveZoomPercent(percent) {
     orthographicCamera.updateProjectionMatrix();
     orthographicViewState.zoom = orthographicCamera.zoom;
   } else {
-    perspectiveCamera.fov = getPerspectiveFovFromPercent(safePercent);
+    const target = controls?.target || perspectiveViewState.target || mapWorldCenter;
+    const minDistance = getPerspectiveMinDistance();
+    const maxDistance = getPerspectiveMaxDistance();
+    const normalized = safePercent / 100;
+    const nextDistance = maxDistance - (normalized * (maxDistance - minDistance));
+    const offset = perspectiveCamera.position.clone().sub(target);
+    if (offset.lengthSq() < 1e-8) {
+      offset.copy(DEFAULT_VIEW_DIRECTION).multiplyScalar(nextDistance);
+    } else {
+      offset.setLength(nextDistance);
+    }
+    perspectiveCamera.position.copy(target).add(offset);
     perspectiveCamera.updateProjectionMatrix();
-    perspectiveViewState.fov = perspectiveCamera.fov;
+    perspectiveViewState.position.copy(perspectiveCamera.position);
   }
   syncZoomUi();
-}
-
-function nudgeActiveZoomPercent(deltaPercent) {
-  applyActiveZoomPercent(getCurrentZoomPercent() + deltaPercent);
 }
 
 function updatePerspectiveProjection(rect) {
@@ -955,13 +989,15 @@ function buildControlsForMode(cameraObject, mode) {
   nextControls.dampingFactor = 0.1;
   nextControls.enablePan = true;
   nextControls.screenSpacePanning = true;
-  nextControls.enableZoom = false;
+  nextControls.enableZoom = true;
   nextControls.zoomToCursor = false;
   nextControls.panSpeed = mode === VIEW_MODE_2D ? 0.8 : 0.5;
 
   if (mode === VIEW_MODE_2D) {
     nextControls.enableRotate = false;
     nextControls.rotateSpeed = 0;
+    nextControls.minZoom = ORTHO_ZOOM_MIN;
+    nextControls.maxZoom = ORTHO_ZOOM_MAX;
     nextControls.mouseButtons = {
       LEFT: THREE.MOUSE.PAN,
       MIDDLE: THREE.MOUSE.PAN,
@@ -970,7 +1006,7 @@ function buildControlsForMode(cameraObject, mode) {
     nextControls.touches = {
       ONE: THREE.TOUCH.PAN,
       // OrbitControls only supports TWO as DOLLY_PAN or DOLLY_ROTATE.
-      // With enableZoom disabled, DOLLY_PAN still gives us two-finger pan.
+      // DOLLY_PAN gives us two-finger pinch zoom plus two-finger drag panning.
       TWO: THREE.TOUCH.DOLLY_PAN,
     };
   } else {
@@ -985,24 +1021,40 @@ function buildControlsForMode(cameraObject, mode) {
     };
     nextControls.touches = {
       ONE: THREE.TOUCH.ROTATE,
-      // Keep two-finger movement in the supported DOLLY_PAN mode so touch panning works.
+      // DOLLY_PAN gives us two-finger pinch zoom plus two-finger drag panning.
       TWO: THREE.TOUCH.DOLLY_PAN,
     };
-    nextControls.minDistance = 0;
-    nextControls.maxDistance = mapWorldDiagonal * 5;
+    nextControls.minDistance = getPerspectiveMinDistance();
+    nextControls.maxDistance = getPerspectiveMaxDistance();
   }
 
   return nextControls;
 }
 
+function syncControlDerivedViewState() {
+  if (!controls || !camera) return;
+
+  if (currentViewMode === VIEW_MODE_2D) {
+    orthographicViewState.target.copy(controls.target);
+    orthographicViewState.zoom = orthographicCamera.zoom;
+  } else {
+    perspectiveViewState.target.copy(controls.target);
+    perspectiveViewState.position.copy(perspectiveCamera.position);
+  }
+
+  syncZoomUi();
+}
+
 function replaceControls(nextCamera, nextMode, target) {
+  controls?.removeEventListener?.("change", syncControlDerivedViewState);
   controls?.dispose?.();
   camera = nextCamera;
   controls = buildControlsForMode(camera, nextMode);
+  controls.addEventListener("change", syncControlDerivedViewState);
   controls.target.copy(target || mapWorldCenter);
   controls.update();
   syncViewModeUi();
-  syncZoomUi();
+  syncControlDerivedViewState();
 }
 
 function captureViewState(mode = currentViewMode) {
@@ -1053,8 +1105,8 @@ function activatePerspectiveView({ target = null, reset = false } = {}) {
   perspectiveCamera.far = Math.max(mapWorldDiagonal * 100, 1000);
   updatePerspectiveProjection(mapStage.getBoundingClientRect());
   replaceControls(perspectiveCamera, currentViewMode, perspectiveViewState.target.clone());
-  controls.minDistance = 0;
-  controls.maxDistance = mapWorldDiagonal * 5;
+  controls.minDistance = getPerspectiveMinDistance();
+  controls.maxDistance = getPerspectiveMaxDistance();
   controls.update();
 }
 
@@ -1216,103 +1268,12 @@ canvas.addEventListener("pointerleave", () => {
   clearHoverOutline();
 });
 
-// ==========================
-// Custom wheel gesture handling
-// ==========================
-const WHEEL_ZOOM_FACTOR = 0.06;
 const TOUCH_TAP_SLOP_PX = 12;
 const TOUCH_CLICK_SUPPRESS_MS = 450;
-const WHEEL_MOUSE_STEP_THRESHOLD = 72;
-const wheelPanOffset = new THREE.Vector3();
-const wheelPanAxis = new THREE.Vector3();
-const wheelPanAxisAlt = new THREE.Vector3();
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
-
-function isLikelyMouseWheelEvent(event) {
-  const absDeltaX = Math.abs(event.deltaX);
-  const absDeltaY = Math.abs(event.deltaY);
-  if (event.deltaMode === 1 || event.deltaMode === 2) return true;
-  return absDeltaX === 0 && absDeltaY >= WHEEL_MOUSE_STEP_THRESHOLD && Number.isInteger(absDeltaY);
-}
-
-function shouldPanFromWheel(event) {
-  if (event.ctrlKey || event.metaKey) return false;
-  if (Math.abs(event.deltaX) > 0) return true;
-  return !isLikelyMouseWheelEvent(event);
-}
-
-function panActiveViewByWheel(deltaX, deltaY) {
-  if (!controls || !camera) return;
-
-  const element = renderer.domElement;
-  const width = Math.max(1, element.clientWidth || 1);
-  const height = Math.max(1, element.clientHeight || 1);
-  const panSpeed = Number(controls.panSpeed) || 1;
-
-  wheelPanOffset.set(0, 0, 0);
-
-  const panLeft = (distance) => {
-    wheelPanAxis.setFromMatrixColumn(camera.matrix, 0);
-    wheelPanAxis.multiplyScalar(-distance);
-    wheelPanOffset.add(wheelPanAxis);
-  };
-
-  const panUp = (distance) => {
-    if (controls.screenSpacePanning) {
-      wheelPanAxis.setFromMatrixColumn(camera.matrix, 1);
-    } else {
-      wheelPanAxis.setFromMatrixColumn(camera.matrix, 0);
-      wheelPanAxisAlt.crossVectors(camera.up, wheelPanAxis);
-      wheelPanAxis.copy(wheelPanAxisAlt);
-    }
-    wheelPanAxis.multiplyScalar(distance);
-    wheelPanOffset.add(wheelPanAxis);
-  };
-
-  if (camera.isPerspectiveCamera) {
-    const targetDistance =
-      camera.position.distanceTo(controls.target) * Math.tan((camera.fov * Math.PI / 180) / 2);
-    panLeft((2 * deltaX * targetDistance / height) * panSpeed);
-    panUp((2 * deltaY * targetDistance / height) * panSpeed);
-  } else if (camera.isOrthographicCamera) {
-    panLeft((deltaX * (camera.right - camera.left) / camera.zoom / width) * panSpeed);
-    panUp((deltaY * (camera.top - camera.bottom) / camera.zoom / height) * panSpeed);
-  } else {
-    return;
-  }
-
-  controls.target.add(wheelPanOffset);
-  camera.position.add(wheelPanOffset);
-  camera.updateMatrixWorld();
-
-  if (currentViewMode === VIEW_MODE_2D) {
-    orthographicViewState.target.copy(controls.target);
-  } else {
-    perspectiveViewState.target.copy(controls.target);
-    perspectiveViewState.position.copy(perspectiveCamera.position);
-  }
-
-  controls.update();
-}
-
-function onWheelZoom(e) {
-  e.preventDefault();
-  e.stopPropagation();
-
-  if (shouldPanFromWheel(e)) {
-    panActiveViewByWheel(e.deltaX, e.deltaY);
-    logCameraState("WHEEL_PAN");
-    return;
-  }
-
-  nudgeActiveZoomPercent(-e.deltaY * WHEEL_ZOOM_FACTOR);
-  logCameraState("WHEEL_ZOOM");
-}
-
-renderer.domElement.addEventListener("wheel", onWheelZoom, { passive: false });
 
 function isTouchLikePointer(event) {
   return event.pointerType === "touch" || event.pointerType === "pen";
@@ -1337,6 +1298,16 @@ function isEventOnCanvas(event) {
   );
 }
 
+mapStage.addEventListener("wheel", (event) => {
+  if (isInteractiveOverlayClick(event)) return;
+  if (!isEventOnCanvas(event)) return;
+  if (!controls?._onMouseWheel) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  event.stopPropagation();
+  controls._onMouseWheel(event);
+}, { passive: false, capture: true });
+
 const LIVE_MAP_ENDPOINT = "../api/map_live.php";
 const BUILDING_DETAILS_ENDPOINT = "../api/map_building_details.php";
 const SEARCH_INDEX_ENDPOINT = "../api/map_search.php";
@@ -1353,6 +1324,7 @@ let dbRoomEntriesForSearch = [];   // [{ roomName, buildingName }]
 let dbBuildingsByKey = new Map();  // normalized building name -> metadata
 let dbBuildingsByUid = new Map();  // stable uid -> metadata
 let dbRoomsByKey = new Map();      // normalized building+room -> metadata
+let dbRoomsByObjectKey = new Map();
 let liveVersion = null;
 let livePollTimer = null;
 let livePollBusy = false;
@@ -1365,6 +1337,7 @@ let selectedGuideTarget = null;
 let activeEventPayload = null;
 let activeEventAutoRoute = requestedEventAutoRoute;
 let activeEventLoadPromise = null;
+let cardBackContext = null;
 
 const kioskMarkerScreen = new THREE.Vector3();
 const PUBLISHED_ROAD_Y_OFFSET = 0.8;
@@ -1839,6 +1812,32 @@ function setSelectedGuideTarget(target) {
   };
 }
 
+function getFacilityFallbackRouteTarget(target) {
+  if (!target) return null;
+  const safeType = String(target.type || "").trim().toLowerCase();
+  if (safeType !== "facility") return null;
+
+  const meta = getDbBuildingMeta(target.buildingName) || getDbBuildingMeta(target.objectName || target.buildingName);
+  const routeTarget = meta?.routeTarget && typeof meta.routeTarget === "object" ? meta.routeTarget : null;
+  const buildingName = String(routeTarget?.buildingName || "").trim();
+  if (!buildingName) return null;
+
+  const fallback = {
+    type: String(routeTarget?.type || "building").trim() || "building",
+    buildingName,
+    buildingUid: normalizeBuildingUid(routeTarget?.buildingUid || ""),
+    objectName: String(routeTarget?.objectName || "").trim(),
+    roomName: String(routeTarget?.roomName || "").trim()
+  };
+
+  const sameType = normalizeQuery(fallback.type) === normalizeQuery(target.type || "");
+  const sameBuilding = normalizeQuery(fallback.buildingName) === normalizeQuery(target.buildingName || "");
+  const sameObject = normalizeQuery(fallback.objectName) === normalizeQuery(target.objectName || "");
+  const sameRoom = normalizeQuery(fallback.roomName) === normalizeQuery(target.roomName || "");
+  if (sameType && sameBuilding && sameObject && sameRoom) return null;
+  return fallback;
+}
+
 function getExactGuideEntryForTarget(target) {
   if (!target || !target.buildingName) return null;
   const buildingUid = normalizeBuildingUid(target.buildingUid || getDbBuildingMeta(target.buildingName)?.buildingUid || "");
@@ -1880,20 +1879,28 @@ function getBuildingGuideEntryForTarget(target) {
     }
   }
 
+  const fallbackTarget = getFacilityFallbackRouteTarget(target);
+  if (fallbackTarget) {
+    return getBuildingGuideEntryForTarget(fallbackTarget);
+  }
+
   return null;
 }
 
 function buildDirectionsTarget() {
-  if (selectedGuideTarget?.buildingName) return selectedGuideTarget;
+  if (selectedGuideTarget?.buildingName) {
+    return getFacilityFallbackRouteTarget(selectedGuideTarget) || selectedGuideTarget;
+  }
   if (selectedBuildingName) {
     const meta = getDbBuildingMeta(selectedBuildingName);
-    return {
+    const directTarget = {
       type: String(meta?.entityType || "building").trim() || "building",
       buildingName: selectedBuildingName,
       buildingUid: normalizeBuildingUid(meta?.buildingUid || ""),
       objectName: String(meta?.objectName || "").trim(),
       roomName: ""
     };
+    return getFacilityFallbackRouteTarget(directTarget) || directTarget;
   }
   return null;
 }
@@ -1929,6 +1936,11 @@ function getRouteEntryForTarget(target) {
   for (const key of candidateKeys) {
     const entry = activeRoutesByKey.get(key);
     if (entry) return entry;
+  }
+
+  const fallbackTarget = getFacilityFallbackRouteTarget(target);
+  if (fallbackTarget) {
+    return getRouteEntryForTarget(fallbackTarget);
   }
   return null;
 }
@@ -2051,9 +2063,21 @@ function buildRoomLookupKeys(buildingName, roomName) {
 }
 
 function registerDbRoomMeta(entry) {
+  const normalizedEntry = {
+    ...entry,
+    objectName: String(entry?.objectName || entry?.modelObjectName || "").trim(),
+    modelObjectName: String(entry?.modelObjectName || entry?.objectName || "").trim()
+  };
   for (const key of buildRoomLookupKeys(entry?.buildingName, entry?.roomName)) {
     if (!dbRoomsByKey.has(key)) {
-      dbRoomsByKey.set(key, entry);
+      dbRoomsByKey.set(key, normalizedEntry);
+    }
+  }
+  for (const value of [normalizedEntry?.objectName, normalizedEntry?.modelObjectName]) {
+    for (const key of getBuildingLookupKeys(value)) {
+      if (!dbRoomsByObjectKey.has(key)) {
+        dbRoomsByObjectKey.set(key, normalizedEntry);
+      }
     }
   }
 }
@@ -2068,6 +2092,26 @@ function getDbRoomMeta(buildingName, roomName) {
     for (const key of buildRoomLookupKeys(candidate, roomName)) {
       const entry = dbRoomsByKey.get(key);
       if (entry) return entry;
+    }
+  }
+  return null;
+}
+
+function getDbRoomMetaByObjectName(objectName, buildingName = "") {
+  const buildingCandidates = [
+    String(buildingName || "").trim(),
+    String(getDisplayBuildingName(buildingName) || "").trim()
+  ]
+    .map((value) => normalizeQuery(value))
+    .filter(Boolean);
+
+  for (const key of getBuildingLookupKeys(objectName)) {
+    const entry = dbRoomsByObjectKey.get(key);
+    if (!entry) continue;
+    if (!buildingCandidates.length) return entry;
+    const entryBuildingNorm = normalizeQuery(entry?.buildingName || "");
+    if (entryBuildingNorm && buildingCandidates.includes(entryBuildingNorm)) {
+      return entry;
     }
   }
   return null;
@@ -2199,7 +2243,40 @@ function getRouteEntry(name) {
 
 rebuildRouteCatalog([]);
 
+function getEntityTypePriority(entityType) {
+  switch (String(entityType || "").trim().toLowerCase()) {
+    case "facility":
+      return 5;
+    case "venue":
+      return 4;
+    case "area":
+      return 3;
+    case "landmark":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function shouldPreferBuildingAlias(nextEntry, currentEntry) {
+  if (!currentEntry) return true;
+  const nextPriority = getEntityTypePriority(nextEntry?.entityType);
+  const currentPriority = getEntityTypePriority(currentEntry?.entityType);
+  if (nextPriority !== currentPriority) return nextPriority > currentPriority;
+
+  const nextObjectName = String(nextEntry?.objectName || "").trim();
+  const currentObjectName = String(currentEntry?.objectName || "").trim();
+  if (!!nextObjectName !== !!currentObjectName) return !!nextObjectName;
+
+  const nextUid = normalizeBuildingUid(nextEntry?.buildingUid || "");
+  const currentUid = normalizeBuildingUid(currentEntry?.buildingUid || "");
+  if (!!nextUid !== !!currentUid) return !!nextUid;
+
+  return false;
+}
+
 function registerDbBuildingMeta(entry) {
+  const rawRouteTarget = entry?.routeTarget && typeof entry.routeTarget === "object" ? entry.routeTarget : null;
   const normalizedUid = normalizeBuildingUid(entry?.buildingUid || "");
   const normalizedEntry = {
     ...entry,
@@ -2207,7 +2284,15 @@ function registerDbBuildingMeta(entry) {
     objectName: String(entry?.objectName || "").trim(),
     entityType: String(entry?.entityType || "building").trim() || "building",
     location: String(entry?.location || "").trim(),
-    contactInfo: String(entry?.contactInfo || "").trim()
+    contactInfo: String(entry?.contactInfo || "").trim(),
+    routeTarget: rawRouteTarget ? {
+      type: String(rawRouteTarget?.type || "building").trim() || "building",
+      buildingName: String(rawRouteTarget?.buildingName || "").trim(),
+      buildingUid: normalizeBuildingUid(rawRouteTarget?.buildingUid || ""),
+      objectName: String(rawRouteTarget?.objectName || "").trim(),
+      roomName: String(rawRouteTarget?.roomName || "").trim(),
+      roomNumber: String(rawRouteTarget?.roomNumber || "").trim()
+    } : null
   };
   if (normalizedUid && !dbBuildingsByUid.has(normalizedUid)) {
     dbBuildingsByUid.set(normalizedUid, normalizedEntry);
@@ -2218,7 +2303,8 @@ function registerDbBuildingMeta(entry) {
   ];
   for (const alias of aliases) {
     for (const key of getBuildingLookupKeys(alias)) {
-      if (!dbBuildingsByKey.has(key)) {
+      const existing = dbBuildingsByKey.get(key);
+      if (!existing || shouldPreferBuildingAlias(normalizedEntry, existing)) {
         dbBuildingsByKey.set(key, normalizedEntry);
       }
     }
@@ -2303,6 +2389,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbBuildingsByKey = new Map();
     dbBuildingsByUid = new Map();
     dbRoomsByKey = new Map();
+    dbRoomsByObjectKey = new Map();
     dbBuildingNamesForSearch = [];
     dbTopLevelEntriesForSearch = [];
     for (const raw of buildings) {
@@ -2318,7 +2405,8 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
         imagePath: String(raw?.imagePath || "").trim(),
         modelFile: String(raw?.modelFile || "").trim(),
         location: String(raw?.location || "").trim(),
-        contactInfo: String(raw?.contactInfo || "").trim()
+        contactInfo: String(raw?.contactInfo || "").trim(),
+        routeTarget: raw?.routeTarget && typeof raw.routeTarget === "object" ? { ...raw.routeTarget } : null
       };
       registerDbBuildingMeta(entry);
       dbTopLevelEntriesForSearch.push(entry);
@@ -2335,6 +2423,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
         floorNumber: String(r?.floorNumber || "").trim(),
         description: String(r?.description || "").trim(),
         indoorGuideText: String(r?.indoorGuideText || "").trim(),
+        objectName: String(r?.objectName || r?.modelObjectName || "").trim(),
         modelFile: String(r?.modelFile || "").trim()
       }))
       .filter((r) => r.roomName && r.buildingName);
@@ -2374,6 +2463,7 @@ async function loadSearchCatalog(modelFile = currentLiveModelFile) {
     dbBuildingsByKey = new Map();
     dbBuildingsByUid = new Map();
     dbRoomsByKey = new Map();
+    dbRoomsByObjectKey = new Map();
   }
 }
 
@@ -2464,6 +2554,7 @@ function collectSearchCandidates(queryNorm) {
     const type = String(candidate?.type || "").trim();
     const label = String(candidate?.label || "").trim();
     const buildingName = String(candidate?.buildingName || "").trim();
+    const objectName = String(candidate?.objectName || "").trim();
     const roomName = String(candidate?.roomName || "").trim();
     const roomNumber = String(candidate?.roomNumber || "").trim();
     const roomType = String(candidate?.roomType || "").trim();
@@ -2506,11 +2597,17 @@ function collectSearchCandidates(queryNorm) {
     }
     if (score <= 0) return;
 
-    const hasRoute = !!getRouteEntry(buildingName);
+    const hasRoute = !!getRouteEntryForTarget({
+      type,
+      buildingName,
+      objectName,
+      roomName
+    });
     out.push({
       type,
       label,
       buildingName,
+      objectName,
       roomName,
       roomNumber,
       roomType,
@@ -2528,7 +2625,8 @@ function collectSearchCandidates(queryNorm) {
     pushCandidate({
       type: getDestinationEntityType(name),
       label: name,
-      buildingName: name
+      buildingName: name,
+      objectName: String(getDbBuildingMeta(name)?.objectName || "").trim()
     });
   }
 
@@ -2540,6 +2638,7 @@ function collectSearchCandidates(queryNorm) {
       type: String(entry?.entityType || "building").trim() || "building",
       label: bName,
       buildingName: bName,
+      objectName: String(entry?.objectName || "").trim(),
       description: String(entry?.description || "").trim(),
       id: entry?.id ?? null
     });
@@ -2557,6 +2656,7 @@ function collectSearchCandidates(queryNorm) {
       floorNumber: row.floorNumber,
       description: row.description,
       indoorGuideText: row.indoorGuideText,
+      objectName: row.objectName,
       id: row.id ?? null
     });
   }
@@ -2658,10 +2758,39 @@ function handleSearchSelect(rawValue, opts = {}) {
   }
 
   const exactStandaloneRooms = getExactStandaloneRoomCandidates(q, candidates);
+  if (exactStandaloneRooms.length === 1) {
+    const selectedRoom = exactStandaloneRooms[0];
+    if (!selectBuildingByName(selectedRoom.buildingName, { showInfoCard: false })) {
+      showSearchFeedback("Search", `The room in ${getDisplayBuildingName(selectedRoom.buildingName) || selectedRoom.buildingName} is not available in the current map model.`);
+      return;
+    }
+    showRoomCard(selectedRoom, { autoRoute });
+    return;
+  }
   if (exactStandaloneRooms.length > 1) {
     showRoomSearchResults(searchText, exactStandaloneRooms);
     return;
   }
+
+  const exactTopLevel = getExactTopLevelCandidates(q, candidates);
+  if (exactTopLevel.length === 1) {
+    const selectedTarget = exactTopLevel[0];
+    const preferredName = String(selectedTarget?.objectName || selectedTarget?.buildingName || "").trim();
+    const selected = (preferredName
+      ? selectBuildingByName(preferredName, { showInfoCard: false })
+      : false) || selectBuildingByName(selectedTarget.buildingName, { showInfoCard: false });
+    if (!selected) {
+      showSearchFeedback("Search", `The destination "${selectedTarget.buildingName || searchText}" is not available in the current map model.`);
+      return;
+    }
+    showCard(selectedTarget.buildingName);
+    if (autoRoute) activateDirectionsForSelectedBuilding();
+    return;
+  }
+
+  const resultSet = exactTopLevel.length > 1 ? exactTopLevel : candidates;
+  showSearchResults(searchText, resultSet);
+  return;
 
   // Prefer rooms/buildings whose parent building has a published route.
   const prioritized = exactStandaloneRooms.length === 1
@@ -3337,7 +3466,10 @@ async function loadCardBuildingDetails(buildingName) {
         imagePath: String(payloadBuilding?.imagePath || meta?.imagePath || "").trim(),
         modelFile: String(payloadBuilding?.modelFile || meta?.modelFile || "").trim(),
         location: String(payloadBuilding?.location || meta?.location || "").trim(),
-        contactInfo: String(payloadBuilding?.contactInfo || meta?.contactInfo || "").trim()
+        contactInfo: String(payloadBuilding?.contactInfo || meta?.contactInfo || "").trim(),
+        routeTarget: payloadBuilding?.routeTarget && typeof payloadBuilding.routeTarget === "object"
+          ? { ...payloadBuilding.routeTarget }
+          : (meta?.routeTarget && typeof meta.routeTarget === "object" ? { ...meta.routeTarget } : null)
       });
     }
 
@@ -3345,15 +3477,16 @@ async function loadCardBuildingDetails(buildingName) {
     rooms.forEach((room) => {
       const roomName = String(room?.name || "").trim();
       if (!roomName || !displayName) return;
-      registerDbRoomMeta({
-        id: room?.id ?? null,
-        roomName,
-        buildingName: displayName,
-        roomNumber: String(room?.roomNumber || "").trim(),
+        registerDbRoomMeta({
+          id: room?.id ?? null,
+          roomName,
+          buildingName: String(room?.buildingName || displayName).trim(),
+          roomNumber: String(room?.roomNumber || "").trim(),
         roomType: String(room?.roomType || "").trim(),
         floorNumber: String(room?.floorNumber || "").trim(),
         description: String(room?.description || "").trim(),
         indoorGuideText: String(room?.indoorGuideText || "").trim(),
+        objectName: String(room?.objectName || room?.modelObjectName || "").trim(),
         modelFile: String(room?.modelFile || "").trim()
       });
     });
@@ -3371,8 +3504,190 @@ async function loadCardBuildingDetails(buildingName) {
   }
 }
 
+function setCardBackContext(context = null) {
+  cardBackContext = context && Array.isArray(context?.candidates) && context.candidates.length
+    ? {
+        searchText: String(context.searchText || "").trim(),
+        candidates: [...context.candidates]
+      }
+    : null;
+  if (!cardBackBtn) return;
+  cardBackBtn.classList.toggle("hidden", !cardBackContext);
+  cardBackBtn.disabled = !cardBackContext;
+}
+
+function buildSearchBackContext(searchText, candidates) {
+  return {
+    searchText: String(searchText || "").trim(),
+    candidates: Array.isArray(candidates) ? [...candidates] : []
+  };
+}
+
+function restoreCardBackContext() {
+  if (!cardBackContext) return false;
+  const context = cardBackContext;
+  setCardBackContext(null);
+  showSearchResults(context.searchText, context.candidates);
+  return true;
+}
+
+function formatTypePillLabel(type) {
+  return String(getEntityTypeLabel(type) || "destination")
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function createSearchResultItem(candidate, opts = {}) {
+  const {
+    statusText = "",
+    actionLabel = "Open details",
+    onSelect = null
+  } = opts;
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = "card-room-item card-room-item--interactive card-search-item";
+  item.addEventListener("click", () => onSelect?.(candidate));
+
+  const head = document.createElement("div");
+  head.className = "card-room-head";
+
+  const title = document.createElement("div");
+  title.className = "card-room-name";
+
+  const pill = document.createElement("div");
+  pill.className = "card-search-pill";
+
+  const type = String(candidate?.type || "building").trim() || "building";
+  const displayBuildingName = getDisplayBuildingName(candidate?.buildingName) || String(candidate?.buildingName || "").trim();
+  const roomName = String(candidate?.roomName || "").trim();
+  const roomNumber = String(candidate?.roomNumber || "").trim();
+  const description = String(candidate?.description || "").trim();
+
+  if (type === "room") {
+    title.textContent = roomName || "Unnamed Room";
+    pill.textContent = roomNumber || "Room";
+  } else {
+    title.textContent = displayBuildingName || String(candidate?.label || "").trim() || "Unnamed Destination";
+    pill.textContent = formatTypePillLabel(type);
+  }
+
+  head.appendChild(title);
+  head.appendChild(pill);
+  item.appendChild(head);
+
+  const subtitle = document.createElement("div");
+  subtitle.className = "card-room-subtitle";
+  subtitle.textContent = type === "room"
+    ? (displayBuildingName || "Unknown Building")
+    : `${formatTypePillLabel(type)} destination`;
+  item.appendChild(subtitle);
+
+  if (type === "room") {
+    const metaParts = [];
+    if (roomNumber) metaParts.push(`Room ${roomNumber}`);
+    if (String(candidate?.floorNumber || "").trim()) metaParts.push(`Floor ${String(candidate.floorNumber).trim()}`);
+    if (String(candidate?.roomType || "").trim()) metaParts.push(String(candidate.roomType).trim());
+    if (metaParts.length) {
+      const meta = document.createElement("div");
+      meta.className = "card-room-meta";
+      meta.textContent = metaParts.join(" - ");
+      item.appendChild(meta);
+    }
+
+    const guideLines = buildCardRoomGuideLines(candidate, displayBuildingName, 2);
+    if (guideLines.length) {
+      const guide = document.createElement("div");
+      guide.className = "card-room-guide";
+      guide.textContent = guideLines.join("\n");
+      item.appendChild(guide);
+    }
+  } else {
+    const copy = document.createElement("div");
+    copy.className = `card-search-copy${description ? "" : " is-muted"}`;
+    copy.textContent = description
+      ? description
+      : (type === "facility"
+          ? "Open this facility to inspect its linked rooms, location details, and route availability."
+          : "Open this destination to inspect details, rooms, and route availability.");
+    item.appendChild(copy);
+  }
+
+  if (statusText) {
+    const status = document.createElement("div");
+    status.className = "card-room-status";
+    status.textContent = statusText;
+    item.appendChild(status);
+  }
+
+  if (actionLabel) {
+    const action = document.createElement("div");
+    action.className = "card-room-action";
+    action.textContent = actionLabel;
+    item.appendChild(action);
+  }
+
+  return item;
+}
+
+function getExactTopLevelCandidates(queryNorm, candidates) {
+  const queryFlat = normalizeLoose(queryNorm);
+  if (!queryFlat) return [];
+
+  return candidates.filter((candidate) => {
+    if (candidate?.type === "room") return false;
+    for (const value of [candidate?.buildingName, candidate?.label, candidate?.objectName]) {
+      if (normalizeLoose(value) === queryFlat) return true;
+    }
+    return false;
+  });
+}
+
+function showSearchResults(searchText, candidates) {
+  const matches = Array.isArray(candidates) ? [...candidates] : [];
+  setCardBackContext(null);
+  hideDirectionsPanel();
+  infoCard.classList.remove("hidden");
+  cardTitle.textContent = String(searchText || "Search").trim() || "Search";
+  cardInfo.textContent = `${matches.length} matching ${matches.length === 1 ? "destination" : "destinations"} found. Select one to view details and directions.`;
+  directionsBtn.disabled = true;
+
+  const backContext = buildSearchBackContext(searchText, matches);
+  const items = matches.map((candidate) => createSearchResultItem(candidate, {
+    statusText: candidate?.type === "room"
+      ? (candidate?.hasRoute
+          ? "Route available through the parent building, plus room guidance."
+          : "Room details and indoor guidance are available, but no published building route exists yet.")
+      : (candidate?.hasRoute
+          ? `Directions are available for this ${getEntityTypeLabel(candidate?.type)}.`
+          : `This ${getEntityTypeLabel(candidate?.type)} can open on the map, but no published route is available right now.`),
+    onSelect: (selectedCandidate) => {
+      if (selectedCandidate?.type === "room") {
+        if (!selectBuildingByName(selectedCandidate.buildingName, { showInfoCard: false })) {
+          showSearchFeedback("Search", `The room in ${getDisplayBuildingName(selectedCandidate.buildingName) || selectedCandidate.buildingName} is not available in the current map model.`);
+          return;
+        }
+        showRoomCard(selectedCandidate, { backContext });
+        return;
+      }
+
+      const preferredName = String(selectedCandidate?.objectName || selectedCandidate?.buildingName || "").trim();
+      const selected = (preferredName
+        ? selectBuildingByName(preferredName, { showInfoCard: false })
+        : false) || selectBuildingByName(selectedCandidate?.buildingName || "", { showInfoCard: false });
+      if (!selected) {
+        showSearchFeedback("Search", "The selected destination is not available in the current map model.");
+        return;
+      }
+      showCard(selectedCandidate.buildingName, { backContext });
+    }
+  }));
+  renderCardRoomItems(items, "Matches", "No matching destinations were found.");
+}
+
 function showRoomCard(room, opts = {}) {
-  const { autoRoute = false } = opts;
+  const { autoRoute = false, backContext = null } = opts;
   const roomName = String(room?.roomName || room?.name || "").trim();
   const buildingName = String(room?.buildingName || "").trim();
   if (!roomName || !buildingName) return;
@@ -3396,6 +3711,7 @@ function showRoomCard(room, opts = {}) {
   });
 
   hideDirectionsPanel();
+  setCardBackContext(backContext);
   infoCard.classList.remove("hidden");
   cardTitle.textContent = roomName;
   cardInfo.textContent = `${roomName} is in ${displayBuildingName}. ${statusText}`;
@@ -3434,43 +3750,19 @@ function showRoomSearchResults(searchText, rooms) {
     }
     return getDisplayBuildingName(a?.buildingName).localeCompare(getDisplayBuildingName(b?.buildingName));
   });
-
-  const roomLabel = String(matches[0]?.roomName || searchText || "Room Search").trim() || "Room Search";
-  hideCardAndClear();
-  infoCard.classList.remove("hidden");
-  cardTitle.textContent = roomLabel;
-  cardInfo.textContent = `Multiple rooms matched "${searchText}". Choose the correct building below.`;
-  directionsBtn.disabled = true;
-
-  const items = matches.map((room) => createCardRoomItem(room, {
-    title: getDisplayBuildingName(room?.buildingName) || String(room?.buildingName || "").trim() || "Unknown Building",
-    subtitle: String(room?.roomName || "").trim(),
-    includeDescription: false,
-    includeGuide: true,
-    guideLineLimit: 2,
-    statusText: room?.hasRoute
-      ? "Get Directions is available after you open this room."
-      : "No published building route yet. Room guidance is still available.",
-    actionLabel: "Open room details",
-    onSelect: (selectedRoom) => {
-      if (!selectBuildingByName(selectedRoom.buildingName, { showInfoCard: false })) {
-        showSearchFeedback("Search", `The room in ${getDisplayBuildingName(selectedRoom.buildingName) || selectedRoom.buildingName} is not available in the current map model.`);
-        return;
-      }
-      showRoomCard(selectedRoom);
-    }
-  }));
-  renderCardRoomItems(items, "Matches", "No matching rooms were found.");
+  showSearchResults(searchText, matches);
 }
 
 function showSearchFeedback(title, message) {
   hideCardAndClear();
+  setCardBackContext(null);
   infoCard.classList.remove("hidden");
   cardTitle.textContent = String(title || "Search");
   cardInfo.textContent = String(message || "").trim() || "Search feedback unavailable.";
 }
 
-function showCard(buildingName) {
+function showCard(buildingName, opts = {}) {
+  const { backContext = null } = opts;
   const meta = getDbBuildingMeta(buildingName);
   const entityType = String(meta?.entityType || "building").trim() || "building";
   const typeLabel = getEntityTypeLabel(entityType);
@@ -3495,6 +3787,7 @@ function showCard(buildingName) {
   const detailParts = [description, location && entityType === "facility" ? `Location: ${location}` : "", contactInfo && entityType === "facility" ? `Contact: ${contactInfo}` : ""]
     .filter(Boolean);
 
+  setCardBackContext(backContext);
   infoCard.classList.remove("hidden");
   cardTitle.textContent = displayName;
   cardInfo.textContent = detailParts.length
@@ -3515,6 +3808,7 @@ function showCard(buildingName) {
 
 function hideCardAndClear() {
   infoCard.classList.add("hidden");
+  setCardBackContext(null);
   selectedBuildingName = null;
   hoveredBuildingName = null;
   setSelectedGuideTarget(null);
@@ -3532,6 +3826,12 @@ closeBtn.addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   hideCardAndClear();
+});
+
+cardBackBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  restoreCardBackContext();
 });
 
 function activateDirectionsForSelectedBuilding() {
@@ -4487,6 +4787,27 @@ if (!livePollTimer) {
 }
 
 
+function findRoomSelectionFromHit(hitObject) {
+  if (!loadedModel || !hitObject) return null;
+  const buildingRoot = findTopBuildingRoot(hitObject, loadedModel);
+  const buildingEntry = buildingRoot ? (buildingEntriesByObject.get(buildingRoot.uuid) || null) : null;
+  const buildingName = String(buildingEntry?.name || buildingRoot?.name || "").trim();
+
+  let current = hitObject;
+  while (current && current !== loadedModel) {
+    const objectName = String(current?.name || "").trim();
+    if (objectName && (!buildingRoot || current !== buildingRoot)) {
+      const roomMeta = getDbRoomMetaByObjectName(objectName, buildingName);
+      if (roomMeta) {
+        return { roomMeta, buildingEntry };
+      }
+    }
+    current = current.parent;
+  }
+
+  return null;
+}
+
 function pickSceneSelection(event) {
   if (!loadedModel) return null;
   setMouseFromEvent(event);
@@ -4494,6 +4815,11 @@ function pickSceneSelection(event) {
   const intersects = raycaster.intersectObjects(loadedModel.children, true);
   if (intersects.length === 0) return null;
   const hit = intersects[0].object;
+  const roomSelection = findRoomSelectionFromHit(hit);
+  if (roomSelection?.roomMeta) {
+    const buildingEntry = roomSelection.buildingEntry || findBuildingEntryFromHit(hit);
+    return { hit, buildingEntry, roomMeta: roomSelection.roomMeta };
+  }
   const buildingEntry = findBuildingEntryFromHit(hit);
   if (!buildingEntry) return null;
   return { hit, buildingEntry };
@@ -4508,19 +4834,27 @@ function handleSceneSelection(event) {
   if (!loadedModel || !isEventOnCanvas(event)) return;
 
   const selection = pickSceneSelection(event);
-  if (!selection) {
-    hideCardAndClear();
+  if (!selection) return;
+
+  const { hit, buildingEntry, roomMeta } = selection;
+  if (roomMeta?.roomName && roomMeta?.buildingName) {
+    if (!selectBuildingByName(roomMeta.buildingName, { showInfoCard: false })) {
+      showSearchFeedback("Search", `The room in ${getDisplayBuildingName(roomMeta.buildingName) || roomMeta.buildingName} is not available in the current map model.`);
+      return;
+    }
+    showRoomCard(roomMeta);
     return;
   }
 
-  const { hit, buildingEntry } = selection;
+  if (!buildingEntry) return;
   const previousSelectedBuilding = selectedBuildingName;
+  const buildingMeta = getDbBuildingMeta(buildingEntry.name) || getDbBuildingMeta(buildingEntry.objectName) || null;
   selectedBuildingName = buildingEntry.name;
   setSelectedGuideTarget({
-    type: "building",
+    type: String(buildingMeta?.entityType || "building").trim() || "building",
     buildingName: buildingEntry.name,
-    buildingUid: buildingEntry.buildingUid || getDbBuildingMeta(buildingEntry.name)?.buildingUid || "",
-    objectName: buildingEntry.objectName || buildingEntry.name,
+    buildingUid: buildingEntry.buildingUid || buildingMeta?.buildingUid || "",
+    objectName: String(buildingEntry.objectName || buildingMeta?.objectName || buildingEntry.name).trim(),
     roomName: ""
   });
   if (!previousSelectedBuilding || normalizeQuery(previousSelectedBuilding) !== normalizeQuery(selectedBuildingName)) {

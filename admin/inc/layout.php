@@ -72,11 +72,6 @@ function admin_layout_start(string $title, string $active = "") { ?>
             <span class="ico">&#x1F5FA;&#xFE0F;</span><span>Map Editor</span>
           </a>
         <?php endif; ?>
-        <?php if (admin_has_permission("view_error_logs")): ?>
-          <a class="nav-item <?= $active==='errorlogs'?'active':'' ?>" href="errorLogs.php">
-            <span class="ico">&#x1F4CB;</span><span>Error Logs</span>
-          </a>
-        <?php endif; ?>
         <?php if (admin_is_superadmin()): ?>
           <a class="nav-item <?= $active==='admins'?'active':'' ?>" href="adminUser.php">
             <span class="ico">&#x1F464;</span><span>Admin Users</span>

@@ -8,6 +8,7 @@ $ROOT = dirname(__DIR__);
 require_once $ROOT . "/admin/inc/db.php";
 require_once $ROOT . "/admin/inc/map_sync.php";
 require_once $ROOT . "/admin/inc/map_entities.php";
+require_once $ROOT . "/admin/inc/events.php";
 app_logger_set_default_subsystem("api.map_building_details");
 
 function has_column(mysqli $conn, string $table, string $column): bool {
@@ -30,6 +31,22 @@ function natural_room_field_compare($left, $right): int {
   }
 
   return strnatcasecmp($a, $b);
+}
+
+function map_building_details_route_target($target): ?array {
+  if (!is_array($target)) return null;
+  $buildingName = trim((string)($target["buildingName"] ?? ""));
+  if ($buildingName === "") return null;
+  return [
+    "type" => trim((string)($target["type"] ?? "building")) ?: "building",
+    "buildingId" => isset($target["buildingId"]) ? (int)$target["buildingId"] : null,
+    "buildingUid" => trim((string)($target["buildingUid"] ?? "")),
+    "buildingName" => $buildingName,
+    "objectName" => trim((string)($target["objectName"] ?? "")),
+    "roomId" => isset($target["roomId"]) ? (int)$target["roomId"] : null,
+    "roomName" => trim((string)($target["roomName"] ?? "")),
+    "roomNumber" => trim((string)($target["roomNumber"] ?? "")),
+  ];
 }
 
 function sort_room_rows(array &$rows): void {
@@ -79,6 +96,7 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
   $hasRoomBuildingName = has_column($conn, "rooms", "building_name");
   $hasRoomNumber = has_column($conn, "rooms", "room_number");
   $hasRoomType = has_column($conn, "rooms", "room_type");
+  $hasRoomObjectName = has_column($conn, "rooms", "model_object_name");
   $hasFloor = has_column($conn, "rooms", "floor_number");
   $hasDescription = has_column($conn, "rooms", "description");
   $hasIndoorGuideText = has_column($conn, "rooms", "indoor_guide_text");
@@ -110,6 +128,7 @@ function fetch_rooms_for_building(mysqli $conn, string $modelFile, ?int $buildin
   $sql = "SELECT "
     . ($hasRoomId ? "r.room_id" : "NULL AS room_id")
     . ", r.room_name"
+    . ", " . ($hasRoomObjectName ? "r.model_object_name" : "NULL AS model_object_name")
     . ", " . ($hasRoomNumber ? "r.room_number" : "NULL AS room_number")
     . ", " . ($hasRoomType ? "r.room_type" : "NULL AS room_type")
     . ", " . ($hasFloor ? "r.floor_number" : "NULL AS floor_number")
@@ -183,7 +202,28 @@ try {
   $resolvedBuildingId = isset($building["id"]) ? (int)$building["id"] : (isset($building["building_id"]) ? (int)$building["building_id"] : null);
   $resolvedBuildingName = trim((string)($building["name"] ?? $building["building_name"] ?? $buildingName));
   $entityType = trim((string)($building["entityType"] ?? "building")) ?: "building";
-  $rooms = $entityType === "facility" ? [] : fetch_rooms_for_building($conn, $currentModel, $resolvedBuildingId, $resolvedBuildingName);
+  $rooms = [];
+  $routeTarget = null;
+  if ($entityType === "facility" && $resolvedBuildingId !== null && $resolvedBuildingId > 0) {
+    $facilityResolution = events_resolve_facility_target($conn, $resolvedBuildingId, $currentModel);
+    $routeTarget = map_building_details_route_target($facilityResolution["resolvedTarget"] ?? null);
+    if (($routeTarget["type"] ?? "") === "room" && trim((string)($routeTarget["roomName"] ?? "")) !== "") {
+      $rooms[] = [
+        "room_id" => isset($routeTarget["roomId"]) ? (int)$routeTarget["roomId"] : null,
+        "room_name" => trim((string)($routeTarget["roomName"] ?? "")),
+        "model_object_name" => "",
+        "room_number" => trim((string)($routeTarget["roomNumber"] ?? "")),
+        "room_type" => "Linked room",
+        "floor_number" => "",
+        "description" => "Directions for this facility will continue through this linked room.",
+        "indoor_guide_text" => "",
+        "source_model_file" => $currentModel,
+        "building_name" => trim((string)($routeTarget["buildingName"] ?? "")),
+      ];
+    }
+  } else {
+    $rooms = fetch_rooms_for_building($conn, $currentModel, $resolvedBuildingId, $resolvedBuildingName);
+  }
 
   echo json_encode([
     "ok" => true,
@@ -199,12 +239,15 @@ try {
       "imagePath" => trim((string)($building["imagePath"] ?? $building["image_path"] ?? "")),
       "modelFile" => trim((string)($building["modelFile"] ?? $building["source_model_file"] ?? "")),
       "location" => trim((string)($building["location"] ?? "")),
-      "contactInfo" => trim((string)($building["contactInfo"] ?? ""))
+      "contactInfo" => trim((string)($building["contactInfo"] ?? "")),
+      "routeTarget" => $routeTarget,
     ],
     "rooms" => array_map(static function(array $row): array {
       return [
         "id" => isset($row["room_id"]) ? (int)$row["room_id"] : null,
         "name" => trim((string)($row["room_name"] ?? "")),
+        "buildingName" => trim((string)($row["building_name"] ?? "")),
+        "objectName" => trim((string)($row["model_object_name"] ?? "")),
         "roomNumber" => trim((string)($row["room_number"] ?? "")),
         "roomType" => trim((string)($row["room_type"] ?? "")),
         "floorNumber" => trim((string)($row["floor_number"] ?? "")),
