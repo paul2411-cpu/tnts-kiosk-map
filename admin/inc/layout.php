@@ -3,7 +3,49 @@
 if (session_status() === PHP_SESSION_NONE) session_start();
 require_once __DIR__ . "/auth.php";
 require_once __DIR__ . "/app_logger.php";
+require_once __DIR__ . "/map_sync.php";
 app_logger_bootstrap(["subsystem" => "admin_ui"]);
+
+function admin_layout_humanize_model_name(string $modelFile): string {
+  $safeFile = trim(basename($modelFile));
+  if ($safeFile === "") return "No Published Map";
+
+  $name = preg_replace('/\.glb$/i', '', $safeFile);
+  $name = preg_replace('/_(\d{8}_\d{6}|\d{14})(?:_[a-z0-9]+)?$/i', '', $name);
+  $name = preg_replace('/^tnts[_-]*/i', '', $name);
+  $name = preg_replace('/[_-]+/', ' ', $name);
+  $name = trim(preg_replace('/\s+/', ' ', (string)$name));
+  $lower = strtolower($name);
+
+  if ($lower === "") return "Published Map";
+  if (str_contains($lower, "map export") || $lower === "export") return "Exported Map";
+  if (str_contains($lower, "navigation")) return "Navigation Map";
+  if (str_contains($lower, "campus")) return "Campus Map";
+
+  return ucwords($name);
+}
+
+function admin_layout_public_model_state(): array {
+  static $state = null;
+  if (is_array($state)) return $state;
+
+  $projectRoot = dirname(__DIR__, 2);
+  $publicState = map_sync_resolve_public_model($projectRoot);
+  $liveJson = is_array($publicState["liveJson"] ?? null) ? $publicState["liveJson"] : [];
+  $modelFile = trim((string)($publicState["modelFile"] ?? ""));
+  $version = trim((string)($liveJson["version"] ?? ""));
+  $publishedAtRaw = $liveJson["publishedAt"] ?? null;
+  $publishedAt = is_numeric($publishedAtRaw) ? (int)$publishedAtRaw : 0;
+
+  $state = [
+    "modelFile" => $modelFile,
+    "version" => $version,
+    "publishedAt" => $publishedAt,
+    "publishedLabel" => $publishedAt > 0 ? date("M d, Y h:i A", $publishedAt) : "Not available",
+    "hasLiveManifest" => !empty($publicState["hasLiveManifest"]),
+  ];
+  return $state;
+}
 
 function admin_layout_start(string $title, string $active = "") { ?>
 <!doctype html>
@@ -20,7 +62,6 @@ function admin_layout_start(string $title, string $active = "") { ?>
     "subsystem" => "admin_ui",
     "page" => $active !== "" ? $active : $title,
   ]) ?>
-  <script src="../js/on-screen-keyboard.js"></script>
 </head>
 <body>
   <div class="admin-shell">

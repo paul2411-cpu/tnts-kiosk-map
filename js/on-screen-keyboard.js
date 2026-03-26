@@ -22,7 +22,7 @@
   const MIN_WIDTH = 320;
   const MIN_HEIGHT = 220;
   const DEFAULT_WIDTH = 760;
-  const DEFAULT_HEIGHT = 320;
+  const DEFAULT_HEIGHT = 430;
   const MAX_WIDTH_RATIO = 0.96;
   const MAX_HEIGHT_RATIO = 0.78;
 
@@ -42,6 +42,7 @@
     drag: null,
     resize: null,
     proxy: null,
+    hasManualSize: false,
   };
 
   function clamp(value, min, max) {
@@ -92,9 +93,114 @@
     return Math.max(MIN_HEIGHT, Math.floor(getViewportHeight() * MAX_HEIGHT_RATIO));
   }
 
+  function getContentMinimumHeight() {
+    if (!state.root || !isOpen()) return MIN_HEIGHT;
+
+    const rootStyles = window.getComputedStyle(state.root);
+    const gap = parseFloat(rootStyles.rowGap || rootStyles.gap || "0") || 0;
+    const paddingTop = parseFloat(rootStyles.paddingTop || "0") || 0;
+    const paddingBottom = parseFloat(rootStyles.paddingBottom || "0") || 0;
+    const sections = Array.from(state.root.children).filter((child) => child instanceof HTMLElement);
+    if (!sections.length) return MIN_HEIGHT;
+
+    const contentHeight = sections.reduce((sum, child) => sum + child.scrollHeight, 0)
+      + (Math.max(0, sections.length - 1) * gap)
+      + paddingTop
+      + paddingBottom;
+
+    return Math.max(MIN_HEIGHT, Math.ceil(contentHeight));
+  }
+
+  function getContentMinimumWidth() {
+    if (!state.root || !isOpen()) return MIN_WIDTH;
+
+    const rootStyles = window.getComputedStyle(state.root);
+    const paddingLeft = parseFloat(rootStyles.paddingLeft || "0") || 0;
+    const paddingRight = parseFloat(rootStyles.paddingRight || "0") || 0;
+    let contentWidth = 0;
+
+    if (state.rows) {
+      const rowElements = Array.from(state.rows.querySelectorAll(".osk-row"));
+      rowElements.forEach((row) => {
+        const rowStyles = window.getComputedStyle(row);
+        const gap = parseFloat(rowStyles.columnGap || rowStyles.gap || "0") || 0;
+        let totalColumns = 0;
+        let requiredUnitWidth = 0;
+
+        Array.from(row.children).forEach((child) => {
+          if (!(child instanceof HTMLElement)) return;
+
+          const span = child.classList.contains("is-space")
+            ? 5
+            : child.classList.contains("is-wide")
+              ? 2
+              : 1;
+          const childStyles = window.getComputedStyle(child);
+          const borderWidth = (parseFloat(childStyles.borderLeftWidth || "0") || 0)
+            + (parseFloat(childStyles.borderRightWidth || "0") || 0);
+          const intrinsicWidth = Math.max(
+            child.scrollWidth + borderWidth,
+            parseFloat(childStyles.minWidth || "0") || 0
+          );
+
+          totalColumns += span;
+          requiredUnitWidth = Math.max(requiredUnitWidth, (intrinsicWidth - ((span - 1) * gap)) / span);
+        });
+
+        if (totalColumns > 0) {
+          const rowWidth = (totalColumns * requiredUnitWidth) + (Math.max(0, totalColumns - 1) * gap);
+          contentWidth = Math.max(contentWidth, rowWidth);
+        }
+      });
+    }
+
+    const sections = Array.from(state.root.children).filter((child) => child instanceof HTMLElement);
+    sections.forEach((child) => {
+      contentWidth = Math.max(contentWidth, child.scrollWidth);
+    });
+
+    contentWidth += paddingLeft + paddingRight;
+
+    return Math.max(MIN_WIDTH, Math.ceil(contentWidth));
+  }
+
+  function getPreferredPanelWidth() {
+    return clamp(Math.max(DEFAULT_WIDTH, getContentMinimumWidth()), MIN_WIDTH, getMaxPanelWidth());
+  }
+
+  function getPreferredPanelHeight() {
+    return clamp(getContentMinimumHeight(), MIN_HEIGHT, getMaxPanelHeight());
+  }
+
+  function applyPanelDimensions(forcePreferred = false) {
+    if (!state.root) return;
+    const minWidth = Math.min(getContentMinimumWidth(), getMaxPanelWidth());
+    const minHeight = Math.min(getContentMinimumHeight(), getMaxPanelHeight());
+    state.root.style.minWidth = `${minWidth}px`;
+    state.root.style.minHeight = `${minHeight}px`;
+
+    if (forcePreferred || !state.hasManualSize) {
+      state.width = getPreferredPanelWidth();
+      state.height = getPreferredPanelHeight();
+    } else {
+      normalizeDimensions();
+    }
+
+    state.root.style.width = `${state.width}px`;
+    state.root.style.height = `${state.height}px`;
+  }
+
   function normalizeDimensions() {
-    state.width = clamp(state.width, MIN_WIDTH, getMaxPanelWidth());
-    state.height = clamp(state.height, MIN_HEIGHT, getMaxPanelHeight());
+    const maxWidth = getMaxPanelWidth();
+    const minWidth = Math.min(getContentMinimumWidth(), maxWidth);
+    const maxHeight = getMaxPanelHeight();
+    const minHeight = Math.min(getContentMinimumHeight(), maxHeight);
+    if (state.root) {
+      state.root.style.minWidth = `${minWidth}px`;
+      state.root.style.minHeight = `${minHeight}px`;
+    }
+    state.width = clamp(state.width, minWidth, maxWidth);
+    state.height = clamp(state.height, minHeight, maxHeight);
   }
 
   function escapeHtml(text) {
@@ -163,6 +269,7 @@
         flex-direction: column;
         gap: 10px;
         padding: 12px;
+        box-sizing: border-box;
         border-radius: 18px;
         border: 1px solid rgba(15, 23, 42, 0.16);
         background: rgba(255, 255, 255, 0.98);
@@ -171,6 +278,7 @@
         user-select: none;
         touch-action: none;
         backdrop-filter: blur(10px);
+        overflow: hidden;
       }
       #tnts-osk[data-open="true"] { display: flex; }
       #tnts-osk .osk-header {
@@ -179,6 +287,7 @@
         gap: 10px;
         align-items: start;
         cursor: grab;
+        flex: 0 0 auto;
       }
       #tnts-osk .osk-header.dragging { cursor: grabbing; }
       #tnts-osk .osk-title {
@@ -196,7 +305,9 @@
       #tnts-osk .osk-display {
         margin-top: 6px;
         min-height: 42px;
+        max-height: 56px;
         padding: 10px 12px;
+        box-sizing: border-box;
         border-radius: 12px;
         border: 1px solid #d0d5dd;
         background: #f8fafc;
@@ -205,6 +316,7 @@
         font-weight: 800;
         line-height: 1.45;
         word-break: break-word;
+        overflow: auto;
       }
       #tnts-osk .osk-display.is-error {
         border-color: #fecdca;
@@ -216,6 +328,7 @@
         gap: 8px;
         flex-wrap: wrap;
         justify-content: flex-end;
+        align-items: flex-start;
       }
       #tnts-osk .osk-small-btn,
       #tnts-osk .osk-tab,
@@ -227,6 +340,8 @@
         font-weight: 900;
         font-family: inherit;
         cursor: pointer;
+        box-sizing: border-box;
+        white-space: nowrap;
       }
       #tnts-osk .osk-small-btn {
         min-height: 38px;
@@ -237,6 +352,7 @@
         display: flex;
         gap: 8px;
         flex-wrap: wrap;
+        flex: 0 0 auto;
       }
       #tnts-osk .osk-tab {
         min-height: 38px;
@@ -253,6 +369,7 @@
         display: grid;
         gap: 8px;
         min-height: 0;
+        align-content: start;
       }
       #tnts-osk .osk-row {
         display: grid;
@@ -281,12 +398,15 @@
         justify-content: space-between;
         gap: 12px;
         align-items: center;
+        flex: 0 0 auto;
       }
       #tnts-osk .osk-hint {
         color: #667085;
         font-size: 12px;
         font-weight: 700;
         line-height: 1.4;
+        flex: 1 1 auto;
+        min-width: 0;
       }
       #tnts-osk .osk-resize {
         width: 24px;
@@ -369,7 +489,7 @@
 
   function handleViewportChange() {
     if (!isOpen() || state.drag || state.resize) return;
-    normalizeDimensions();
+    applyPanelDimensions(!state.hasManualSize);
     positionNearTarget();
   }
 
@@ -778,6 +898,7 @@
       renderKeys();
       updateDisplay();
       openPanel();
+      applyPanelDimensions(!state.hasManualSize);
       positionNearTarget();
       return true;
     }
@@ -793,6 +914,7 @@
     renderKeys();
     updateDisplay();
     openPanel();
+    applyPanelDimensions(!state.hasManualSize);
     positionNearTarget();
     focusTarget();
     return true;
@@ -805,6 +927,7 @@
     state.root.dataset.open = "false";
     state.root.setAttribute("aria-hidden", "true");
     state.shift = false;
+    state.hasManualSize = false;
     state.target = null;
     updateDisplay();
     return true;
@@ -850,6 +973,10 @@
       state.mode = modeButton.getAttribute("data-osk-mode") || "alpha";
       state.shift = false;
       renderKeys();
+      if (isOpen()) {
+        applyPanelDimensions(!state.hasManualSize);
+        positionNearTarget();
+      }
       return;
     }
 
@@ -936,8 +1063,13 @@
     if (!state.resize || !state.root) return;
     event.preventDefault();
 
-    state.width = clamp(state.resize.startWidth + (event.clientX - state.resize.startX), MIN_WIDTH, getMaxPanelWidth());
-    state.height = clamp(state.resize.startHeight + (event.clientY - state.resize.startY), MIN_HEIGHT, getMaxPanelHeight());
+    const maxWidth = getMaxPanelWidth();
+    const minWidth = Math.min(getContentMinimumWidth(), maxWidth);
+    state.width = clamp(state.resize.startWidth + (event.clientX - state.resize.startX), minWidth, maxWidth);
+    const maxHeight = getMaxPanelHeight();
+    const minHeight = Math.min(getContentMinimumHeight(), maxHeight);
+    state.height = clamp(state.resize.startHeight + (event.clientY - state.resize.startY), minHeight, maxHeight);
+    state.hasManualSize = true;
     state.root.style.width = `${state.width}px`;
     state.root.style.height = `${state.height}px`;
 

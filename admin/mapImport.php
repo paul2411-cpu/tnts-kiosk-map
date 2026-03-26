@@ -5,6 +5,7 @@ require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/building_identity.php";
 require_once __DIR__ . "/inc/map_entities.php";
 require_once __DIR__ . "/inc/map_naming.php";
+require_once __DIR__ . "/inc/destination_harmony.php";
 app_logger_set_default_subsystem("map_import");
 
 $MODEL_DIR = __DIR__ . "/../models";
@@ -225,6 +226,7 @@ function import_ensure_schema(mysqli $conn): void {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
   ");
   map_entities_ensure_schema($conn);
+  harmony_ensure_schema($conn);
 }
 
 function import_get_or_create_version_id(
@@ -702,13 +704,6 @@ if (isset($_GET["action"])) {
         WHERE source_model_file = ? AND model_object_name = ?
         LIMIT 1
       ");
-      $selectBuildingTemplateStmt = $conn->prepare("
-        SELECT building_uid, building_name, model_object_name, entity_type, description, image_path, last_edited_at, last_edited_by_admin_id
-        FROM buildings
-        WHERE model_object_name = ? OR building_name = ?
-        ORDER BY building_id DESC
-        LIMIT 1
-      ");
       $insertBuildingStmt = $conn->prepare("
         INSERT INTO buildings (building_uid, building_name, model_object_name, entity_type, description, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
@@ -719,46 +714,32 @@ if (isset($_GET["action"])) {
         WHERE building_id = ?
       ");
       $selectFacilityStmt = $conn->prepare("
-        SELECT facility_id, facility_name, model_object_name
+        SELECT facility_id, facility_uid, facility_name, model_object_name
         FROM facilities
         WHERE source_model_file = ? AND model_object_name = ?
         LIMIT 1
       ");
-      $selectFacilityTemplateStmt = $conn->prepare("
-        SELECT facility_name, model_object_name, description, logo_path, location, contact_info, last_edited_at, last_edited_by_admin_id
-        FROM facilities
-        WHERE model_object_name = ? OR facility_name = ?
-        ORDER BY facility_id DESC
-        LIMIT 1
-      ");
       $insertFacilityStmt = $conn->prepare("
-        INSERT INTO facilities (facility_name, model_object_name, description, logo_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id, location, contact_info)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+        INSERT INTO facilities (facility_uid, facility_name, model_object_name, description, logo_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id, location, contact_info)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
       ");
       $updateFacilitySeenStmt = $conn->prepare("
         UPDATE facilities
-        SET last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
+        SET facility_uid = ?, last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
         WHERE facility_id = ?
       ");
       $selectRoomStmt = $conn->prepare("
-        SELECT room_id, room_name, model_object_name
+        SELECT room_id, room_uid, room_name, model_object_name
         FROM rooms
         WHERE source_model_file = ? AND building_id = ?
       ");
-      $selectRoomTemplateStmt = $conn->prepare("
-        SELECT room_name, room_number, room_type, floor_number, description, indoor_guide_text, image_path, model_object_name, last_edited_at, last_edited_by_admin_id
-        FROM rooms
-        WHERE model_object_name = ? OR (room_name = ? AND building_name = ?)
-        ORDER BY room_id DESC
-        LIMIT 1
-      ");
       $insertRoomStmt = $conn->prepare("
-        INSERT INTO rooms (building_id, building_uid, model_object_name, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        INSERT INTO rooms (building_id, building_uid, room_uid, model_object_name, room_name, room_number, room_type, floor_number, building_name, description, indoor_guide_text, image_path, source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest, last_edited_at, last_edited_by_admin_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
       ");
       $updateRoomSeenStmt = $conn->prepare("
         UPDATE rooms
-        SET building_id = ?, building_uid = ?, model_object_name = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
+        SET building_id = ?, building_uid = ?, room_uid = ?, model_object_name = ?, building_name = ?, last_seen_version_id = ?, is_present_in_latest = 1, source_model_file = ?
         WHERE room_id = ?
       ");
       $countMissingBuildingsStmt = $conn->prepare("SELECT COUNT(*) AS cnt FROM buildings WHERE source_model_file = ? AND is_present_in_latest = 0");
@@ -767,9 +748,9 @@ if (isset($_GET["action"])) {
 
       if (
         !$markBuildingsNotSeenStmt || !$markRoomsNotSeenStmt || !$markFacilitiesNotSeenStmt ||
-        !$selectBuildingStmt || !$selectBuildingTemplateStmt || !$insertBuildingStmt || !$updateBuildingSeenStmt ||
-        !$selectFacilityStmt || !$selectFacilityTemplateStmt || !$insertFacilityStmt || !$updateFacilitySeenStmt ||
-        !$selectRoomStmt || !$selectRoomTemplateStmt || !$insertRoomStmt || !$updateRoomSeenStmt ||
+        !$selectBuildingStmt || !$insertBuildingStmt || !$updateBuildingSeenStmt ||
+        !$selectFacilityStmt || !$insertFacilityStmt || !$updateFacilitySeenStmt ||
+        !$selectRoomStmt || !$insertRoomStmt || !$updateRoomSeenStmt ||
         !$countMissingBuildingsStmt || !$countMissingFacilitiesStmt || !$countMissingRoomsStmt
       ) {
         throw new RuntimeException("Failed to prepare SQL statements");
@@ -788,6 +769,8 @@ if (isset($_GET["action"])) {
         throw new RuntimeException("Failed to mark stale facilities");
       }
 
+      $parentModel = harmony_get_model_parent($conn, $modelFile);
+
       foreach ($destinationsIn as $buildingRow) {
         if (!is_array($buildingRow)) continue;
 
@@ -805,6 +788,7 @@ if (isset($_GET["action"])) {
         }
 
         if ($bucket === "facilities") {
+          $facilityUid = harmony_resolve_facility_uid($conn, $buildingName, $buildingObjectName, $modelFile, $parentModel);
           $selectFacilityStmt->bind_param("ss", $modelFile, $buildingObjectName);
           if (!$selectFacilityStmt->execute()) {
             throw new RuntimeException("Failed to query facilities table");
@@ -814,7 +798,8 @@ if (isset($_GET["action"])) {
 
           if ($existingFacility && isset($existingFacility["facility_id"])) {
             $facilityId = (int)$existingFacility["facility_id"];
-            $updateFacilitySeenStmt->bind_param("isi", $versionId, $modelFile, $facilityId);
+            $facilityUid = harmony_normalize_uid((string)($existingFacility["facility_uid"] ?? ""), "fac") ?: $facilityUid;
+            $updateFacilitySeenStmt->bind_param("sisi", $facilityUid, $versionId, $modelFile, $facilityId);
             if (!$updateFacilitySeenStmt->execute()) {
               throw new RuntimeException("Failed to update facility sync markers: " . $buildingName);
             }
@@ -827,13 +812,9 @@ if (isset($_GET["action"])) {
             $facilityContact = "";
             $facilityEditedAt = null;
             $facilityEditedBy = null;
-            $selectFacilityTemplateStmt->bind_param("ss", $buildingObjectName, $buildingName);
-            if (!$selectFacilityTemplateStmt->execute()) {
-              throw new RuntimeException("Failed to query facility template");
-            }
-            $templateRes = $selectFacilityTemplateStmt->get_result();
-            $templateRow = $templateRes ? $templateRes->fetch_assoc() : null;
+            $templateRow = harmony_fetch_facility_template($conn, $parentModel, $facilityUid, $buildingObjectName, $buildingName);
             if ($templateRow) {
+              $facilityUid = harmony_normalize_uid((string)($templateRow["facility_uid"] ?? ""), "fac") ?: $facilityUid;
               $templateDisplayName = import_clean_building_name((string)($templateRow["facility_name"] ?? ""));
               if ($templateDisplayName !== "") $facilityDisplayName = $templateDisplayName;
               $facilityDescription = import_copy_text($templateRow["description"] ?? "");
@@ -844,7 +825,8 @@ if (isset($_GET["action"])) {
               $facilityEditedBy = isset($templateRow["last_edited_by_admin_id"]) ? (int)$templateRow["last_edited_by_admin_id"] : null;
             }
             $insertFacilityStmt->bind_param(
-              "sssssiisiss",
+              "ssssssiisiss",
+              $facilityUid,
               $facilityDisplayName,
               $buildingObjectName,
               $facilityDescription,
@@ -872,12 +854,12 @@ if (isset($_GET["action"])) {
         $buildingResult = $selectBuildingStmt->get_result();
         $existing = $buildingResult ? $buildingResult->fetch_assoc() : null;
         $buildingId = 0;
-        $buildingUid = "";
+        $buildingUid = map_identity_resolve_uid($conn, $buildingName, $modelFile);
         $buildingDisplayName = $buildingName;
 
         if ($existing && isset($existing["building_id"])) {
           $buildingId = (int)$existing["building_id"];
-          $buildingUid = map_identity_normalize_uid((string)($existing["building_uid"] ?? ""));
+          $buildingUid = map_identity_normalize_uid((string)($existing["building_uid"] ?? "")) ?: $buildingUid;
           $buildingDisplayName = import_clean_building_name((string)($existing["building_name"] ?? $buildingName));
           if ($buildingDisplayName === "") $buildingDisplayName = $buildingName;
           if ($buildingUid === "") {
@@ -904,16 +886,10 @@ if (isset($_GET["action"])) {
           $buildingImagePath = "";
           $buildingEditedAt = null;
           $buildingEditedBy = null;
-          $buildingUid = "";
           $templateEntityType = $entityType;
-          $selectBuildingTemplateStmt->bind_param("ss", $buildingObjectName, $buildingName);
-          if (!$selectBuildingTemplateStmt->execute()) {
-            throw new RuntimeException("Failed to query building template");
-          }
-          $templateRes = $selectBuildingTemplateStmt->get_result();
-          $templateRow = $templateRes ? $templateRes->fetch_assoc() : null;
+          $templateRow = harmony_fetch_building_template($conn, $parentModel, $buildingUid, $buildingObjectName, $buildingName);
           if ($templateRow) {
-            $buildingUid = map_identity_normalize_uid((string)($templateRow["building_uid"] ?? ""));
+            $buildingUid = map_identity_normalize_uid((string)($templateRow["building_uid"] ?? "")) ?: $buildingUid;
             $templateDisplayName = import_clean_building_name((string)($templateRow["building_name"] ?? ""));
             if ($templateDisplayName !== "") $buildingDisplayName = $templateDisplayName;
             $templateEntityType = import_clean_entity_type((string)($templateRow["entity_type"] ?? $entityType));
@@ -922,10 +898,6 @@ if (isset($_GET["action"])) {
             $buildingEditedAt = isset($templateRow["last_edited_at"]) ? (string)$templateRow["last_edited_at"] : null;
             $buildingEditedBy = isset($templateRow["last_edited_by_admin_id"]) ? (int)$templateRow["last_edited_by_admin_id"] : null;
           }
-          if ($buildingUid === "") {
-            $buildingUid = map_identity_resolve_uid($conn, $buildingName, $modelFile);
-          }
-
           $insertBuildingStmt->bind_param("sssssssiisi", $buildingUid, $buildingDisplayName, $buildingObjectName, $templateEntityType, $buildingDescription, $buildingImagePath, $modelFile, $versionId, $versionId, $buildingEditedAt, $buildingEditedBy);
           if (!$insertBuildingStmt->execute()) {
             throw new RuntimeException("Failed to insert building: " . $buildingName);
@@ -954,9 +926,13 @@ if (isset($_GET["action"])) {
           while ($row = $roomResult->fetch_assoc()) {
             $existingObjectName = import_clean_object_name((string)($row["model_object_name"] ?? ""));
             $existingRoomName = isset($row["room_name"]) ? strtolower(trim((string)$row["room_name"])) : "";
-            if ($existingObjectName !== "") $existingRoomsByKey[strtolower($existingObjectName)] = (int)($row["room_id"] ?? 0);
+            $existingRoomInfo = [
+              "id" => (int)($row["room_id"] ?? 0),
+              "uid" => harmony_normalize_uid((string)($row["room_uid"] ?? ""), "room")
+            ];
+            if ($existingObjectName !== "") $existingRoomsByKey[strtolower($existingObjectName)] = $existingRoomInfo;
             if ($existingRoomName !== "" && !isset($existingRoomsByKey[$existingRoomName])) {
-              $existingRoomsByKey[$existingRoomName] = (int)($row["room_id"] ?? 0);
+              $existingRoomsByKey[$existingRoomName] = $existingRoomInfo;
             }
           }
         }
@@ -972,8 +948,13 @@ if (isset($_GET["action"])) {
           }
 
           if (isset($existingRoomsByKey[$roomKey])) {
-            $existingRoomId = (int)$existingRoomsByKey[$roomKey];
-            $updateRoomSeenStmt->bind_param("isssisi", $buildingId, $buildingUid, $roomObjectName, $buildingDisplayName, $versionId, $modelFile, $existingRoomId);
+            $existingRoom = $existingRoomsByKey[$roomKey];
+            $existingRoomId = (int)($existingRoom["id"] ?? 0);
+            $roomUid = harmony_normalize_uid((string)($existingRoom["uid"] ?? ""), "room");
+            if ($roomUid === "") {
+              $roomUid = harmony_resolve_room_uid($conn, $buildingUid, $roomName, $roomObjectName, $modelFile, $parentModel);
+            }
+            $updateRoomSeenStmt->bind_param("issssisi", $buildingId, $buildingUid, $roomUid, $roomObjectName, $buildingDisplayName, $versionId, $modelFile, $existingRoomId);
             if (!$updateRoomSeenStmt->execute()) {
               throw new RuntimeException("Failed to update room sync markers: " . $roomName);
             }
@@ -989,14 +970,11 @@ if (isset($_GET["action"])) {
           $roomImagePath = "";
           $roomEditedAt = null;
           $roomEditedBy = null;
+          $roomUid = harmony_resolve_room_uid($conn, $buildingUid, $roomName, $roomObjectName, $modelFile, $parentModel);
           $templateObjectName = $roomObjectName !== "" ? $roomObjectName : $roomName;
-          $selectRoomTemplateStmt->bind_param("sss", $templateObjectName, $roomName, $buildingDisplayName);
-          if (!$selectRoomTemplateStmt->execute()) {
-            throw new RuntimeException("Failed to query room template");
-          }
-          $roomTemplateRes = $selectRoomTemplateStmt->get_result();
-          $roomTemplate = $roomTemplateRes ? $roomTemplateRes->fetch_assoc() : null;
+          $roomTemplate = harmony_fetch_room_template($conn, $parentModel, $roomUid, $buildingUid, $roomName, $templateObjectName);
           if ($roomTemplate) {
+            $roomUid = harmony_normalize_uid((string)($roomTemplate["room_uid"] ?? ""), "room") ?: $roomUid;
             if ($roomNumber === "") $roomNumber = import_copy_text($roomTemplate["room_number"] ?? "");
             $roomType = import_copy_text($roomTemplate["room_type"] ?? "");
             $floorNumber = import_copy_text($roomTemplate["floor_number"] ?? "");
@@ -1008,9 +986,10 @@ if (isset($_GET["action"])) {
           }
 
           $insertRoomStmt->bind_param(
-            "isssssssssssiisi",
+            "issssssssssssiisi",
             $buildingId,
             $buildingUid,
+            $roomUid,
             $roomObjectName,
             $roomName,
             $roomNumber,
@@ -1029,7 +1008,10 @@ if (isset($_GET["action"])) {
           if (!$insertRoomStmt->execute()) {
             throw new RuntimeException("Failed to insert room: " . $roomName);
           }
-          $existingRoomsByKey[$roomKey] = (int)$insertRoomStmt->insert_id;
+          $existingRoomsByKey[$roomKey] = [
+            "id" => (int)$insertRoomStmt->insert_id,
+            "uid" => $roomUid
+          ];
           $summary["roomsInserted"]++;
         }
       }

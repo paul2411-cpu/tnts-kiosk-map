@@ -1961,6 +1961,13 @@ function isUsablePublishedGuide(entry) {
   );
 }
 
+function isUsablePublishedExactGuideForTarget(target, entry) {
+  if (!isUsablePublishedGuide(entry)) return false;
+  if (String(target?.type || "").trim().toLowerCase() !== "room") return true;
+  const mode = String(entry?.guideMode || "").trim().toLowerCase();
+  return mode === "manual" && !!String(entry?.manualText || "").trim();
+}
+
 function hideDirectionsPanel() {
   directionsPanel?.classList.add("hidden");
   if (directionsSummary) directionsSummary.textContent = "Select a destination to view directions.";
@@ -2170,7 +2177,7 @@ function showDirectionsPanelForSelection(target, routeEntry, alignedPoints, rout
   const summaryText = String(summary || "").replace(/\s*(?:\u2022|\u00e2\u20ac\u00a2)\s*/g, " - ");
   const exactGuideEntry = getExactGuideEntryForTarget(target);
   const buildingGuideEntry = getBuildingGuideEntryForTarget(target);
-  const usableExactGuide = isUsablePublishedGuide(exactGuideEntry);
+  const usableExactGuide = isUsablePublishedExactGuideForTarget(target, exactGuideEntry);
   const usableBuildingGuide = isUsablePublishedGuide(buildingGuideEntry);
   const roomMeta = target.type === "room" && target.roomName
     ? getDbRoomMeta(target.buildingName, target.roomName)

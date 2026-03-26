@@ -4,6 +4,7 @@ require_admin_permission("manage_facilities", "You do not have access to manage 
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_entities.php";
 require_once __DIR__ . "/inc/map_sync.php";
+require_once __DIR__ . "/inc/destination_harmony.php";
 app_logger_set_default_subsystem("facilities_admin");
 
 $MODEL_DIR = __DIR__ . "/../models";
@@ -65,12 +66,15 @@ function fac_latest_version_id(mysqli $conn, string $modelFile): ?int {
 
 function fac_fetch_rows(mysqli $conn, string $model = ""): array {
   map_entities_ensure_schema($conn);
+  harmony_ensure_schema($conn);
   $hasSource = map_entities_has_column($conn, "facilities", "source_model_file");
   $hasPresent = map_entities_has_column($conn, "facilities", "is_present_in_latest");
   $hasVersion = map_entities_has_column($conn, "facilities", "last_seen_version_id");
   $hasEdited = map_entities_has_column($conn, "facilities", "last_edited_at");
 
-  $sql = "SELECT facility_id, facility_name, model_object_name, description, logo_path, location, contact_info, "
+  $sql = "SELECT facility_id, "
+    . (map_entities_has_column($conn, "facilities", "facility_uid") ? "facility_uid" : "NULL AS facility_uid")
+    . ", facility_name, model_object_name, description, logo_path, location, contact_info, "
     . ($hasSource ? "source_model_file" : "NULL AS source_model_file")
     . ", " . ($hasVersion ? "last_seen_version_id" : "NULL AS last_seen_version_id")
     . ", " . ($hasEdited ? "last_edited_at" : "NULL AS last_edited_at")
@@ -100,6 +104,12 @@ function fac_fetch_rows(mysqli $conn, string $model = ""): array {
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
   $action = (string)$_GET["action"];
+  try {
+    map_entities_ensure_schema($conn);
+    harmony_ensure_schema($conn);
+  } catch (Throwable $e) {
+    fac_fail(500, $e->getMessage());
+  }
 
   if ($action === "list_models") {
     $editorModel = fac_editor_model_file();
@@ -148,10 +158,11 @@ if (isset($_GET["action"])) {
   if ($action === "get_facility") {
     try {
       map_entities_ensure_schema($conn);
+      harmony_ensure_schema($conn);
       $id = isset($_GET["facilityId"]) && is_numeric($_GET["facilityId"]) ? (int)$_GET["facilityId"] : 0;
       if ($id <= 0) fac_fail(400, "Missing facility id");
       $stmt = $conn->prepare("
-        SELECT facility_id, facility_name, model_object_name, description, logo_path, location, contact_info,
+        SELECT facility_id, facility_uid, facility_name, model_object_name, description, logo_path, location, contact_info,
                source_model_file, last_seen_version_id, last_edited_at
         FROM facilities
         WHERE facility_id = ?
@@ -174,6 +185,7 @@ if (isset($_GET["action"])) {
     fac_post_csrf();
     try {
       map_entities_ensure_schema($conn);
+      harmony_ensure_schema($conn);
       $facilityId = isset($_POST["facilityId"]) && is_numeric($_POST["facilityId"]) ? (int)$_POST["facilityId"] : 0;
       $modelFileRaw = trim((string)($_POST["modelFile"] ?? ""));
       $modelFile = $modelFileRaw === "" ? "" : fac_model_name($modelFileRaw);
@@ -211,12 +223,13 @@ if (isset($_GET["action"])) {
 
       $adminId = isset($_SESSION["admin_id"]) ? (int)$_SESSION["admin_id"] : null;
       if (is_int($adminId) && $adminId <= 0) $adminId = null;
+      $parentModel = $modelFile !== "" ? harmony_get_model_parent($conn, $modelFile) : "";
 
       $conn->begin_transaction();
       $existing = null;
       if ($facilityId > 0) {
         $stmt = $conn->prepare("
-          SELECT facility_id, facility_name, model_object_name, source_model_file, first_seen_version_id, last_seen_version_id
+          SELECT facility_id, facility_uid, facility_name, model_object_name, source_model_file, first_seen_version_id, last_seen_version_id
           FROM facilities
           WHERE facility_id = ?
           LIMIT 1
@@ -233,6 +246,10 @@ if (isset($_GET["action"])) {
       }
 
       if ($modelFile === "") fac_fail(400, "Facility model file is required");
+      $facilityUid = harmony_resolve_facility_uid($conn, $facilityName, $objectName, $modelFile, $parentModel);
+      if ($existing) {
+        $facilityUid = harmony_normalize_uid((string)($existing["facility_uid"] ?? ""), "fac") ?: $facilityUid;
+      }
 
       $versionId = fac_latest_version_id($conn, $modelFile);
       $firstSeenVersion = $existing ? (int)($existing["first_seen_version_id"] ?? 0) : 0;
@@ -260,23 +277,23 @@ if (isset($_GET["action"])) {
         if ($adminId === null) {
           $stmt = $conn->prepare("
             UPDATE facilities
-            SET facility_name = ?, model_object_name = ?, description = ?, logo_path = ?, location = ?, contact_info = ?,
+            SET facility_uid = ?, facility_name = ?, model_object_name = ?, description = ?, logo_path = ?, location = ?, contact_info = ?,
                 source_model_file = ?, first_seen_version_id = ?, last_seen_version_id = ?, is_present_in_latest = 1,
                 last_edited_at = NOW(), last_edited_by_admin_id = NULL
             WHERE facility_id = ?
           ");
           if (!$stmt) throw new RuntimeException("Failed to prepare facility update");
-          $stmt->bind_param("sssssssiii", $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $facilityId);
+          $stmt->bind_param("ssssssssiii", $facilityUid, $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $facilityId);
         } else {
           $stmt = $conn->prepare("
             UPDATE facilities
-            SET facility_name = ?, model_object_name = ?, description = ?, logo_path = ?, location = ?, contact_info = ?,
+            SET facility_uid = ?, facility_name = ?, model_object_name = ?, description = ?, logo_path = ?, location = ?, contact_info = ?,
                 source_model_file = ?, first_seen_version_id = ?, last_seen_version_id = ?, is_present_in_latest = 1,
                 last_edited_at = NOW(), last_edited_by_admin_id = ?
             WHERE facility_id = ?
           ");
           if (!$stmt) throw new RuntimeException("Failed to prepare facility update");
-          $stmt->bind_param("sssssssiiii", $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $adminId, $facilityId);
+          $stmt->bind_param("ssssssssiiii", $facilityUid, $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $adminId, $facilityId);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to update facility");
         $stmt->close();
@@ -284,25 +301,25 @@ if (isset($_GET["action"])) {
         if ($adminId === null) {
           $stmt = $conn->prepare("
             INSERT INTO facilities (
-              facility_name, model_object_name, description, logo_path, location, contact_info,
+              facility_uid, facility_name, model_object_name, description, logo_path, location, contact_info,
               source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest,
               last_edited_at, last_edited_by_admin_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NULL)
           ");
           if (!$stmt) throw new RuntimeException("Failed to prepare facility insert");
-          $stmt->bind_param("sssssssii", $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion);
+          $stmt->bind_param("ssssssssii", $facilityUid, $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion);
         } else {
           $stmt = $conn->prepare("
             INSERT INTO facilities (
-              facility_name, model_object_name, description, logo_path, location, contact_info,
+              facility_uid, facility_name, model_object_name, description, logo_path, location, contact_info,
               source_model_file, first_seen_version_id, last_seen_version_id, is_present_in_latest,
               last_edited_at, last_edited_by_admin_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), ?)
           ");
           if (!$stmt) throw new RuntimeException("Failed to prepare facility insert");
-          $stmt->bind_param("sssssssiii", $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $adminId);
+          $stmt->bind_param("ssssssssiii", $facilityUid, $facilityName, $objectName, $description, $logoPath, $location, $contactInfo, $modelFile, $firstSeenVersion, $lastSeenVersion, $adminId);
         }
         if (!$stmt->execute()) throw new RuntimeException("Failed to insert facility");
         $facilityId = (int)$stmt->insert_id;
@@ -531,10 +548,11 @@ async function loadModels() {
     const o = document.createElement("option");
     o.value = r.file;
     const tags = [];
-    if (r.isEditable) tags.push("default/editable");
-    else if (r.isLive) tags.push("live");
+    if (r.isLive) tags.push("published");
+    if (r.isEditable) tags.push("editable");
     if (r.isOriginal) tags.push("original");
-    if (!r.isEditable) tags.push("archive");
+    if (!r.isEditable && !r.isLive) tags.push("snapshot");
+    else if (!r.isEditable && r.isLive) tags.push("read-only");
     o.textContent = tags.length ? `${r.file} (${tags.join(", ")})` : r.file;
     modelSel.appendChild(o);
   });

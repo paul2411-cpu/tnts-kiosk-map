@@ -50,7 +50,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Admin Login</title>
   <link rel="stylesheet" href="assets/admin.css"/>
-  <script src="../js/on-screen-keyboard.js"></script>
   <style>
     body{ background:#f6f7fb; }
     .login-shell{

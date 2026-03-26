@@ -4,6 +4,7 @@ require_admin_permission("manage_map", "You do not have access to the map tools.
 require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/building_identity.php";
 require_once __DIR__ . "/inc/map_entities.php";
+require_once __DIR__ . "/inc/destination_harmony.php";
 app_logger_set_default_subsystem("map_editor");
 
 $ASSET_DIR = __DIR__ . "/assets_map";
@@ -351,6 +352,18 @@ function validate_guides_payload($data, ?string &$error = null): bool {
       $error = "entries[{$guideKey}].manualText must be a string";
       return false;
     }
+    if (isset($guideEntry["roomSupplementText"]) && !is_string($guideEntry["roomSupplementText"])) {
+      $error = "entries[{$guideKey}].roomSupplementText must be a string";
+      return false;
+    }
+    if (isset($guideEntry["roomUid"]) && !is_string($guideEntry["roomUid"])) {
+      $error = "entries[{$guideKey}].roomUid must be a string";
+      return false;
+    }
+    if (isset($guideEntry["facilityUid"]) && !is_string($guideEntry["facilityUid"])) {
+      $error = "entries[{$guideKey}].facilityUid must be a string";
+      return false;
+    }
     if (isset($guideEntry["routeSignature"]) && !is_string($guideEntry["routeSignature"])) {
       $error = "entries[{$guideKey}].routeSignature must be a string";
       return false;
@@ -495,6 +508,7 @@ function editor_ensure_snapshot_schema(mysqli $conn): void {
   if (!editor_db_col($conn, "rooms", "last_edited_at")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!editor_db_col($conn, "rooms", "last_edited_by_admin_id")) editor_db_sql($conn, "ALTER TABLE rooms ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
   map_entities_ensure_schema($conn);
+  harmony_ensure_schema($conn);
 }
 
 function editor_get_or_create_version_id(mysqli $conn, string $modelFile, string $modelHash): int {
@@ -534,7 +548,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
   if ($sourceModel === "" || $targetModel === "" || $sourceModel === $targetModel) return;
 
   $buildingSql = "
-    SELECT building_id, building_uid, building_name, model_object_name, description, image_path, last_edited_at, last_edited_by_admin_id
+    SELECT building_id, building_uid, building_name, model_object_name, entity_type, description, image_path, last_edited_at, last_edited_by_admin_id
     FROM buildings
     WHERE source_model_file = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
     ORDER BY building_id ASC
@@ -556,6 +570,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       building_uid,
       building_name,
       model_object_name,
+      entity_type,
       description,
       image_path,
       source_model_file,
@@ -565,7 +580,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       last_edited_at,
       last_edited_by_admin_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   ");
   if (!$insertBuildingStmt) throw new RuntimeException("Failed to prepare cloned building insert");
 
@@ -573,6 +588,8 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
     INSERT INTO rooms (
       building_id,
       building_uid,
+      room_uid,
+      model_object_name,
       room_name,
       room_number,
       room_type,
@@ -588,12 +605,12 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       last_edited_at,
       last_edited_by_admin_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   ");
   if (!$insertRoomStmt) throw new RuntimeException("Failed to prepare cloned room insert");
 
   $roomQueryStmt = $conn->prepare("
-    SELECT room_name, room_number, room_type, floor_number, building_name, building_uid, description, indoor_guide_text, image_path, last_edited_at, last_edited_by_admin_id
+    SELECT room_uid, room_name, room_number, room_type, floor_number, building_name, building_uid, description, indoor_guide_text, image_path, model_object_name, last_edited_at, last_edited_by_admin_id
     FROM rooms
     WHERE source_model_file = ? AND building_id = ? AND (is_present_in_latest = 1 OR is_present_in_latest IS NULL)
     ORDER BY room_id ASC
@@ -610,6 +627,7 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
     }
     $buildingName = trim((string)($building["building_name"] ?? ""));
     $buildingObjectName = trim((string)($building["model_object_name"] ?? ""));
+    $buildingEntityType = trim((string)($building["entity_type"] ?? "building")) ?: "building";
     if ($buildingObjectName === "") $buildingObjectName = $buildingName;
     if ($buildingName === "" || $buildingObjectName === "") continue;
     $buildingDescription = trim((string)($building["description"] ?? ""));
@@ -618,10 +636,11 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
     $buildingEditedBy = isset($building["last_edited_by_admin_id"]) ? (int)$building["last_edited_by_admin_id"] : null;
 
     $insertBuildingStmt->bind_param(
-      "ssssssiisi",
+      "sssssssiisi",
       $buildingUid,
       $buildingName,
       $buildingObjectName,
+      $buildingEntityType,
       $buildingDescription,
       $buildingImagePath,
       $targetModel,
@@ -643,6 +662,10 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       if ($roomName === "") continue;
       $roomBuildingUid = map_identity_normalize_uid((string)($room["building_uid"] ?? ""));
       if ($roomBuildingUid === "") $roomBuildingUid = $buildingUid;
+      $roomUid = harmony_normalize_uid((string)($room["room_uid"] ?? ""), "room");
+      if ($roomUid === "") {
+        $roomUid = harmony_resolve_room_uid($conn, $roomBuildingUid, $roomName, (string)($room["model_object_name"] ?? ""), $sourceModel);
+      }
       $roomNumber = trim((string)($room["room_number"] ?? ""));
       $roomType = trim((string)($room["room_type"] ?? ""));
       $floorNumber = trim((string)($room["floor_number"] ?? ""));
@@ -650,13 +673,17 @@ function editor_clone_model_snapshot(mysqli $conn, string $sourceModel, string $
       $roomDescription = trim((string)($room["description"] ?? ""));
       $roomIndoorGuideText = trim((string)($room["indoor_guide_text"] ?? ""));
       $roomImagePath = trim((string)($room["image_path"] ?? ""));
+      $roomObjectName = trim((string)($room["model_object_name"] ?? ""));
+      if ($roomObjectName === "") $roomObjectName = $roomName;
       $roomEditedAt = isset($room["last_edited_at"]) ? (string)$room["last_edited_at"] : null;
       $roomEditedBy = isset($room["last_edited_by_admin_id"]) ? (int)$room["last_edited_by_admin_id"] : null;
 
       $insertRoomStmt->bind_param(
-        "issssssssssiisi",
+        "issssssssssssiisi",
         $newBuildingId,
         $roomBuildingUid,
+        $roomUid,
+        $roomObjectName,
         $roomName,
         $roomNumber,
         $roomType,
@@ -844,6 +871,7 @@ if (isset($_GET["action"])) {
   }
 
   if ($action === "load_guides") {
+    editor_ensure_snapshot_schema($conn);
     $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
     $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
     if ($safe === "" || $safe === "." || $safe === "..") {
@@ -859,7 +887,21 @@ if (isset($_GET["action"])) {
     }
 
     $path = __DIR__ . "/overlays/guides_" . $safe . ".json";
-    if (!file_exists($path)) {
+    $hasFile = file_exists($path);
+    $entries = [];
+    $updated = null;
+    if ($hasFile) {
+      $raw = file_get_contents($path);
+      $json = json_decode($raw, true);
+      if (is_array($json) && isset($json["entries"]) && is_array($json["entries"])) {
+        $entries = $json["entries"];
+      }
+      $updated = (is_array($json) && isset($json["updated"])) ? $json["updated"] : null;
+    }
+
+    $sourceRows = harmony_load_guide_source_rows($conn, $safe);
+    $entries = harmony_merge_guide_source_rows($entries, $sourceRows);
+    if (!$hasFile && !$entries) {
       echo json_encode([
         "ok" => true,
         "model" => $safe,
@@ -869,22 +911,18 @@ if (isset($_GET["action"])) {
       exit;
     }
 
-    $raw = file_get_contents($path);
-    $json = json_decode($raw, true);
-    $entries = (is_array($json) && isset($json["entries"]) && is_array($json["entries"])) ? $json["entries"] : new stdClass();
-    $updated = (is_array($json) && isset($json["updated"])) ? $json["updated"] : null;
-
     echo json_encode([
       "ok" => true,
       "model" => $safe,
-      "exists" => true,
+      "exists" => ($hasFile || !empty($entries)),
       "updated" => $updated,
-      "entries" => $entries
+      "entries" => !empty($entries) ? $entries : new stdClass()
     ], JSON_PRETTY_PRINT);
     exit;
   }
 
   if ($action === "save_guides") {
+    editor_ensure_snapshot_schema($conn);
     $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
     $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
     if ($safe === "" || $safe === "." || $safe === "..") {
@@ -912,14 +950,27 @@ if (isset($_GET["action"])) {
     $payload["ok"] = true;
     $payload["model"] = $safe;
     $payload["updated"] = time();
-    if (!safe_atomic_write_json($path, $payload)) {
-      json_error_and_exit(500, "Failed to save guides file");
+    $adminId = isset($_SESSION["admin_id"]) ? (int)$_SESSION["admin_id"] : null;
+    if (is_int($adminId) && $adminId <= 0) $adminId = null;
+    $backup = file_exists($path) ? file_get_contents($path) : null;
+    $conn->begin_transaction();
+    try {
+      harmony_persist_guide_source_entries($conn, $safe, is_array($payload["entries"] ?? null) ? $payload["entries"] : [], $adminId);
+      if (!safe_atomic_write_json($path, $payload)) {
+        throw new RuntimeException("Failed to save guides file");
+      }
+      $conn->commit();
+    } catch (Throwable $e) {
+      $conn->rollback();
+      restore_file_from_backup($path, $backup);
+      json_error_and_exit(500, "Failed to save guides file: " . $e->getMessage());
     }
     echo json_encode(["ok" => true], JSON_PRETTY_PRINT);
     exit;
   }
 
   if ($action === "save_navigation_bundle") {
+    editor_ensure_snapshot_schema($conn);
     $name = isset($_GET["name"]) ? trim($_GET["name"]) : "";
     $safe = preg_replace('/[^A-Za-z0-9._-]/', '_', $name);
     if ($safe === "" || $safe === "." || $safe === "..") {
@@ -983,8 +1034,12 @@ if (isset($_GET["action"])) {
     $guidesOut["ok"] = true;
     $guidesOut["model"] = $safe;
     $guidesOut["updated"] = $updated;
+    $adminId = isset($_SESSION["admin_id"]) ? (int)$_SESSION["admin_id"] : null;
+    if (is_int($adminId) && $adminId <= 0) $adminId = null;
 
     try {
+      $conn->begin_transaction();
+      harmony_persist_guide_source_entries($conn, $safe, is_array($guidesPayload["entries"] ?? null) ? $guidesPayload["entries"] : [], $adminId);
       if (!safe_atomic_write_json($roadnetPath, $roadnetOut)) {
         throw new RuntimeException("Failed to save roadnet file");
       }
@@ -994,7 +1049,9 @@ if (isset($_GET["action"])) {
       if (!safe_atomic_write_json($guidesPath, $guidesOut)) {
         throw new RuntimeException("Failed to save guides file");
       }
+      $conn->commit();
     } catch (Throwable $e) {
+      try { $conn->rollback(); } catch (Throwable $_) {}
       restore_file_from_backup($roadnetPath, $roadnetBackup);
       restore_file_from_backup($routesPath, $routesBackup);
       restore_file_from_backup($guidesPath, $guidesBackup);
@@ -1252,6 +1309,28 @@ if (isset($_GET["action"])) {
     }
   }
 
+  if ($action === "harmony_health") {
+    try {
+      editor_ensure_snapshot_schema($conn);
+      $model = "";
+      if (isset($_GET["model"]) && trim((string)$_GET["model"]) !== "") {
+        $candidate = editor_normalize_model_file_name((string)$_GET["model"]);
+        if ($candidate === "") {
+          json_error_and_exit(400, "Invalid model file");
+        }
+        $model = $candidate;
+      }
+      $report = harmony_collect_health_report($conn, $model);
+      echo json_encode([
+        "ok" => true,
+        "report" => $report
+      ], JSON_PRETTY_PRINT);
+      exit;
+    } catch (Throwable $e) {
+      json_error_and_exit(500, "Failed to build harmony diagnostics: " . $e->getMessage());
+    }
+  }
+
   if ($action === "get_default_model") {
     $defaultModel = $ORIGINAL_MODEL_NAME;
     if (file_exists($DEFAULT_MODEL_PATH)) {
@@ -1306,6 +1385,7 @@ if (isset($_GET["action"])) {
   }
 
   if ($action === "publish_map") {
+    editor_ensure_snapshot_schema($conn);
 
     $raw = file_get_contents("php://input");
     $data = json_decode($raw, true);
@@ -1334,7 +1414,6 @@ if (isset($_GET["action"])) {
     $guidesPath = $overlayDir . "/" . $guidesFile;
     $roadnetBackup = file_exists($roadnetPath) ? file_get_contents($roadnetPath) : null;
     $liveBackup = file_exists($LIVE_MAP_PATH) ? file_get_contents($LIVE_MAP_PATH) : null;
-    $defaultBackup = file_exists($DEFAULT_MODEL_PATH) ? file_get_contents($DEFAULT_MODEL_PATH) : null;
     $releasesBackup = file_exists($RELEASES_PATH) ? file_get_contents($RELEASES_PATH) : null;
 
     $publishedAt = time();
@@ -1389,11 +1468,6 @@ if (isset($_GET["action"])) {
         throw new RuntimeException("Failed to write live map manifest");
       }
 
-      // Keep default model aligned with published model for admin UX consistency.
-      if (!safe_atomic_write_json($DEFAULT_MODEL_PATH, ["file" => $file, "updated" => $publishedAt])) {
-        throw new RuntimeException("Failed to update default model");
-      }
-
       $history = [];
       if (file_exists($RELEASES_PATH)) {
         $old = json_decode(file_get_contents($RELEASES_PATH), true);
@@ -1414,7 +1488,6 @@ if (isset($_GET["action"])) {
     } catch (Throwable $e) {
       restore_file_from_backup($roadnetPath, $roadnetBackup);
       restore_file_from_backup($LIVE_MAP_PATH, $liveBackup);
-      restore_file_from_backup($DEFAULT_MODEL_PATH, $defaultBackup);
       restore_file_from_backup($RELEASES_PATH, $releasesBackup);
       json_error_and_exit(500, "Publish failed: " . $e->getMessage());
     }
@@ -1535,6 +1608,7 @@ if (isset($_GET["action"])) {
         try {
           $versionId = editor_get_or_create_version_id($conn, $finalName, $hash);
           editor_clone_model_snapshot($conn, $sourceModel, $finalName, $versionId);
+          harmony_set_model_parent($conn, $finalName, $sourceModel);
           editor_refresh_version_totals($conn, $versionId, $finalName);
           $conn->commit();
         } catch (Throwable $e) {
@@ -2544,30 +2618,19 @@ function handleBuildingKeyboardPress(e) {
 }
 
 function setupBuildingFilterKeyboard() {
-  if (window.TNTSOnScreenKeyboard) return;
   if (!buildingFilterEl) return;
 
-  createBuildingKeyboard();
-
-  const openKeyboard = () => showBuildingKeyboardFor(buildingFilterEl);
-  buildingFilterEl.addEventListener("focus", openKeyboard);
-  buildingFilterEl.addEventListener("pointerdown", openKeyboard, { passive: true });
-  buildingFilterEl.addEventListener("click", openKeyboard);
   buildingFilterEl.addEventListener("keydown", (ev) => {
     if (ev.key !== "Enter") return;
     ev.preventDefault();
     refreshBuildingList();
     selectFirstFilteredBuilding();
-    hideBuildingKeyboard();
   });
 
   buildingFilterEl.setAttribute("autocomplete", "off");
   buildingFilterEl.setAttribute("autocorrect", "off");
   buildingFilterEl.setAttribute("autocapitalize", "off");
   buildingFilterEl.setAttribute("spellcheck", "false");
-
-  const overlay = document.getElementById("me-kb-overlay");
-  overlay?.addEventListener("pointerdown", handleBuildingKeyboardPress, { passive: false });
 }
 
 function withCsrfHeaders(headers = undefined) {
@@ -3846,6 +3909,7 @@ function normalizeLoadedGuideEntry(rawKey, rawEntry = {}) {
   });
   const guideMode = String(rawEntry?.guideMode || "").trim().toLowerCase();
   let manualText = String(rawEntry?.manualText || "").replace(/\r\n/g, "\n").trim();
+  const roomSupplementText = String(rawEntry?.roomSupplementText || "").replace(/\r\n/g, "\n").trim();
   if (!manualText && (guideMode === "manual" || guideMode === "mixed") && Array.isArray(rawEntry?.finalSteps)) {
     manualText = guideStepsToText(rawEntry.finalSteps);
   }
@@ -3861,7 +3925,10 @@ function normalizeLoadedGuideEntry(rawKey, rawEntry = {}) {
     buildingUid: resolved.buildingUid,
     objectName: resolved.objectName,
     roomName,
+    roomUid: String(rawEntry?.roomUid || "").trim(),
+    facilityUid: String(rawEntry?.facilityUid || "").trim(),
     manualText,
+    roomSupplementText,
     sourceRouteSignature: String(rawEntry?.sourceRouteSignature || "").trim()
   };
 }
@@ -3895,10 +3962,13 @@ function buildGuideRawSnapshotValue() {
       buildingUid: String(entry?.buildingUid || "").trim(),
       objectName: String(entry?.objectName || "").trim(),
       roomName: String(entry?.roomName || "").trim(),
+      roomUid: String(entry?.roomUid || "").trim(),
+      facilityUid: String(entry?.facilityUid || "").trim(),
       manualText: String(entry?.manualText || "").replace(/\r\n/g, "\n").trim(),
+      roomSupplementText: String(entry?.roomSupplementText || "").replace(/\r\n/g, "\n").trim(),
       sourceRouteSignature: String(entry?.sourceRouteSignature || "").trim()
     }))
-    .filter((entry) => entry.key && (entry.manualText || entry.sourceRouteSignature))
+    .filter((entry) => entry.key && (entry.manualText || entry.roomSupplementText || entry.sourceRouteSignature))
     .sort((a, b) => a.key.localeCompare(b.key));
   return {
     model: String(currentModelName || "").trim(),
@@ -4136,7 +4206,7 @@ function buildGuideWorkingEntries(opts = {}) {
     const raw = normalizeLoadedGuideEntry(key, rawEntries[key] || destination);
     const routeEntry = getGuideRouteEntry(routes, destination.buildingName, destination.buildingUid, destination.objectName);
     const routeSignature = routeEntry ? buildRouteSignature(routeEntry.points, routeEntry.distance) : "";
-    const autoSteps = routeEntry
+    const baseAutoSteps = routeEntry
       ? buildGuideStepsFromPoints(routeEntry.points, {
           destinationName: destination.roomName || destination.buildingName,
           arrivalText: destination.roomName
@@ -4146,10 +4216,15 @@ function buildGuideWorkingEntries(opts = {}) {
         })
       : [];
     const manualText = String(raw.manualText || "").replace(/\r\n/g, "\n").trim();
+    const roomSupplementText = String(raw.roomSupplementText || "").replace(/\r\n/g, "\n").trim();
+    const roomSupplementSteps = destination.roomName && roomSupplementText
+      ? parseManualGuideText(roomSupplementText)
+      : [];
+    const autoSteps = roomSupplementSteps.length ? [...baseAutoSteps, ...roomSupplementSteps] : baseAutoSteps;
     const finalSteps = manualText ? parseManualGuideText(manualText) : autoSteps;
     const isStale = !!manualText && !!raw.sourceRouteSignature && !!routeSignature && raw.sourceRouteSignature !== routeSignature;
     const notes = [];
-    if (destination.roomName) notes.push("Room guidance currently follows the parent building route.");
+    if (destination.roomName) notes.push(roomSupplementSteps.length ? "Room guidance uses the parent building route plus the saved room supplement." : "Room guidance currently follows the parent building route.");
     if (!routeEntry) notes.push("No route is currently available for this destination.");
     if (isStale) notes.push("Manual text should be reviewed because the route changed.");
 
@@ -4160,6 +4235,8 @@ function buildGuideWorkingEntries(opts = {}) {
       buildingUid: destination.buildingUid,
       objectName: destination.objectName,
       roomName: destination.roomName,
+      roomUid: String(raw.roomUid || "").trim(),
+      facilityUid: String(raw.facilityUid || "").trim(),
       destinationName: destination.destinationName,
       routeName: String(routeEntry?.name || destination.buildingName || "").trim(),
       routeSignature,
@@ -4168,6 +4245,7 @@ function buildGuideWorkingEntries(opts = {}) {
       autoSteps,
       finalSteps,
       manualText,
+      roomSupplementText,
       guideMode: manualText ? "manual" : "auto",
       status: routeEntry ? (isStale ? "stale" : "ok") : "missing_route",
       routeAvailable: !!routeEntry,
@@ -4181,6 +4259,7 @@ function buildGuideWorkingEntries(opts = {}) {
     if (seenKeys.has(rawKey)) continue;
     const raw = normalizeLoadedGuideEntry(rawKey, rawValue);
     const manualText = String(raw.manualText || "").replace(/\r\n/g, "\n").trim();
+    const roomSupplementText = String(raw.roomSupplementText || "").replace(/\r\n/g, "\n").trim();
     working[rawKey] = {
       key: rawKey,
       destinationType: raw.destinationType,
@@ -4188,6 +4267,8 @@ function buildGuideWorkingEntries(opts = {}) {
       buildingUid: raw.buildingUid,
       objectName: raw.objectName,
       roomName: raw.roomName,
+      roomUid: String(raw.roomUid || "").trim(),
+      facilityUid: String(raw.facilityUid || "").trim(),
       destinationName: raw.roomName ? `${raw.buildingName} / ${raw.roomName}` : raw.buildingName,
       routeName: raw.buildingName,
       routeSignature: "",
@@ -4196,6 +4277,7 @@ function buildGuideWorkingEntries(opts = {}) {
       autoSteps: [],
       finalSteps: manualText ? parseManualGuideText(manualText) : [],
       manualText,
+      roomSupplementText,
       guideMode: manualText ? "manual" : "auto",
       status: "orphaned",
       routeAvailable: false,
@@ -4361,6 +4443,8 @@ function buildGuidesPayloadForModel(modelName, opts = {}) {
       buildingUid: entry.buildingUid,
       objectName: entry.objectName,
       roomName: entry.roomName,
+      roomUid: String(entry.roomUid || "").trim(),
+      facilityUid: String(entry.facilityUid || "").trim(),
       destinationName: entry.destinationName,
       routeName: entry.routeName,
       distance: entry.distance,
@@ -4370,6 +4454,7 @@ function buildGuidesPayloadForModel(modelName, opts = {}) {
       status: entry.status,
       usesBuildingRoute: !!entry.usesBuildingRoute,
       manualText,
+      roomSupplementText: String(entry.roomSupplementText || "").replace(/\r\n/g, "\n").trim(),
       notes: Array.isArray(entry.notes) ? entry.notes : [],
       autoSteps: Array.isArray(entry.autoSteps) ? entry.autoSteps : [],
       finalSteps
@@ -10215,15 +10300,54 @@ function buildWorkingRoutesSnapshot() {
   return hasLiveRoadData() ? computeSavedRoutes() : savedRoutes;
 }
 
+function isObjectIncludedInExportNodes(obj, nodes) {
+  if (!obj || !Array.isArray(nodes) || !nodes.length) return false;
+  const roots = new Set(nodes.filter(Boolean));
+  let current = obj;
+  while (current) {
+    if (roots.has(current)) return true;
+    current = current.parent || null;
+  }
+  return false;
+}
+
+async function withCleanExportVisualState(nodes, task) {
+  const exportNodes = Array.isArray(nodes) ? nodes.filter(Boolean) : [];
+  const selectedForExport = selected && isObjectIncludedInExportNodes(selected, exportNodes)
+    ? selected
+    : null;
+  const hoveredForExport = hovered
+    && hovered !== selectedForExport
+    && isObjectIncludedInExportNodes(hovered, exportNodes)
+      ? hovered
+      : null;
+
+  if (hoveredForExport) clearHover(hoveredForExport);
+  if (selectedForExport) clearSelected(selectedForExport);
+
+  try {
+    return await task(exportNodes);
+  } finally {
+    if (selectedForExport && selected === selectedForExport) {
+      applySelected(selectedForExport);
+    }
+    if (hoveredForExport && hovered === hoveredForExport && hovered !== selected) {
+      applyHover(hoveredForExport);
+    }
+  }
+}
+
 function exportNodesToGlbBinary(nodes) {
-  const exporter = new GLTFExporter();
-  return new Promise((resolve, reject) => {
-    exporter.parse(
-      Array.isArray(nodes) ? nodes : [],
-      (glb) => resolve(glb),
-      (err) => reject(err),
-      { binary: true }
-    );
+  return withCleanExportVisualState(nodes, (exportNodes) => {
+    const exporter = new GLTFExporter();
+    return new Promise((resolve, reject) => {
+      exporter.parse(
+        exportNodes,
+        (glb) => resolve(glb),
+        (err) => reject(err),
+        { binary: true }
+      );
+    });
   });
 }
 

@@ -5,6 +5,7 @@ require_once __DIR__ . "/inc/db.php";
 require_once __DIR__ . "/inc/map_sync.php";
 require_once __DIR__ . "/inc/building_identity.php";
 require_once __DIR__ . "/inc/map_entities.php";
+require_once __DIR__ . "/inc/destination_harmony.php";
 app_logger_set_default_subsystem("building_admin");
 
 $MODEL_DIR = __DIR__ . "/../models";
@@ -122,6 +123,7 @@ function bld_ensure_schema(mysqli $conn): void {
   if (!bld_col($conn, "buildings", "last_edited_at")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_at DATETIME NULL AFTER is_present_in_latest");
   if (!bld_col($conn, "buildings", "last_edited_by_admin_id")) bld_sql($conn, "ALTER TABLE buildings ADD COLUMN last_edited_by_admin_id INT NULL AFTER last_edited_at");
   map_entities_ensure_schema($conn);
+  harmony_ensure_schema($conn);
 }
 
 function bld_version_id(mysqli $conn, string $modelFile, string $modelHash, ?int $adminId): int {
@@ -201,6 +203,11 @@ function bld_editor_model_file(): ?string {
 if (isset($_GET["action"])) {
   header("Content-Type: application/json; charset=utf-8");
   $action = (string)$_GET["action"];
+  try {
+    bld_ensure_schema($conn);
+  } catch (Throwable $e) {
+    bld_fail(500, $e->getMessage());
+  }
 
   if ($action === "list_models") {
     $editorModel = bld_editor_model_file();
@@ -243,7 +250,9 @@ if (isset($_GET["action"])) {
     $hasVersion = bld_col($conn, "buildings", "last_seen_version_id");
     $hasEdited = bld_col($conn, "buildings", "last_edited_at");
 
-    $sql = "SELECT building_id, building_name, "
+    $sql = "SELECT building_id, "
+      . (bld_col($conn, "buildings", "building_uid") ? "building_uid" : "NULL AS building_uid")
+      . ", building_name, "
       . (bld_col($conn, "buildings", "model_object_name") ? "model_object_name" : "NULL AS model_object_name")
       . ", " . (bld_col($conn, "buildings", "entity_type") ? "entity_type" : "'building' AS entity_type")
       . ", description, image_path, "
@@ -284,13 +293,17 @@ if (isset($_GET["action"])) {
       $model = $safe;
     }
     $hasSource = bld_col($conn, "buildings", "source_model_file");
-    $sqlCols = "building_id, building_name, description, image_path, "
+    $sqlCols = "building_id, "
+      . (bld_col($conn, "buildings", "building_uid") ? "building_uid" : "NULL AS building_uid")
+      . ", building_name, description, image_path, "
       . (bld_col($conn, "buildings", "model_object_name") ? "model_object_name" : "NULL AS model_object_name")
       . ", " . (bld_col($conn, "buildings", "entity_type") ? "entity_type" : "'building' AS entity_type")
+      . ", "
       . (bld_col($conn, "buildings", "last_seen_version_id") ? "last_seen_version_id" : "NULL AS last_seen_version_id")
       . ", " . (bld_col($conn, "buildings", "last_edited_at") ? "last_edited_at" : "NULL AS last_edited_at")
       . ", " . ($hasSource ? "source_model_file" : "NULL AS source_model_file");
     $row = null;
+    $parentModel = $model !== "" ? harmony_get_model_parent($conn, $model) : "";
     if ($model !== "" && $hasSource) {
       $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE source_model_file = ? AND (building_name = ? OR model_object_name = ?) LIMIT 1");
       if ($stmt) {
@@ -301,10 +314,10 @@ if (isset($_GET["action"])) {
         }
       }
     }
-    if (!$row) {
-      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE building_name = ? OR model_object_name = ? ORDER BY building_id DESC LIMIT 1");
+    if (!$row && $parentModel !== "" && $hasSource) {
+      $stmt = $conn->prepare("SELECT {$sqlCols} FROM buildings WHERE source_model_file = ? AND (building_name = ? OR model_object_name = ?) ORDER BY building_id DESC LIMIT 1");
       if ($stmt) {
-        $stmt->bind_param("ss", $name, $name);
+        $stmt->bind_param("sss", $parentModel, $name, $name);
         if ($stmt->execute()) {
           $res = $stmt->get_result();
           $row = $res ? $res->fetch_assoc() : null;
@@ -385,8 +398,6 @@ if (isset($_GET["action"])) {
       $lookups = [
         ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE source_model_file = ? AND model_object_name = ? LIMIT 1", "ss", [$modelFile, $oldName]],
         ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE source_model_file = ? AND building_name = ? LIMIT 1", "ss", [$modelFile, $newName]],
-        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE model_object_name = ? ORDER BY building_id DESC LIMIT 1", "s", [$oldName]],
-        ["SELECT building_id, building_uid, building_name, model_object_name, entity_type FROM buildings WHERE building_name = ? ORDER BY building_id DESC LIMIT 1", "s", [$newName]],
       ];
       foreach ($lookups as $q) {
         if ($id > 0) break;
@@ -901,10 +912,11 @@ async function loadModels() {
     const o = document.createElement("option");
     o.value = r.file;
     const tags = [];
-    if (r.isEditable) tags.push("default/editable");
-    else if (r.isLive) tags.push("live");
+    if (r.isLive) tags.push("published");
+    if (r.isEditable) tags.push("editable");
     if (r.isOriginal) tags.push("original");
-    if (!r.isEditable) tags.push("archive");
+    if (!r.isEditable && !r.isLive) tags.push("snapshot");
+    else if (!r.isEditable && r.isLive) tags.push("read-only");
     o.textContent = tags.length ? `${r.file} (${tags.join(", ")})` : r.file;
     modelSel.appendChild(o);
   });
