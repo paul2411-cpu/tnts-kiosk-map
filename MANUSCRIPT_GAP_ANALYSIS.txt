@@ -1,0 +1,990 @@
+TNTS MANUSCRIPT GAP ANALYSIS
+Prepared from a comparison between:
+1. The manuscript file: C:\Users\Lenovo Legion\Downloads\TNTS NAVIGATOR.docx
+2. The current TNTS project source tree: C:\xampp\htdocs\tnts
+
+Date of review: 2026-03-26
+
+========================================================================
+1. OVERALL ASSESSMENT
+========================================================================
+
+The TNTS software project itself is stronger than the manuscript that
+describes it.
+
+After examining the manuscript text, the embedded images, and the current
+project code, the main conclusion is:
+
+- The manuscript contains a real TNTS core.
+- Many embedded screenshots do match the TNTS system.
+- The manuscript text is not yet clean, consistent, or academically ready.
+- Some sections overstate features.
+- Some sections underdescribe the system's strongest technical work.
+- Several parts appear to be copied or left over from another project.
+
+In short:
+
+The project looks real and technically substantial, but the manuscript
+currently weakens the project because the write-up is inconsistent,
+partially contaminated by unrelated content, and unclear in scope and stage.
+
+
+========================================================================
+2. WHAT WAS EXAMINED
+========================================================================
+
+The review covered the following:
+
+- Full extracted text from the DOCX package.
+- Embedded media inventory from the manuscript.
+- Public kiosk pages and related JavaScript.
+- API endpoints that drive the map and detail panels.
+- Admin-side content management pages.
+- Map import, map editing, route authoring, guide authoring, and publish
+  workflows.
+- Admin role and permission handling.
+
+Important project files reviewed include:
+
+- pages/map.php
+- pages/facilities.php
+- pages/events.php
+- pages/announcement.php
+- pages/feedback.php
+- js/map3d.js
+- js/guide-utils.js
+- js/map-entity-utils.js
+- js/app-error-tracker.js
+- js/admin-events-map-picker.js
+- api/map_live.php
+- api/map_search.php
+- api/map_building_details.php
+- admin/dashboard.php
+- admin/building.php
+- admin/room.php
+- admin/facilities.php
+- admin/events.php
+- admin/announcement.php
+- admin/feedback.php
+- admin/adminUser.php
+- admin/mapImport.php
+- admin/mapEditor.php
+- admin/inc/admin_users.php
+- admin/inc/auth.php
+- admin/inc/events.php
+
+
+========================================================================
+3. HIGH-LEVEL FINDINGS
+========================================================================
+
+The biggest findings are these:
+
+1. The manuscript includes unrelated content from another project.
+2. The manuscript has conflicting dates, names, roles, and supervision
+   details.
+3. The manuscript does not clearly signal that it is a Chapter 1 to 3 draft.
+4. The manuscript mixes proposal-stage tense and completed-study tense.
+5. The manuscript contains many grammar, spacing, numbering, and citation
+   quality issues.
+6. Some feature descriptions are inaccurate or too strong.
+7. The manuscript fails to fully explain some of the most advanced parts of
+   the TNTS system.
+
+
+========================================================================
+4. MAJOR LACKS IN THE MANUSCRIPT
+========================================================================
+
+------------------------------------------------------------------------
+4.1 Cross-project contamination
+------------------------------------------------------------------------
+
+This is the most serious manuscript problem.
+
+The manuscript still contains clear leftovers from another system. The
+following examples were found in the extracted DOCX text:
+
+- "SideQuest-TC"
+- marketplace
+- closet
+- leaderboard
+- moderator creation
+- student registration
+- profanity control
+- forums moderation
+- mobile application references that do not belong to TNTS
+
+Why this is a problem:
+
+- It damages the credibility of the manuscript immediately.
+- A panel or adviser can interpret this as careless assembly or copy-paste.
+- It makes the manuscript look unfinished even if the software is real.
+- It creates confusion about what system is actually being defended.
+
+What this means academically:
+
+- Even if the actual system is good, the manuscript can be judged as weak
+  because it appears insufficiently proofread and insufficiently tailored to
+  the actual project.
+
+
+------------------------------------------------------------------------
+4.2 Front matter inconsistency
+------------------------------------------------------------------------
+
+The manuscript front matter contains multiple inconsistencies:
+
+- Conflicting dates such as July 2026, September 2025, September 2025 to
+  March 2026, and September 2025 to September 2026.
+- Mixed adviser or supervision references.
+- Author name inconsistencies such as Senson versus Sendon in one area.
+- Placeholder text such as "Month Year".
+- Formatting issues like missing spaces and merged words.
+
+Why this is a problem:
+
+- Front matter is supposed to be the cleanest part of a manuscript.
+- If this section is inconsistent, readers will doubt the reliability of the
+  rest of the document.
+- It signals that the manuscript was not subjected to final editorial review.
+
+
+------------------------------------------------------------------------
+4.3 Scope confusion in the manuscript structure
+------------------------------------------------------------------------
+
+The extracted DOCX text clearly showed Introduction, RRL, Methodology,
+References, and Appendices. However, a clear, clean main-body sequence for
+later chapters such as Results and Discussion and Conclusion was not evident
+in the text review.
+
+Why this is a problem:
+
+- If this document is intended only as a Chapter 1 to 3 manuscript, then the
+  absence of Chapters 4 and 5 is expected and should not be treated as a
+  defect by itself.
+- The real problem is that parts of the document make it look like a later
+  stage or more complete manuscript even though the scope is still Chapter 1
+  to 3.
+- Because of that, the document sends mixed signals about whether it is a
+  proposal-stage manuscript or a finished capstone manuscript.
+
+Likely effect on readers:
+
+- Readers may misunderstand the manuscript stage.
+- They may think Chapters 4 and 5 are missing, when the larger issue is that
+  the document does not clearly present itself as a Chapter 1 to 3 draft.
+
+
+------------------------------------------------------------------------
+4.4 Tense inconsistency: Chapter 1 to 3 draft versus completed project
+------------------------------------------------------------------------
+
+The manuscript switches between:
+
+- completed-study language
+- present-description language
+- future/proposal language
+
+Examples of the problem:
+
+- The abstract speaks as if the system has already been designed,
+  implemented, tested, and evaluated.
+- Later methodology sections still say things like:
+  "will be conducted"
+  "will be deployed"
+  "will be evaluated"
+  "will be subjected"
+
+Why this is a problem:
+
+- If this is officially a Chapter 1 to 3 manuscript, most of the document
+  should stay in proposal, design, or planned-evaluation language.
+- Mixed tense makes it unclear whether the system is already deployed and
+  evaluated, or still being proposed and prepared.
+- This creates confusion about the manuscript stage and can make readers
+  doubt which claims are already completed and which are still planned.
+
+
+------------------------------------------------------------------------
+4.5 Weak academic writing quality
+------------------------------------------------------------------------
+
+The manuscript has many writing issues:
+
+- missing spaces
+- merged words
+- repeated words
+- inconsistent capitalization
+- awkward sentence construction
+- incorrect pronouns in biographies
+- broken technical phrasing
+- repeated figure numbers
+- incorrect punctuation
+
+Examples of technical writing problems:
+
+- "phpMyAdmin" treated as if it were a programming language or major
+  development platform rather than an administrative database tool.
+- "3JSis" appears without spacing.
+- "real-time mapping" is used too strongly for what the system actually does.
+
+Why this is a problem:
+
+- It makes the manuscript look rushed.
+- It reduces clarity.
+- It weakens confidence in the technical explanations.
+
+
+------------------------------------------------------------------------
+4.6 Reference quality problems
+------------------------------------------------------------------------
+
+The reference list has several quality issues:
+
+- some sources are unrelated to TNTS or campus wayfinding
+- some entries appear included only because they contain words like
+  navigation or kiosk
+- some local file paths are cited using file:///C:/...
+- a sci-hub link appears
+- some entries are malformed or duplicated
+- some citations look incomplete or weakly normalized
+
+Why this is a problem:
+
+- A capstone manuscript should use relevant, properly formatted, defensible
+  references.
+- Local file paths and pirate mirror links should not appear in formal
+  academic references.
+- Weak relevance lowers the quality of the literature review.
+
+
+------------------------------------------------------------------------
+4.7 Figure and appendix numbering problems
+------------------------------------------------------------------------
+
+The manuscript contains:
+
+- repeated figure numbers
+- inconsistent appendix labels
+- caption numbering mismatches
+- appendix references that do not align cleanly with the actual image set
+
+Example types of issues found:
+
+- repeated "Appendix Figure 6"
+- list entries that refer to unrelated screens
+- duplicated numbering logic in appendix sections
+
+Why this is a problem:
+
+- It makes navigation through the manuscript confusing.
+- It suggests the document was assembled from multiple sources without final
+  normalization.
+
+
+------------------------------------------------------------------------
+4.8 Feature overstatement or inaccurate framing
+------------------------------------------------------------------------
+
+Some descriptions in the manuscript do not align perfectly with the current
+system.
+
+Important examples:
+
+- The manuscript uses "real-time mapping" language.
+  The current system loads the published live map state and polls for a newer
+  published version. It is not real-time indoor positioning or live user
+  tracking.
+
+- The manuscript describes the Events module as using a built-in calendar
+  interface.
+  The current public events page is a schedule-filtered card interface, not a
+  calendar-style event planner view.
+
+- The manuscript sometimes makes the student moderator side sound like a
+  separate student panel system.
+  In the code, this is implemented as permission-scoped admin accounts,
+  especially student-leader style users with limited access to events and
+  announcements, not a separately engineered end-user admin application.
+
+Why this is a problem:
+
+- It risks overclaiming.
+- A reviewer comparing the document to the actual system may notice the
+  mismatch.
+
+
+------------------------------------------------------------------------
+4.9 Underdescription of the strongest technical work
+------------------------------------------------------------------------
+
+One of the biggest weaknesses of the manuscript is that it does not explain
+the most technically impressive parts of TNTS well enough.
+
+The strongest software elements are not just:
+
+- a 3D campus map
+- a search bar
+- an events page
+
+The strongest elements are actually:
+
+- model-aware map publishing
+- GLB import and synchronization
+- route graph authoring
+- per-model route storage
+- per-model text guide storage
+- building and room editing tied to the model
+- event location pinning directly on the map
+- role-based admin permissions
+
+These are the parts that make the project more than a simple kiosk site.
+
+
+========================================================================
+5. WHAT THE EMBEDDED IMAGES REVEAL
+========================================================================
+
+The embedded screenshots in the DOCX are important because they provide
+evidence that the TNTS system is real.
+
+Observed image patterns:
+
+- Public feedback screen matches the current TNTS public feedback page style.
+- Admin dashboard screenshots match the TNTS admin layout.
+- Building, room, facility, event, announcement, feedback, map editor, and
+  admin user screens largely match the current project.
+- Public map, facilities, events, and announcements screenshots largely match
+  the system's current visual direction.
+- There are also methodology and appendix images such as conceptual
+  framework, use case, fishbone diagram, Gantt chart, survey snapshots, and
+  implementation plan.
+
+Important interpretation:
+
+- The images support the claim that the team built a real system.
+- The screenshots are stronger than the manuscript text.
+- The document's main weakness is therefore not absence of a system, but the
+  quality and consistency of the write-up.
+
+
+========================================================================
+6. DETAILED SYSTEM INFORMATION THAT THE MANUSCRIPT SHOULD EXPLAIN BETTER
+========================================================================
+
+------------------------------------------------------------------------
+6.1 Public map experience
+------------------------------------------------------------------------
+
+The manuscript correctly says that TNTS has a 3D campus map, but it should
+describe the map module more precisely.
+
+The public map page includes:
+
+- 3D and 2D viewing modes
+- a zoom slider
+- a directions panel
+- building info cards
+- room lists inside the info card
+- event focus card behavior
+
+Evidence in code:
+
+- pages/map.php
+- js/map3d.js
+
+Key technical points the manuscript is currently missing:
+
+- The map runtime is driven by a published live map manifest rather than a
+  hardcoded single model.
+- The map can refresh when a new published version is detected.
+- The system distinguishes between published model data and fallback model
+  behavior.
+- The public map includes room-aware detail loading and route-aware selection
+  logic.
+
+
+------------------------------------------------------------------------
+6.2 Search is not just a simple text filter
+------------------------------------------------------------------------
+
+The manuscript mentions search, but it does not fully explain how much logic
+is behind it.
+
+The search pipeline includes:
+
+- building search
+- room search
+- route-aware result prioritization
+- room-to-building resolution
+- destination jumping from facilities/events into the map
+
+Evidence in code:
+
+- api/map_search.php
+- js/map3d.js
+
+Why this matters:
+
+- This shows the system is not merely displaying a static map.
+- It is interpreting search results against a published campus data model.
+
+
+------------------------------------------------------------------------
+6.3 Route guidance is more advanced than the manuscript suggests
+------------------------------------------------------------------------
+
+The manuscript usually describes route guidance in generic terms such as
+"pathways pointer" or "text guide."
+
+The actual system is more advanced:
+
+- published route bundles are loaded by the public map
+- published guide bundles are also loaded
+- the route ribbon is animated
+- direction steps can be built from published text guides
+- room-level fallback guidance can be generated when detailed text guides are
+  not available
+- route-related missing states are explicitly handled
+
+Evidence in code:
+
+- js/map3d.js
+- js/guide-utils.js
+- admin/mapEditor.php
+
+Why the manuscript should explain this:
+
+- This is one of the project's best technical differentiators.
+- It demonstrates algorithmic and content-management work, not just UI work.
+
+
+------------------------------------------------------------------------
+6.4 The system is model-aware
+------------------------------------------------------------------------
+
+This is one of the most important technical facts that the manuscript barely
+explains.
+
+TNTS is not simply reading one permanent campus map. It is model-aware.
+
+That means:
+
+- the currently published model is resolved dynamically
+- routes and guides are attached to a specific model file
+- buildings, rooms, and facilities can be filtered by source model
+- the public side follows the active published map state
+
+Evidence in code:
+
+- api/map_live.php
+- api/map_search.php
+- api/map_building_details.php
+- admin/inc/map_sync.php
+
+Why this matters:
+
+- This is a major software-engineering improvement over a basic kiosk demo.
+- It supports evolving campus models and map revisions.
+
+
+------------------------------------------------------------------------
+6.5 Event integration is stronger than a normal event page
+------------------------------------------------------------------------
+
+The manuscript mentions that events can be viewed and connected to the map,
+but it does not explain the actual implementation depth.
+
+The current system supports:
+
+- event records stored in the database
+- public event listing from real rows
+- event schedule classification
+- location resolution
+- map links from events to the public map
+- direct "Get Directions" links
+- specific-area event pinning
+- route-anchor linkage for events
+
+Evidence in code:
+
+- pages/events.php
+- admin/events.php
+- admin/inc/events.php
+- js/admin-events-map-picker.js
+- pages/map.php
+- js/map3d.js
+
+Why this matters:
+
+- This is not just an event bulletin board.
+- It is a navigation-integrated event system.
+
+
+------------------------------------------------------------------------
+6.6 Facilities are tied into the route model
+------------------------------------------------------------------------
+
+The manuscript mentions facilities, but the current project does more than
+simply list facility cards.
+
+The current facilities flow supports:
+
+- loading facilities from the database
+- model-aware facility filtering
+- route-readiness detection
+- map-jump behavior
+- contact and location details
+
+Evidence in code:
+
+- pages/facilities.php
+- admin/facilities.php
+- admin/inc/events.php
+
+Why this matters:
+
+- It shows that facilities are treated as navigable destinations, not just
+  static informational cards.
+
+
+------------------------------------------------------------------------
+6.7 Announcements are more than plain posts
+------------------------------------------------------------------------
+
+The manuscript says announcements exist, but it does not explain the richer
+behavior.
+
+The current announcement system supports:
+
+- scheduled visibility
+- active and headline prioritization
+- importance levels
+- banner uploads
+- public automatic filtering by active schedule window
+
+Evidence in code:
+
+- pages/announcement.php
+- admin/announcement.php
+- admin/inc/announcements.php
+
+Why this matters:
+
+- This is a content scheduling system, not just a simple notice board.
+
+
+------------------------------------------------------------------------
+6.8 Feedback is actually implemented end-to-end
+------------------------------------------------------------------------
+
+The manuscript mentions feedback but gives it only a small amount of
+attention.
+
+The current system supports:
+
+- public feedback submission
+- CSRF protection on submission
+- rating and category selection
+- source-page context
+- selected destination context
+- map-version capture
+- admin review workflow
+- admin status updates such as new, reviewed, and resolved
+
+Evidence in code:
+
+- pages/feedback.php
+- admin/feedback.php
+
+Why this matters:
+
+- This gives the project a real loop from public use to admin review.
+- It also supports future maintenance decisions.
+
+
+------------------------------------------------------------------------
+6.9 Admin roles and permissions are more mature than the manuscript shows
+------------------------------------------------------------------------
+
+The manuscript mentions admin users and student moderators, but the codebase
+has a more structured permission model than the manuscript explains.
+
+Current role-related capabilities include:
+
+- superadmin accounts
+- scoped admin accounts
+- student-leader account type
+- per-module permissions
+- permission-based sidebar visibility
+- restricted access to content modules
+
+Evidence in code:
+
+- admin/adminUser.php
+- admin/inc/admin_users.php
+- admin/inc/auth.php
+- admin/inc/layout.php
+
+Important nuance:
+
+The student moderator behavior is implemented as a restricted admin account
+pattern, not as an entirely separate application architecture.
+
+
+------------------------------------------------------------------------
+6.10 Building editor is more than CRUD
+------------------------------------------------------------------------
+
+The manuscript says admins can manage buildings, but that undersells the
+actual building module.
+
+The building editor supports:
+
+- loading a model-aware building list
+- selecting buildings inside a 3D viewport
+- saving GLB changes
+- updating database metadata
+- syncing renamed route entries
+- syncing renamed guide entries
+- syncing renamed roadnet links
+
+Evidence in code:
+
+- admin/building.php
+
+Why this matters:
+
+- This is a strong integration point between 3D model state and structured
+  database state.
+
+
+------------------------------------------------------------------------
+6.11 Room editor includes indoor guidance metadata
+------------------------------------------------------------------------
+
+The manuscript refers to rooms mainly as searchable destinations, but the
+room module does more.
+
+The room editor supports:
+
+- room number storage
+- room type storage
+- floor number storage
+- description storage
+- indoor guide text storage
+- model-linked room editing
+- GLB save workflow
+
+Evidence in code:
+
+- admin/room.php
+
+Why this matters:
+
+- This helps explain where room-level directions and fallback room guidance
+  can come from.
+
+
+------------------------------------------------------------------------
+6.12 Map import pipeline is a major system feature
+------------------------------------------------------------------------
+
+The manuscript should explain this much more clearly.
+
+The map import workflow supports:
+
+- scanning GLB models
+- validating GLB binaries
+- extracting building and room structures
+- correcting room-name artifacts from modeling workflows
+- syncing imported entities to database tables
+- tracking model versions
+- marking stale or missing records
+
+Evidence in code:
+
+- admin/mapImport.php
+- js/map-entity-utils.js
+
+Why this matters:
+
+- This is one of the strongest technical contributions in the project.
+- It shows the system was built for maintainability and future map updates.
+
+
+------------------------------------------------------------------------
+6.13 Master map editor and publishing pipeline are major missing highlights
+------------------------------------------------------------------------
+
+This is probably the single strongest system area that the manuscript should
+feature more proudly and more clearly.
+
+The map editor supports:
+
+- asset listing
+- route loading and saving
+- roadnet loading and saving
+- guide loading and saving
+- navigation bundle preparation
+- route generation logic
+- shortest-path computation using Dijkstra-style runs
+- GLB export
+- publish-to-live workflow
+
+Evidence in code:
+
+- admin/mapEditor.php
+
+Why this matters:
+
+- This turns TNTS from a static viewer into a maintainable map platform.
+- This is a stronger story than simply saying the map can be updated.
+
+
+------------------------------------------------------------------------
+6.14 Reliability and error tracking exist but are absent from the manuscript
+------------------------------------------------------------------------
+
+The manuscript focuses on visible features and testing plans, but it does not
+mention runtime support features such as error tracking.
+
+The current project includes:
+
+- client-side error reporting helper
+- subsystem-aware logging patterns
+- route-missing and other client issue reporting hooks
+
+Evidence in code:
+
+- js/app-error-tracker.js
+- js/map3d.js
+
+Why this matters:
+
+- It supports maintainability and troubleshooting.
+- It shows the system includes operational thinking, not only UI features.
+
+
+========================================================================
+7. FEATURE STATUS: WHAT IS ACCURATE, WHAT IS PARTIAL, WHAT IS TOO STRONG
+========================================================================
+
+Below is a practical feature-by-feature interpretation.
+
+3D map:
+- Accurate.
+- Implemented and central to the system.
+
+2D and 3D view switching:
+- Accurate.
+- Implemented.
+
+Zoom controls:
+- Accurate.
+- Implemented.
+
+Building and room search:
+- Accurate.
+- Implemented.
+
+Route guidance:
+- Accurate overall.
+- Implemented, and actually stronger than the manuscript usually explains.
+
+Text guidance:
+- Accurate overall.
+- Implemented through published guides and fallback guidance logic.
+
+Facilities page:
+- Accurate.
+- Implemented and tied to route readiness.
+
+Events page:
+- Accurate overall.
+- Implemented, but not as a calendar interface.
+
+Announcements page:
+- Accurate overall.
+- Implemented, including scheduling and headline behavior.
+
+Feedback page:
+- Accurate.
+- Implemented, including admin review flow.
+
+Admin dashboard:
+- Accurate.
+- Implemented.
+
+Building management:
+- Accurate.
+- Implemented and more advanced than the manuscript suggests.
+
+Room management:
+- Accurate.
+- Implemented and more advanced than the manuscript suggests.
+
+Facilities management:
+- Accurate.
+- Implemented.
+
+Events management:
+- Accurate.
+- Implemented, including map-linked event areas.
+
+Announcements management:
+- Accurate.
+- Implemented.
+
+Feedback management:
+- Accurate.
+- Implemented.
+
+Admin users management:
+- Accurate.
+- Implemented.
+
+Student moderator:
+- Partially accurate.
+- The concept exists through permission-scoped users, but the manuscript
+  over-separates it from the admin system.
+
+Real-time mapping:
+- Too strong.
+- The system uses published model/version updates and polling, not live
+  location tracking.
+
+Built-in event calendar interface:
+- Too strong or inaccurate.
+- The current public events page is not a calendar-style scheduling tool.
+
+Separate student panel application:
+- Too strong.
+- The code supports restricted accounts and permissions rather than a wholly
+  independent student-side management application.
+
+
+========================================================================
+8. WHY THESE LACKS MATTER
+========================================================================
+
+These problems matter for three different reasons:
+
+Reason 1: Credibility
+
+- Cross-project leftovers make the document look unreliable.
+- Inconsistencies in dates and names raise doubts about the whole manuscript.
+
+Reason 2: Academic quality
+
+- Weak citations, poor formatting, and incomplete chapter flow reduce the
+  manuscript's scholarly value.
+
+Reason 3: Loss of technical impact
+
+- The current manuscript does not showcase the most sophisticated parts of
+  TNTS well enough.
+- Because of that, the paper can make the project look simpler than it
+  actually is.
+
+
+========================================================================
+9. HOW THE MANUSCRIPT SHOULD BE REFRAMED
+========================================================================
+
+The project should be framed not merely as:
+
+"a kiosk with a 3D map, facilities, events, announcements, and feedback"
+
+It should be framed more accurately as:
+
+"a model-aware campus navigation and information platform with a published
+3D map runtime, searchable building and room catalog, route and text-guide
+support, event and facility map integration, and an admin-side workflow for
+importing, editing, versioning, and publishing campus map data."
+
+That framing better matches the real system.
+
+
+========================================================================
+10. RECOMMENDED PRIORITY ORDER FOR FIXING THE MANUSCRIPT
+========================================================================
+
+Priority 1:
+- Remove all non-TNTS content.
+- Clean the title pages, front matter, dates, names, and adviser references.
+
+Priority 2:
+- Clearly label and structure the document as a Chapter 1 to 3 manuscript.
+- Make the tense consistent with that stage throughout.
+
+Priority 3:
+- Fix figure numbering, appendix numbering, and caption numbering.
+
+Priority 4:
+- Replace weak or irrelevant references.
+- Remove local file path citations and sci-hub references.
+
+Priority 5:
+- Rewrite the system-description sections so they better explain:
+  map import
+  route and guide authoring
+  model-aware publishing
+  event area pinning
+  permissions and scoped admin roles
+
+Priority 6:
+- Tighten language, grammar, spacing, and terminology.
+
+
+========================================================================
+11. STRONGER SYSTEM DESCRIPTION THAT THE MANUSCRIPT COULD USE
+========================================================================
+
+Below is a cleaner technical description of TNTS based on the actual system:
+
+The Tanza National Trade School Navigator is a kiosk-oriented campus
+navigation and information platform built with PHP, MySQL, JavaScript,
+Three.js, and Blender-generated GLB assets. On the public side, it provides
+an interactive campus map with 2D and 3D viewing modes, destination search,
+building and room detail panels, route guidance, facilities browsing, event
+integration, announcement display, and feedback submission. On the
+administrative side, it supports role-based access to building, room,
+facility, event, announcement, feedback, and account management modules,
+along with a model-aware map import and publishing pipeline. Administrators
+can scan and synchronize GLB map models, maintain destination metadata,
+author routes and guide text, place event-specific areas on the map, export
+updated model states, and publish a selected model as the live campus map
+used by the public kiosk runtime.
+
+This description is much closer to what the actual codebase supports.
+
+
+========================================================================
+12. FINAL CONCLUSION
+========================================================================
+
+The manuscript's main weakness is not that the system is fake or empty.
+The manuscript's main weakness is that it does not yet present the real
+project cleanly and convincingly.
+
+The software demonstrates:
+
+- genuine implementation work
+- meaningful system integration
+- administrative maintainability
+- navigation-oriented map functionality
+
+However, the manuscript still suffers from:
+
+- content contamination
+- inconsistent front matter
+- inaccurate or exaggerated wording in places
+- underexplained technical strengths
+- unclear draft-stage signaling and incomplete polish
+
+If the manuscript is cleaned properly, aligned strictly to TNTS, and revised
+to better explain the real map-management and publishing workflow, it can
+represent the project much more effectively.

@@ -2176,7 +2176,7 @@ admin_layout_start("Map Editor", "mapeditor");
       <div id="road-controls" style="display:none; margin-top:12px; padding-top:12px; border-top:1px dashed #e5e7eb;">
         <div class="me-section-title">Road Tool</div>
         <div class="me-subtext" style="margin-bottom:10px;">
-          Tap the map to place a road point. Drag a road point to draw a segment (Draw) or reposition it (Move). Use two-finger gestures to pan/zoom.
+          Tap the map to place a road point. Tap a selected road to insert a point between existing nodes. Drag a road point to draw a segment (Draw) or reposition it (Move). Use two-finger gestures to pan/zoom.
         </div>
 
         <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px;">
@@ -7538,6 +7538,129 @@ function pickRoadHandle(event) {
   return { index: idx, roadId: hit.userData.roadId || null, handle: hit };
 }
 
+function getRoadTopMeshes(targetRoad = null) {
+  const roads = targetRoad ? [targetRoad] : getRoadObjects();
+  const meshes = [];
+  for (const road of roads) {
+    if (!road || !isRoadObject(road)) continue;
+    road.traverse((obj) => {
+      if (obj?.isMesh && obj.userData?.isRoadMesh === true) meshes.push(obj);
+    });
+  }
+  return meshes;
+}
+
+function projectWorldPointToRoadSegment(roadObj, worldPoint, opts = {}) {
+  if (!roadObj || !isRoadObject(roadObj) || !worldPoint) return null;
+  roadObj.updateMatrixWorld(true);
+
+  const pointsW = getRoadWorldPoints(roadObj);
+  if (!Array.isArray(pointsW) || pointsW.length < 2) return null;
+
+  const width = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+  const tol = Number.isFinite(opts?.tol)
+    ? Number(opts.tol)
+    : Math.max(1.5, (Number.isFinite(width) ? width : ROAD_DEFAULT_WIDTH) * 0.75);
+  const seg = findSegmentIndexForPointXZ(pointsW, worldPoint, tol);
+  if (!seg) return null;
+
+  const a = pointsW[seg.index];
+  const b = pointsW[seg.index + 1];
+  if (!a || !b) return null;
+
+  const t = Math.max(0, Math.min(1, Number(seg.t) || 0));
+  const x = a.x + (b.x - a.x) * t;
+  const y = a.y + (b.y - a.y) * t;
+  const z = a.z + (b.z - a.z) * t;
+
+  return {
+    road: roadObj,
+    segIndex: seg.index,
+    t,
+    dist: Number(seg.dist) || 0,
+    point: new THREE.Vector3(x, y, z),
+  };
+}
+
+function pickRoadSegmentHit(event, targetRoad = null) {
+  if (!event) return null;
+  const meshes = getRoadTopMeshes(targetRoad);
+  if (!meshes.length) return null;
+
+  setMouseFromEvent(event);
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(meshes, true);
+  if (!hits.length) return null;
+
+  for (const h of hits) {
+    const mesh = h?.object;
+    if (!mesh || mesh.userData?.isRoadMesh !== true) continue;
+
+    let roadObj = mesh;
+    while (roadObj && !isRoadObject(roadObj)) roadObj = roadObj.parent;
+    if (!roadObj || (targetRoad && roadObj !== targetRoad)) continue;
+
+    const projection = projectWorldPointToRoadSegment(roadObj, h.point);
+    if (!projection) continue;
+
+    return {
+      ...projection,
+      hitPoint: h.point.clone(),
+      mesh,
+    };
+  }
+
+  return null;
+}
+
+function captureRoadEditState(roadObj) {
+  return {
+    points: clonePointsArray(roadObj?.userData?.road?.points || []),
+    width: Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH),
+    ids: Array.isArray(roadObj?.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [],
+    meta: cloneRoadPointMeta(roadObj?.userData?.road?.pointMeta || []),
+  };
+}
+
+function roadEditStateChanged(before, after) {
+  if (!before || !after) return false;
+  if (JSON.stringify(before.points || []) !== JSON.stringify(after.points || [])) return true;
+  if (Math.abs(Number(before.width || 0) - Number(after.width || 0)) > 1e-6) return true;
+  if (JSON.stringify(before.ids || []) !== JSON.stringify(after.ids || [])) return true;
+  return JSON.stringify(before.meta || []) !== JSON.stringify(after.meta || []);
+}
+
+function getRoadPointRefsById(pointId, opts = {}) {
+  const id = String(pointId || "").trim();
+  if (!id || !overlayRoot) return [];
+
+  const excludeRoad = opts?.excludeRoad || null;
+  const excludeIndex = Number.isInteger(opts?.excludeIndex) ? opts.excludeIndex : null;
+  const refs = [];
+
+  for (const roadObj of overlayRoot.children || []) {
+    if (!isRoadObject(roadObj)) continue;
+    const ids = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds : [];
+    for (let i = 0; i < ids.length; i++) {
+      if (ids[i] !== id) continue;
+      if (excludeRoad === roadObj && excludeIndex === i) continue;
+      refs.push({ road: roadObj, index: i });
+    }
+  }
+
+  return refs;
+}
+
+function groupRoadPointRefsByRoad(refs = []) {
+  const grouped = new Map();
+  for (const ref of refs) {
+    if (!ref?.road || !isRoadObject(ref.road) || !Number.isInteger(ref.index)) continue;
+    if (!grouped.has(ref.road)) grouped.set(ref.road, new Set());
+    grouped.get(ref.road).add(ref.index);
+  }
+  return grouped;
+}
+
 function setRoadPointIndexFromWorld(roadObj, index, ptWorld) {
   if (!roadObj || !isRoadObject(roadObj)) return false;
   if (!canEditObject(roadObj)) return false;
@@ -7709,6 +7832,53 @@ function insertRoadPointAtSegment(roadObj, segIndex, worldPoint, meta = null, po
 
   setRoadLocalPoints(roadObj, ptsLocal);
   rebuildRoadObject(roadObj);
+  return true;
+}
+
+function insertRoadPointFromWorldHit(roadObj, worldPoint) {
+  if (!roadObj || !isRoadObject(roadObj) || !worldPoint) return false;
+  if (!canEditObject(roadObj)) return false;
+
+  const projection = projectWorldPointToRoadSegment(roadObj, worldPoint);
+  if (!projection) return false;
+
+  const pointsW = getRoadWorldPoints(roadObj);
+  const width = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
+  const nearTol = Math.max(0.75, Math.min(ROAD_MIN_POINT_DIST, (Number.isFinite(width) ? width : ROAD_DEFAULT_WIDTH) * 0.35));
+  const nearbyIndex = findNearbyPointIndexWorld(pointsW, projection.point, nearTol);
+  if (nearbyIndex !== -1) {
+    buildRoadHandlesFor(roadObj);
+    syncRoadHandlesToRoad(roadObj);
+    selectRoadPoint(roadObj, nearbyIndex, { mode: "set", showStatus: true });
+    updateRoadControls();
+    return true;
+  }
+
+  const before = captureRoadEditState(roadObj);
+  if (!insertRoadPointAtSegment(roadObj, projection.segIndex, projection.point)) return false;
+
+  const after = captureRoadEditState(roadObj);
+  buildRoadHandlesFor(roadObj);
+  syncRoadHandlesToRoad(roadObj);
+
+  const insertedIndex = projection.segIndex + 1;
+  selectRoadPoint(roadObj, insertedIndex, { mode: "set", showStatus: false });
+  pushUndo({
+    type: "road_edit",
+    obj: roadObj,
+    beforePoints: before.points,
+    afterPoints: after.points,
+    beforeWidth: before.width,
+    afterWidth: after.width,
+    beforeIds: before.ids,
+    afterIds: after.ids,
+    beforeMeta: before.meta,
+    afterMeta: after.meta,
+  });
+  redoStack = [];
+
+  setStatus("Road point inserted - use Drag: Move to reposition or Drag: Draw to branch");
+  updateRoadControls();
   return true;
 }
 
@@ -8129,8 +8299,18 @@ function beginRoadHandleDrag(roadObj, index, pointerId) {
   if (!canEditObject(roadObj)) return false;
   if (!Array.isArray(roadObj.userData?.road?.points)) return false;
 
-  isDraggingRoadHandle = true;
   ensureRoadPointMetaArrays(roadObj);
+  const movedPointId = Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds[index] : null;
+  const pointRefs = movedPointId
+    ? [{ road: roadObj, index }, ...getRoadPointRefsById(movedPointId, { excludeRoad: roadObj, excludeIndex: index })]
+    : [{ road: roadObj, index }];
+  const beforeStates = new Map();
+  for (const ref of pointRefs) {
+    if (!ref?.road || beforeStates.has(ref.road)) continue;
+    beforeStates.set(ref.road, captureRoadEditState(ref.road));
+  }
+
+  isDraggingRoadHandle = true;
   roadHandleDrag = {
     road: roadObj,
     index,
@@ -8139,6 +8319,10 @@ function beginRoadHandleDrag(roadObj, index, pointerId) {
     beforeWidth: Number(roadObj.userData.road.width || ROAD_DEFAULT_WIDTH),
     beforeIds: Array.isArray(roadObj.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [],
     beforeMeta: cloneRoadPointMeta(roadObj.userData?.road?.pointMeta || []),
+    pointId: movedPointId || null,
+    pointRefs,
+    sharedRefs: pointRefs.filter((ref) => !(ref?.road === roadObj && ref?.index === index)),
+    beforeStates,
   };
   controls.enabled = false;
   try { renderer.domElement.setPointerCapture(pointerId); } catch (_) {}
@@ -8150,12 +8334,27 @@ function endRoadHandleDrag(pointerId = null) {
   if (!isDraggingRoadHandle || !roadHandleDrag) return;
   if (pointerId != null && roadHandleDrag.pointerId !== pointerId) return;
 
-  const handleIndex = roadHandleDrag.index;
-  const roadObj = roadHandleDrag.road;
-  const beforePoints = roadHandleDrag.beforePoints;
-  const beforeWidth = roadHandleDrag.beforeWidth;
-  const beforeIds = roadHandleDrag.beforeIds || [];
-  const beforeMeta = roadHandleDrag.beforeMeta || [];
+  const drag = roadHandleDrag;
+  const handleIndex = drag.index;
+  const roadObj = drag.road;
+  const beforePoints = drag.beforePoints;
+  const beforeWidth = drag.beforeWidth;
+  const beforeIds = drag.beforeIds || [];
+  const beforeMeta = drag.beforeMeta || [];
+  const trackedBeforeStates = drag.beforeStates instanceof Map
+    ? new Map(drag.beforeStates)
+    : new Map();
+  if (!trackedBeforeStates.has(roadObj)) {
+    trackedBeforeStates.set(roadObj, {
+      points: beforePoints,
+      width: beforeWidth,
+      ids: beforeIds,
+      meta: beforeMeta,
+    });
+  }
+  const pointRefs = Array.isArray(drag.pointRefs) && drag.pointRefs.length
+    ? drag.pointRefs
+    : [{ road: roadObj, index: handleIndex }];
 
   isDraggingRoadHandle = false;
   roadHandleDrag = null;
@@ -8166,52 +8365,69 @@ function endRoadHandleDrag(pointerId = null) {
   }
 
   const movedPointId = roadObj?.userData?.road?.pointIds?.[handleIndex] ?? null;
+  const refsByRoad = groupRoadPointRefsByRoad(pointRefs);
+  const autoBeforeStates = new Map();
 
-  const afterPointsPre = clonePointsArray(roadObj?.userData?.road?.points || []);
-  const afterWidthPre = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
-  const movedChanged = JSON.stringify(beforePoints) !== JSON.stringify(afterPointsPre) || Math.abs(beforeWidth - afterWidthPre) > 1e-6;
+  for (const [refRoad, indexSet] of refsByRoad.entries()) {
+    const beforeState = trackedBeforeStates.get(refRoad) || captureRoadEditState(refRoad);
+    const afterStatePre = captureRoadEditState(refRoad);
+    if (!roadEditStateChanged(beforeState, afterStatePre)) continue;
 
-  // Auto-intersect adjacent segments when a point is moved (if enabled).
-  const otherChanges = new Map();
-  if (movedChanged && roadObj) {
-    const ptsLocalNow = getRoadLocalPoints(roadObj);
-    const segs = [];
-    if (handleIndex > 0) segs.push({ start: handleIndex - 1, end: handleIndex });
-    if (handleIndex < ptsLocalNow.length - 1) segs.push({ start: handleIndex, end: handleIndex + 1 });
-    segs.sort((a, b) => b.start - a.start);
+    const segKeys = new Set();
+    const indices = Array.from(indexSet.values()).sort((a, b) => b - a);
+    const ptsLocalNow = getRoadLocalPoints(refRoad);
+    for (const idx of indices) {
+      if (!Number.isInteger(idx)) continue;
+      if (idx > 0) segKeys.add(`${idx - 1}:${idx}`);
+      if (idx < ptsLocalNow.length - 1) segKeys.add(`${idx}:${idx + 1}`);
+    }
+
+    const segs = Array.from(segKeys)
+      .map((key) => {
+        const [startRaw, endRaw] = key.split(":");
+        return { start: Number(startRaw), end: Number(endRaw) };
+      })
+      .filter((seg) => Number.isInteger(seg.start) && Number.isInteger(seg.end))
+      .sort((a, b) => b.start - a.start);
 
     for (const seg of segs) {
-      const res = applyAutoIntersectionsForSegment(roadObj, seg.start, seg.end, { event: lastPointerEvent });
+      const res = applyAutoIntersectionsForSegment(refRoad, seg.start, seg.end, { event: lastPointerEvent });
       if (!Array.isArray(res.modifiedOthers)) continue;
       for (const [other, st] of res.modifiedOthers) {
-        if (!otherChanges.has(other)) {
-          otherChanges.set(other, st);
-        } else {
-          const prev = otherChanges.get(other);
-          prev.afterPoints = st.afterPoints;
-          prev.afterWidth = st.afterWidth;
-          prev.afterIds = st.afterIds;
-          prev.afterMeta = st.afterMeta;
-        }
+        if (trackedBeforeStates.has(other) || autoBeforeStates.has(other)) continue;
+        autoBeforeStates.set(other, {
+          points: clonePointsArray(st.beforePoints || []),
+          width: Number(st.beforeWidth || ROAD_DEFAULT_WIDTH),
+          ids: Array.isArray(st.beforeIds) ? st.beforeIds.slice() : [],
+          meta: cloneRoadPointMeta(st.beforeMeta || []),
+        });
       }
     }
   }
 
-  const batchCmds = [];
-  if (otherChanges.size) {
-    for (const [other, st] of otherChanges) {
-      batchCmds.push({ type: "road_edit", obj: other, beforePoints: st.beforePoints, afterPoints: st.afterPoints, beforeWidth: st.beforeWidth, afterWidth: st.afterWidth, beforeIds: st.beforeIds, afterIds: st.afterIds, beforeMeta: st.beforeMeta, afterMeta: st.afterMeta });
-    }
+  for (const [other, state] of autoBeforeStates.entries()) {
+    trackedBeforeStates.set(other, state);
   }
 
-  const afterPoints = clonePointsArray(roadObj?.userData?.road?.points || []);
-  const afterWidth = Number(roadObj?.userData?.road?.width || ROAD_DEFAULT_WIDTH);
-  const afterIds = Array.isArray(roadObj?.userData?.road?.pointIds) ? roadObj.userData.road.pointIds.slice() : [];
-  const afterMeta = cloneRoadPointMeta(roadObj?.userData?.road?.pointMeta || []);
+  const batchCmds = [];
+  for (const [editRoad, beforeState] of trackedBeforeStates.entries()) {
+    const afterState = captureRoadEditState(editRoad);
+    if (!roadEditStateChanged(beforeState, afterState)) continue;
+    batchCmds.push({
+      type: "road_edit",
+      obj: editRoad,
+      beforePoints: beforeState.points,
+      afterPoints: afterState.points,
+      beforeWidth: beforeState.width,
+      afterWidth: afterState.width,
+      beforeIds: beforeState.ids,
+      afterIds: afterState.ids,
+      beforeMeta: beforeState.meta,
+      afterMeta: afterState.meta,
+    });
+  }
 
-  const changed = movedChanged;
-  if (changed && roadObj) {
-    batchCmds.push({ type: "road_edit", obj: roadObj, beforePoints, afterPoints, beforeWidth, afterWidth, beforeIds, afterIds, beforeMeta, afterMeta });
+  if (batchCmds.length && roadObj) {
     pushUndoBatch(batchCmds);
     redoStack = [];
 
@@ -8223,7 +8439,7 @@ function endRoadHandleDrag(pointerId = null) {
     buildRoadHandlesFor(roadObj);
     syncRoadHandlesToRoad(roadObj);
     selectRoadPoint(roadObj, finalIndex, { mode: "set", showStatus: false });
-    setStatus("Road edited Ã¢Å“â€œ (undo available)");
+    setStatus("Road edited - undo available");
   } else {
     // Treat a simple tap as point selection (and endpoint selection for extension).
     selectRoadPoint(roadObj, handleIndex, { mode: "toggle", showStatus: true });
@@ -10081,6 +10297,13 @@ renderer.domElement.addEventListener("pointermove", (e) => {
     const wpt = new THREE.Vector3(x, y, z);
 
     setRoadPointIndexFromWorld(roadObj, pointIndex, wpt);
+    if (roadHandleDrag?.pointId) {
+      const sharedRefs = Array.isArray(roadHandleDrag.sharedRefs) ? roadHandleDrag.sharedRefs : [];
+      for (const ref of sharedRefs) {
+        if (!ref?.road || !Number.isInteger(ref.index)) continue;
+        setRoadPointIndexFromWorld(ref.road, ref.index, wpt);
+      }
+    }
 
     // Auto-tag/clear a building link when a point snaps (so routing can later use it).
     if (roadBuildingSnapEnabled) {
@@ -10169,6 +10392,19 @@ window.addEventListener("pointerup", (e) => {
       const picked = pickRoadObject(e);
 
       if (picked && isRoadObject(picked)) {
+        const shouldInsertOnSelectedRoad = (
+          picked === selected
+          && canEditObject(picked)
+          && !roadKioskPlaceMode
+        );
+        if (shouldInsertOnSelectedRoad) {
+          const segmentHit = pickRoadSegmentHit(e, picked);
+          if (segmentHit && insertRoadPointFromWorldHit(picked, segmentHit.point)) {
+            hideRoadHoverPreview();
+            e.preventDefault();
+            return;
+          }
+        }
         selectObject(picked);
       } else {
         const pt = getRoadSurfacePointFromEvent(e);
